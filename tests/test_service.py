@@ -2,12 +2,14 @@ from collections import deque
 from dataclasses import replace
 
 import pytest
+from langchain_core.exceptions import ContextOverflowError
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command, Interrupt
 
 from deepfix.approval import ApprovalPolicy
 from deepfix.config import ApprovalMode, load_config
-from deepfix.models import RepairOutcome, TaskStatus
+from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
+from deepfix.models import Evidence, RepairOutcome, TaskStatus
 from deepfix.persistence import TaskRepository
 from deepfix.service import BugfixService
 
@@ -95,14 +97,21 @@ def app_config(tmp_path, monkeypatch):
     return load_config(tmp_path, ApprovalMode.MANUAL)
 
 
-def make_service(config, fake_agent):
+@pytest.fixture
+def memory_store(app_config):
+    return WorkingMemoryStore(app_config.database_path)
+
+
+def make_service(config, fake_agent, memory_store=None):
     repository = TaskRepository(config.database_path)
+    memory_store = memory_store or WorkingMemoryStore(config.database_path)
     return (
         BugfixService(
             fake_agent,
             repository,
             ApprovalPolicy(config.approval_mode),
             config,
+            memory_store,
         ),
         repository,
     )
@@ -296,3 +305,143 @@ def test_repeated_graph_message_history_does_not_duplicate_test_result(app_confi
     continued = service.continue_task(task.task_id, "Python 3.12")
 
     assert len(continued.test_results) == 1
+
+
+def test_service_syncs_latest_memory_without_promoting_hypothesis_to_diagnosis(
+    app_config,
+    memory_store,
+):
+    fake_agent = FakeAgent(outcome(), outcome(question="请继续提供信息"))
+    service, _ = make_service(app_config, fake_agent, memory_store)
+    task = service.start("测试失败")
+    memory_store.save(
+        task.task_id,
+        ProgressSnapshot(
+            phase="investigating",
+            summary="最新调查",
+            facts=["失败可稳定复现"],
+            evidence=[
+                {
+                    "source": "tests/test_calc.py:18",
+                    "observation": "期望 2，实际 -2",
+                }
+            ],
+            active_hypotheses=["符号处理重复取反"],
+            rejected_hypotheses=[],
+            checked_files=["src/calc.py"],
+            experiments=["目标单测退出码为 1"],
+            next_steps=["验证 normalize_sign"],
+            unresolved_questions=[],
+        ),
+    )
+
+    continued = service.continue_task(task.task_id, "继续")
+
+    assert continued.working_memory_version == 1
+    assert Evidence("tests/test_calc.py:18", "期望 2，实际 -2") in continued.evidence
+    assert "符号处理重复取反" in continued.hypotheses
+    assert continued.diagnosis is None
+
+
+def test_successful_compaction_is_counted_once_for_repeated_graph_history(
+    app_config,
+    memory_store,
+):
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "compact_conversation",
+                    "args": {},
+                    "id": "compact-1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content="Conversation compacted.",
+            tool_call_id="compact-1",
+        ),
+    ]
+    first = outcome()
+    first["messages"] = messages
+    second = outcome(question="请继续")
+    second["messages"] = messages
+    service, _ = make_service(
+        app_config,
+        FakeAgent(first, second),
+        memory_store,
+    )
+    task = service.start("超长测试失败")
+
+    continued = service.continue_task(task.task_id, "继续")
+
+    assert continued.context_metrics.active_compaction_count == 1
+    assert memory_store.metrics(task.task_id).active_compaction_count == 1
+
+
+def test_nothing_to_compact_does_not_increment_success_metric(
+    app_config,
+    memory_store,
+):
+    result = outcome()
+    result["messages"] = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "compact_conversation",
+                    "args": {},
+                    "id": "compact-noop",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content="Nothing to compact yet — conversation is within the token budget.",
+            tool_call_id="compact-noop",
+        ),
+    ]
+    service, _ = make_service(
+        app_config,
+        FakeAgent(result),
+        memory_store,
+    )
+
+    task = service.start("短任务")
+
+    assert task.context_metrics.active_compaction_count == 0
+    assert memory_store.metrics(task.task_id).active_compaction_count == 0
+
+
+def test_context_overflow_pauses_and_persists_task(app_config, memory_store):
+    service, repository = make_service(
+        app_config,
+        FakeAgent(ContextOverflowError("context exceeded")),
+        memory_store,
+    )
+
+    task = service.start("超长任务")
+
+    assert task.status is TaskStatus.PAUSED
+    assert task.context_metrics.context_overflow_count == 1
+    assert "上下文" in task.final_summary
+    assert repository.get(task.task_id).status is TaskStatus.PAUSED
+
+
+def test_service_records_existing_context_artifacts(app_config, memory_store):
+    history = app_config.artifacts_path / "conversation_history" / "task.md"
+    large_result = app_config.artifacts_path / "large_tool_results" / "call-1"
+    history.parent.mkdir(parents=True)
+    large_result.parent.mkdir(parents=True)
+    history.write_text("history", encoding="utf-8")
+    large_result.write_text("output", encoding="utf-8")
+    service, _ = make_service(app_config, FakeAgent(outcome()), memory_store)
+
+    task = service.start("测试失败")
+
+    assert task.offloaded_artifacts == [
+        "conversation_history/task.md",
+        "large_tool_results/call-1",
+    ]

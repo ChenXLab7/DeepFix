@@ -1,5 +1,5 @@
 from deepfix.config import ApprovalMode
-from deepfix.models import ApprovalRecord, Evidence, TaskState
+from deepfix.models import ApprovalRecord, ContextMetrics, Evidence, TaskState
 from deepfix.models import TestResult as RepairTestResult
 from deepfix.reporting import render_report
 
@@ -38,6 +38,7 @@ def test_report_sections_have_stable_order_and_empty_collections_are_explicit(tm
         "## 修改文件",
         "## 测试结果",
         "## 审批记录",
+        "## 上下文管理",
         "## 结论、风险与未验证项",
     ]
     assert [report.index(heading) for heading in headings] == sorted(
@@ -54,3 +55,24 @@ def test_report_uses_exit_code_not_success_wording_to_mark_test_result(tmp_path)
 
     assert "[失败] `pytest -q` (exit_code=1)" in report
     assert "[通过] `pytest -q`" not in report
+
+
+def test_report_renders_deterministic_context_metrics_and_artifacts(tmp_path):
+    task = TaskState.create(tmp_path, "超长修复任务", ApprovalMode.MANUAL)
+    task.working_memory_version = 3
+    task.context_metrics = ContextMetrics(
+        context_peak_tokens=4200,
+        context_overflow_count=0,
+        active_compaction_count=1,
+        working_memory_version=3,
+        last_compaction_at="2026-08-21T10:00:00+00:00",
+    )
+    task.offloaded_artifacts = ["conversation_history/task.md"]
+
+    report = render_report(task)
+
+    assert "工作记忆版本：3" in report
+    assert "上下文峰值估算：4200 tokens" in report
+    assert "主动压缩次数：1" in report
+    assert "上下文溢出次数：0" in report
+    assert "conversation_history/task.md" in report

@@ -4,11 +4,13 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
+from langchain_core.exceptions import ContextOverflowError
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command
 
 from deepfix.approval import ApprovalPolicy, PolicyAction
 from deepfix.config import AppConfig
+from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus, TestResult
 from deepfix.persistence import TaskRepository
 
@@ -20,11 +22,13 @@ class BugfixService:
         repository: TaskRepository,
         policy: ApprovalPolicy,
         config: AppConfig,
+        working_memory_store: WorkingMemoryStore,
     ) -> None:
         self.agent = agent
         self.repository = repository
         self.policy = policy
         self.config = config
+        self.working_memory_store = working_memory_store
 
     def start(self, problem: str) -> TaskState:
         task = TaskState.create(
@@ -35,7 +39,7 @@ class BugfixService:
         message = {"role": "user", "content": task.user_problem}
         task.conversation.append(message)
         task.transition_to(TaskStatus.INVESTIGATING)
-        self.repository.save(task)
+        self._save(task)
         return self._invoke(task, {"messages": [message]})
 
     def continue_task(
@@ -47,7 +51,7 @@ class BugfixService:
         if task.status is TaskStatus.PAUSED:
             task.resume()
         if task.status is TaskStatus.WAITING_APPROVAL and task.pending_actions:
-            self.repository.save(task)
+            self._save(task)
             return task
         if task.status is TaskStatus.CLARIFYING:
             if not user_message or not user_message.strip():
@@ -59,7 +63,7 @@ class BugfixService:
 
         message = {"role": "user", "content": user_message.strip()}
         task.conversation.append(message)
-        self.repository.save(task)
+        self._save(task)
         return self._invoke(task, {"messages": [message]})
 
     def pending_actions(self, task_id: str) -> list[dict[str, object]]:
@@ -76,14 +80,20 @@ class BugfixService:
             return self._pause(task, "已达到 Agent 最大调用次数")
 
         task.agent_invocations += 1
-        self.repository.save(task)
+        self._save(task)
         graph_config = {"configurable": {"thread_id": task.task_id}}
         try:
             result = self.agent.invoke(value, graph_config)
+        except ContextOverflowError as exc:
+            self.working_memory_store.record_overflow(task.task_id)
+            return self._pause(
+                task,
+                f"上下文压缩后仍超出模型限制，任务已暂停: {exc}",
+            )
         except Exception as exc:  # noqa: BLE001 - persist every Agent boundary failure
             task.final_summary = f"Agent 执行失败: {exc}"
             task.transition_to(TaskStatus.FAILED)
-            self.repository.save(task)
+            self._save(task)
             return task
 
         self._record_tool_results(task, result)
@@ -96,7 +106,7 @@ class BugfixService:
 
         response = result.get("structured_response")
         if response is None:
-            self.repository.save(task)
+            self._save(task)
             return task
         outcome = (
             response
@@ -114,7 +124,7 @@ class BugfixService:
             return self._pause(task, "已达到 Shell 最大执行次数")
 
         task.transition_to(TaskStatus.WAITING_APPROVAL)
-        self.repository.save(task)
+        self._save(task)
         if all(
             action["policy_action"] == PolicyAction.ALLOW.value
             for action in task.pending_actions
@@ -213,7 +223,7 @@ class BugfixService:
             task.transition_to(TaskStatus.TESTING)
         if not approved_write and not approved_test:
             task.transition_to(TaskStatus.INVESTIGATING)
-        self.repository.save(task)
+        self._save(task)
         return self._invoke(task, Command(resume={"decisions": graph_decisions}))
 
     def _record_tool_results(self, task: TaskState, result: Mapping[str, Any]) -> None:
@@ -232,6 +242,10 @@ class BugfixService:
                 continue
             task.processed_tool_call_ids.append(call_id)
             name, args = calls.get(call_id, (str(message.name or ""), {}))
+            if name == "compact_conversation":
+                if message.text.startswith("Conversation compacted."):
+                    self.working_memory_store.record_compaction(task.task_id)
+                continue
             command = str(args.get("command", ""))
             if name != "execute" or not self._is_pytest(command):
                 continue
@@ -269,7 +283,7 @@ class BugfixService:
             self._return_to_investigating(task)
             task.transition_to(TaskStatus.REVIEWING)
             task.transition_to(TaskStatus.COMPLETED)
-        self.repository.save(task)
+        self._save(task)
         return task
 
     def _return_to_investigating(self, task: TaskState) -> None:
@@ -280,8 +294,39 @@ class BugfixService:
         task.final_summary = reason
         if task.status is not TaskStatus.PAUSED:
             task.transition_to(TaskStatus.PAUSED)
-        self.repository.save(task)
+        self._save(task)
         return task
+
+    def _save(self, task: TaskState) -> None:
+        self._sync_context(task)
+        self.repository.save(task)
+
+    def _sync_context(self, task: TaskState) -> None:
+        latest = self.working_memory_store.latest(task.task_id)
+        if latest is not None:
+            task.working_memory_version = latest.version
+            evidence_keys = {
+                (item.source, item.observation)
+                for item in task.evidence
+            }
+            for item in latest.snapshot.evidence:
+                key = (item.source, item.observation)
+                if key not in evidence_keys:
+                    task.evidence.append(item)
+                    evidence_keys.add(key)
+            task.hypotheses = list(
+                dict.fromkeys(
+                    [*task.hypotheses, *latest.snapshot.active_hypotheses]
+                )
+            )
+
+        task.context_metrics = self.working_memory_store.metrics(task.task_id)
+        if self.config.artifacts_path.exists():
+            task.offloaded_artifacts = sorted(
+                path.relative_to(self.config.artifacts_path).as_posix()
+                for path in self.config.artifacts_path.rglob("*")
+                if path.is_file()
+            )
 
     @staticmethod
     def _is_pytest(command: str) -> bool:
