@@ -155,6 +155,8 @@ class TaskState:
     residual_risks: list[str] = field(default_factory=list)
     unverified_items: list[str] = field(default_factory=list)
     pending_question: str | None = None
+    pending_actions: list[dict[str, object]] = field(default_factory=list)
+    processed_tool_call_ids: list[str] = field(default_factory=list)
     paused_from: TaskStatus | None = None
     shell_calls: int = 0
     agent_invocations: int = 0

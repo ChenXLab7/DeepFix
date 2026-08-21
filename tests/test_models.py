@@ -52,6 +52,19 @@ def test_paused_task_resumes_previous_status(tmp_path):
     assert task.paused_from is None
 
 
+def test_task_round_trip_preserves_pending_actions_and_processed_tool_calls(tmp_path):
+    task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
+    task.pending_actions.append(
+        {"name": "execute", "args": {"command": "pytest -q"}}
+    )
+    task.processed_tool_call_ids.append("call-1")
+
+    restored = TaskState.from_dict(task.to_dict())
+
+    assert restored.pending_actions == task.pending_actions
+    assert restored.processed_tool_call_ids == ["call-1"]
+
+
 def test_active_task_cannot_resume(tmp_path):
     task = TaskState.create(tmp_path, "除法结果错误", ApprovalMode.MANUAL)
     task.transition_to(TaskStatus.INVESTIGATING)
