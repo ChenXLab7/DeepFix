@@ -3,6 +3,7 @@ import pytest
 from deepfix.config import ApprovalMode
 from deepfix.models import (
     ApprovalRecord,
+    ContextMetrics,
     Evidence,
     RepairOutcome,
     TaskState,
@@ -63,6 +64,34 @@ def test_task_round_trip_preserves_pending_actions_and_processed_tool_calls(tmp_
 
     assert restored.pending_actions == task.pending_actions
     assert restored.processed_tool_call_ids == ["call-1"]
+
+
+def test_task_round_trip_preserves_context_state(tmp_path):
+    task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
+    task.working_memory_version = 3
+    task.context_metrics.context_peak_tokens = 4200
+    task.offloaded_artifacts = ["conversation_history/a.md"]
+
+    restored = TaskState.from_dict(task.to_dict())
+
+    assert restored.working_memory_version == 3
+    assert restored.context_metrics.context_peak_tokens == 4200
+    assert restored.offloaded_artifacts == ["conversation_history/a.md"]
+    assert isinstance(restored.context_metrics, ContextMetrics)
+
+
+def test_task_from_old_payload_uses_context_defaults(tmp_path):
+    task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
+    payload = task.to_dict()
+    payload.pop("working_memory_version")
+    payload.pop("context_metrics")
+    payload.pop("offloaded_artifacts")
+
+    restored = TaskState.from_dict(payload)
+
+    assert restored.working_memory_version == 0
+    assert restored.context_metrics == ContextMetrics()
+    assert restored.offloaded_artifacts == []
 
 
 def test_active_task_cannot_resume(tmp_path):

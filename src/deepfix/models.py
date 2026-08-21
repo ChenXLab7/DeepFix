@@ -122,6 +122,15 @@ class ApprovalRecord:
     risk: str
 
 
+@dataclass
+class ContextMetrics:
+    context_peak_tokens: int = 0
+    context_overflow_count: int = 0
+    active_compaction_count: int = 0
+    working_memory_version: int = 0
+    last_compaction_at: str | None = None
+
+
 class RepairOutcome(BaseModel):
     status: Literal["needs_input", "completed", "blocked"]
     question: str | None = None
@@ -161,6 +170,9 @@ class TaskState:
     shell_calls: int = 0
     agent_invocations: int = 0
     consecutive_test_failures: int = 0
+    working_memory_version: int = 0
+    context_metrics: ContextMetrics = field(default_factory=ContextMetrics)
+    offloaded_artifacts: list[str] = field(default_factory=list)
 
     @classmethod
     def create(
@@ -216,4 +228,7 @@ class TaskState:
             item if isinstance(item, ApprovalRecord) else ApprovalRecord(**item)
             for item in payload.get("approvals", [])
         ]
+        context_metrics = payload.get("context_metrics")
+        if context_metrics is not None and not isinstance(context_metrics, ContextMetrics):
+            payload["context_metrics"] = ContextMetrics(**context_metrics)
         return cls(**payload)

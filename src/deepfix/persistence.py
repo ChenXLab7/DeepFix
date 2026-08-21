@@ -11,6 +11,20 @@ from typing import cast
 from deepfix.models import TaskState
 
 
+def open_sqlite_connection(
+    database_path: str | Path,
+    *,
+    check_same_thread: bool = False,
+) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        Path(database_path).expanduser().resolve(),
+        check_same_thread=check_same_thread,
+    )
+    connection.execute("PRAGMA busy_timeout = 5000")
+    connection.execute("PRAGMA journal_mode = WAL")
+    return connection
+
+
 class TaskRepository:
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path).expanduser().resolve()
@@ -62,7 +76,7 @@ class TaskRepository:
 
     @contextmanager
     def checkpoint_connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.database_path, check_same_thread=False)
+        connection = open_sqlite_connection(self.database_path)
         try:
             yield connection
         finally:

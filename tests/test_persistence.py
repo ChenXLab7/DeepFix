@@ -58,3 +58,14 @@ def test_checkpoint_connection_closes_after_context(tmp_path):
 
     with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
         connection.execute("SELECT 1")
+
+
+def test_checkpoint_connection_enables_wal_and_busy_timeout(tmp_path):
+    repository = TaskRepository(tmp_path / "deepfix.sqlite3")
+
+    with repository.checkpoint_connection() as connection:
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    assert journal_mode == "wal"
+    assert busy_timeout == 5000
