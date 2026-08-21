@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+from deepfix.models import TaskState
+
+
+def render_report(task: TaskState) -> str:
+    sections = [
+        "# DeepFix 修复报告",
+        "",
+        "## 用户问题",
+        "",
+        task.user_problem,
+        "",
+        "## 根因与证据",
+        "",
+        f"根因：{task.diagnosis or '无'}",
+        "证据：",
+        *_evidence_lines(task),
+        "",
+        "## 修改文件",
+        "",
+        *_list_or_none(task.changed_files),
+        "",
+        "## 测试结果",
+        "",
+        *_test_lines(task),
+        "",
+        "## 审批记录",
+        "",
+        *_approval_lines(task),
+        "",
+        "## 结论、风险与未验证项",
+        "",
+        f"结论：{task.final_summary or '无'}",
+        f"复核：{task.review or '无'}",
+        "残余风险：",
+        *_list_or_none(task.residual_risks),
+        "未验证项：",
+        *_list_or_none(task.unverified_items),
+    ]
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def _evidence_lines(task: TaskState) -> list[str]:
+    if not task.evidence:
+        return ["无"]
+    return [
+        f"- {item.source}：{item.observation}"
+        for item in task.evidence
+    ]
+
+
+def _test_lines(task: TaskState) -> list[str]:
+    if not task.test_results:
+        return ["无"]
+    return [
+        f"- [{'通过' if result.exit_code == 0 else '失败'}] "
+        f"`{result.command}` (exit_code={result.exit_code})：{result.summary}"
+        for result in task.test_results
+    ]
+
+
+def _approval_lines(task: TaskState) -> list[str]:
+    if not task.approvals:
+        return ["无"]
+    return [
+        f"- [{record.risk}] {record.operation}：{record.decision}"
+        for record in task.approvals
+    ]
+
+
+def _list_or_none(items: list[str]) -> list[str]:
+    return [f"- {item}" for item in items] if items else ["无"]
