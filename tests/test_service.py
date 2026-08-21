@@ -141,6 +141,22 @@ def test_interrupt_is_persisted_as_waiting_approval(app_config):
     assert repository.get(task.task_id).pending_actions == task.pending_actions
 
 
+def test_user_can_pause_and_resume_same_pending_approval(app_config):
+    fake_agent = FakeAgent(make_interrupt("execute", {"command": "pytest -q"}))
+    service, repository = make_service(app_config, fake_agent)
+    task = service.start("测试失败")
+
+    paused = service.pause_task(task.task_id, "用户从终端暂停")
+    resumed = service.continue_task(task.task_id)
+
+    assert paused.task_id == task.task_id
+    assert paused.status is TaskStatus.PAUSED
+    assert paused.pending_actions == task.pending_actions
+    assert resumed.status is TaskStatus.WAITING_APPROVAL
+    assert resumed.pending_actions == task.pending_actions
+    assert repository.get(task.task_id).status is TaskStatus.WAITING_APPROVAL
+
+
 def test_l3_operation_is_rejected_even_when_user_requests_approval(app_config):
     fake_agent = FakeAgent(
         make_interrupt("execute", {"command": "git reset --hard"}),

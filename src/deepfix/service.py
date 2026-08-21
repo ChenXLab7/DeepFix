@@ -69,6 +69,16 @@ class BugfixService:
     def pending_actions(self, task_id: str) -> list[dict[str, object]]:
         return deepcopy(self.repository.get(task_id).pending_actions)
 
+    def pause_task(self, task_id: str, reason: str = "用户暂停任务") -> TaskState:
+        task = self.repository.get(task_id)
+        if task.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            raise ValueError("终态任务不能暂停")
+        return self._pause(task, reason)
+
     def decide(self, task_id: str, decisions: list[str]) -> TaskState:
         task = self.repository.get(task_id)
         if task.status is not TaskStatus.WAITING_APPROVAL:
