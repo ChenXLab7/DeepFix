@@ -14,6 +14,8 @@ def test_load_config_resolves_project_and_state_paths(tmp_path, monkeypatch):
 
     assert config.project_root == project.resolve()
     assert config.database_path == state_home.resolve() / "deepfix.sqlite3"
+    assert config.artifacts_path == state_home.resolve() / "artifacts"
+    assert config.artifacts_path.is_dir()
     assert config.model_name == "deepseek-chat"
     assert config.approval_mode is ApprovalMode.MANUAL
 

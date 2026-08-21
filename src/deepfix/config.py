@@ -15,6 +15,7 @@ class ApprovalMode(StrEnum):
 class AppConfig:
     project_root: Path
     database_path: Path
+    artifacts_path: Path
     model_name: str
     approval_mode: ApprovalMode
     shell_timeout_seconds: int = 120
@@ -30,9 +31,13 @@ def load_config(project_root: str | Path, approval_mode: ApprovalMode) -> AppCon
         raise ValueError(f"项目目录不存在: {project}")
     if not os.environ.get("DEEPSEEK_API_KEY"):
         raise ValueError("缺少环境变量 DEEPSEEK_API_KEY")
+    database_path = state_database_path()
+    artifacts_path = database_path.parent / "artifacts"
+    artifacts_path.mkdir(parents=True, exist_ok=True)
     return AppConfig(
         project_root=project,
-        database_path=state_database_path(),
+        database_path=database_path,
+        artifacts_path=artifacts_path,
         model_name="deepseek-chat",
         approval_mode=approval_mode,
     )
