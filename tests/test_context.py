@@ -1,15 +1,36 @@
+import pytest
+from deepagents.middleware.summarization import (
+    SummarizationMiddleware,
+    SummarizationToolMiddleware,
+)
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.prebuilt import ToolNode
 from langgraph.runtime import ExecutionInfo, Runtime
 
+from deepfix.agent import build_model
+from deepfix.backend import build_backend
+from deepfix.config import ApprovalMode, load_config
 from deepfix.context import (
     ContextMemoryMiddleware,
+    build_context_middleware,
     build_save_progress_tool,
     render_working_memory,
 )
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore, WorkingMemoryVersion
+
+
+@pytest.fixture
+def config(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    return load_config(tmp_path, ApprovalMode.MANUAL)
+
+
+@pytest.fixture
+def store(config):
+    return WorkingMemoryStore(config.database_path)
 
 
 def snapshot(summary: str = "已复现失败") -> ProgressSnapshot:
@@ -147,3 +168,21 @@ def test_render_working_memory_has_a_hard_injection_bound():
     assert "事实-0-" in rendered
     assert "事实-8-" not in rendered
     assert len(rendered) <= 12_000
+
+
+def test_context_middleware_shares_one_summarization_engine(config, store):
+    middleware = build_context_middleware(
+        build_model(config),
+        build_backend(config),
+        store,
+    )
+    summarization = next(
+        item for item in middleware if isinstance(item, SummarizationMiddleware)
+    )
+    tool_layer = next(
+        item for item in middleware if isinstance(item, SummarizationToolMiddleware)
+    )
+
+    assert tool_layer._summarization is summarization
+    assert summarization._lc_helper.trigger == ("fraction", 0.70)
+    assert summarization._lc_helper.keep == ("fraction", 0.15)

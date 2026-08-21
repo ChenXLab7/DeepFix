@@ -4,6 +4,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from deepfix.agent import build_agent, build_model
 from deepfix.config import ApprovalMode, load_config
+from deepfix.memory import WorkingMemoryStore
 
 
 @pytest.fixture
@@ -15,7 +16,11 @@ def config(tmp_path, monkeypatch):
 
 @pytest.fixture
 def agent(config):
-    return build_agent(config, checkpointer=InMemorySaver())
+    return build_agent(
+        config,
+        checkpointer=InMemorySaver(),
+        working_memory_store=WorkingMemoryStore(config.database_path),
+    )
 
 
 def test_agent_exposes_repair_tools_without_subagent_task_tool(agent):
@@ -31,6 +36,8 @@ def test_agent_exposes_repair_tools_without_subagent_task_tool(agent):
         "glob",
         "grep",
         "execute",
+        "save_progress",
+        "compact_conversation",
     } <= tools.keys()
 
 
@@ -45,6 +52,8 @@ def test_agent_interrupts_every_side_effecting_tool(agent):
         "delete",
         "execute",
     }
+    assert "save_progress" not in middleware.interrupt_on
+    assert "compact_conversation" not in middleware.interrupt_on
 
 
 def test_agent_returns_structured_repair_outcome(agent):

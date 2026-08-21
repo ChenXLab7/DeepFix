@@ -4,6 +4,10 @@ from collections.abc import Callable
 from html import escape
 from typing import Literal
 
+from deepagents.middleware.summarization import (
+    SummarizationMiddleware,
+    SummarizationToolMiddleware,
+)
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain.tools import ToolRuntime
 from langchain_core.messages import SystemMessage, ToolMessage
@@ -88,6 +92,32 @@ def build_save_progress_tool(store: WorkingMemoryStore) -> BaseTool:
             "在对话压缩后仍可恢复。任务 ID 由运行时自动提供。"
         ),
     )
+
+
+def build_context_middleware(model, backend, store: WorkingMemoryStore):
+    summarization = SummarizationMiddleware(
+        model=model,
+        backend=backend,
+        trigger=("fraction", 0.70),
+        keep=("fraction", 0.15),
+        truncate_args_settings={
+            "trigger": ("fraction", 0.70),
+            "keep": ("fraction", 0.15),
+            "max_length": 2000,
+            "truncation_text": "...(argument truncated)",
+        },
+    )
+    return [
+        summarization,
+        SummarizationToolMiddleware(
+            summarization,
+            system_prompt=(
+                "长任务中完成独立阶段后，先用 save_progress 保存关键事实，"
+                "再在上下文足够长时调用 compact_conversation。"
+            ),
+        ),
+        ContextMemoryMiddleware(store),
+    ]
 
 
 def render_working_memory(version: WorkingMemoryVersion) -> str:
