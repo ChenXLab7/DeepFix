@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Protocol
+
+from langchain_core.tools import BaseTool
 
 from deepfix.config import ApprovalMode
 
@@ -26,6 +29,22 @@ class PolicyDecision:
     risk: RiskLevel
     action: PolicyAction
     reason: str
+
+
+class RegisteredToolPolicy(Protocol):
+    tool: BaseTool
+    policy_action: PolicyAction
+
+
+def merge_interrupt_on(
+    core_interrupts: Mapping[str, bool],
+    registrations: Iterable[RegisteredToolPolicy],
+) -> dict[str, bool]:
+    merged = dict(core_interrupts)
+    for registration in registrations:
+        if registration.policy_action in {PolicyAction.ASK, PolicyAction.DENY}:
+            merged[registration.tool.name] = True
+    return merged
 
 
 _READ_ONLY_TOOLS = frozenset({"ls", "read_file", "glob", "grep"})

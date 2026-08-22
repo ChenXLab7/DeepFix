@@ -1,9 +1,12 @@
 import pytest
+from deepagents.middleware.summarization import SummarizationMiddleware
+from langchain_core.tools import StructuredTool
 from langchain_deepseek import ChatDeepSeek
 from langgraph.checkpoint.memory import InMemorySaver
 
 from deepfix.agent import build_agent, build_model
 from deepfix.config import ApprovalMode, load_config
+from deepfix.extensions import build_research_extensions
 from deepfix.memory import WorkingMemoryStore
 
 
@@ -68,3 +71,57 @@ def test_model_uses_configured_deepseek_chat_deterministically(config):
     assert isinstance(model, ChatDeepSeek)
     assert model.model_name == "deepseek-chat"
     assert model.temperature == 0
+
+
+def _extension_tool(name):
+    def run():
+        return "ok"
+
+    return StructuredTool.from_function(run, name=name, description="test tool")
+
+
+def test_agent_assembles_research_extensions_without_changing_core_guards(
+    config,
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+        return "compiled-agent"
+
+    monkeypatch.setattr("deepfix.agent.create_deep_agent", fake_create_deep_agent)
+    extensions = build_research_extensions(
+        inspect_dependency=_extension_tool("inspect_dependency"),
+        search_technical_sources=_extension_tool("search_technical_sources"),
+        fetch_external_evidence=_extension_tool("fetch_external_evidence"),
+        link_external_evidence=_extension_tool("link_external_evidence"),
+    )
+
+    result = build_agent(
+        config,
+        checkpointer=InMemorySaver(),
+        working_memory_store=WorkingMemoryStore(config.database_path),
+        extensions=extensions,
+    )
+
+    tool_names = [tool.name for tool in captured["tools"]]
+    middleware = captured["middleware"]
+    middleware_names = [type(item).__name__ for item in middleware]
+    assert result == "compiled-agent"
+    assert tool_names.count("save_progress") == 1
+    assert tool_names.count("inspect_dependency") == 1
+    assert tool_names.count("search_technical_sources") == 1
+    assert tool_names.count("fetch_external_evidence") == 1
+    assert tool_names.count("link_external_evidence") == 1
+    assert any(isinstance(item, SummarizationMiddleware) for item in middleware)
+    assert "SummarizationToolMiddleware" in middleware_names
+    assert "ContextMemoryMiddleware" in middleware_names
+    assert captured["subagents"] == []
+    assert captured["skills"] == []
+    assert captured["interrupt_on"] == {
+        "write_file": True,
+        "edit_file": True,
+        "delete": True,
+        "execute": True,
+    }

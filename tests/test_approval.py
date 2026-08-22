@@ -1,7 +1,27 @@
 import pytest
 
-from deepfix.approval import ApprovalPolicy, PolicyAction, RiskLevel
+from deepfix.approval import (
+    ApprovalPolicy,
+    PolicyAction,
+    RiskLevel,
+    merge_interrupt_on,
+)
 from deepfix.config import ApprovalMode
+from deepfix.extensions import ToolRegistration
+
+
+def _registered_tool(name, action):
+    from langchain_core.tools import StructuredTool
+
+    def run():
+        return "ok"
+
+    return ToolRegistration(
+        tool=StructuredTool.from_function(run, name=name, description="test"),
+        risk=RiskLevel.L1,
+        policy_action=action,
+        network_access=False,
+    )
 
 
 @pytest.mark.parametrize(
@@ -84,3 +104,27 @@ def test_sensitive_shell_syntax_uses_sensitive_rule(command):
     assert decision.risk is RiskLevel.L2
     assert decision.action is PolicyAction.ASK
     assert "越过项目边界" in decision.reason
+
+
+def test_extension_interrupts_include_ask_and_deny_but_not_allow():
+    merged = merge_interrupt_on(
+        {"execute": True},
+        (
+            _registered_tool("read_network", PolicyAction.ALLOW),
+            _registered_tool("install_package", PolicyAction.ASK),
+            _registered_tool("destroy_workspace", PolicyAction.DENY),
+        ),
+    )
+
+    assert merged == {
+        "execute": True,
+        "install_package": True,
+        "destroy_workspace": True,
+    }
+
+
+def test_unknown_tool_keeps_l2_ask_fallback_after_extension_support():
+    decision = ApprovalPolicy(ApprovalMode.GUARDED).evaluate("unregistered", {})
+
+    assert decision.risk is RiskLevel.L2
+    assert decision.action is PolicyAction.ASK
