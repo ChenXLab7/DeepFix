@@ -1,0 +1,24 @@
+{
+  "data": {
+    "search": {
+      "nodes": [
+        {
+          "title": "Answered model_copy question",
+          "url": "https://github.com/pydantic/pydantic/discussions/201",
+          "bodyText": "How should model_copy update fields?",
+          "authorAssociation": "NONE",
+          "answerChosenAt": "2024-08-02T00:00:00Z",
+          "closed": false
+        },
+        {
+          "title": "Unconfirmed migration question",
+          "url": "https://github.com/pydantic/pydantic/discussions/202",
+          "bodyText": "Unexpected behavior after migration",
+          "authorAssociation": "NONE",
+          "answerChosenAt": null,
+          "closed": false
+        }
+      ]
+    }
+  }
+}

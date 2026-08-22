@@ -1,0 +1,24 @@
+{
+  "info": {
+    "name": "pydantic",
+    "version": "2.8.4",
+    "summary": "Data validation using Python type hints",
+    "project_urls": {
+      "Documentation": "https://docs.pydantic.dev/",
+      "Source": "https://github.com/pydantic/pydantic",
+      "Changelog": "https://docs.pydantic.dev/latest/changelog/"
+    },
+    "classifiers": [
+      "Programming Language :: Python :: 3"
+    ]
+  },
+  "releases": {
+    "2.8.4": [
+      {
+        "filename": "pydantic-2.8.4-py3-none-any.whl",
+        "upload_time_iso_8601": "2024-08-01T00:00:00Z"
+      }
+    ]
+  },
+  "urls": []
+}

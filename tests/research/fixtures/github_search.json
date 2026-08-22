@@ -1,0 +1,45 @@
+{
+  "total_count": 4,
+  "incomplete_results": false,
+  "items": [
+    {
+      "number": 101,
+      "title": "Open user report",
+      "html_url": "https://github.com/pydantic/pydantic/issues/101",
+      "state": "open",
+      "author_association": "NONE",
+      "labels": [],
+      "pull_request": null
+    },
+    {
+      "number": 102,
+      "title": "Closed validation issue",
+      "html_url": "https://github.com/pydantic/pydantic/issues/102",
+      "state": "closed",
+      "author_association": "NONE",
+      "labels": [{"name": "bug"}],
+      "pull_request": null
+    },
+    {
+      "number": 103,
+      "title": "Merged model_copy fix",
+      "html_url": "https://github.com/pydantic/pydantic/pull/103",
+      "state": "closed",
+      "author_association": "CONTRIBUTOR",
+      "labels": [],
+      "pull_request": {
+        "url": "https://api.github.com/repos/pydantic/pydantic/pulls/103",
+        "merged_at": "2024-08-01T12:00:00Z"
+      }
+    },
+    {
+      "number": 104,
+      "title": "Maintainer confirmation",
+      "html_url": "https://github.com/pydantic/pydantic/issues/104",
+      "state": "open",
+      "author_association": "MEMBER",
+      "labels": [],
+      "pull_request": null
+    }
+  ]
+}

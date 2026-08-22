@@ -1,0 +1,23 @@
+{
+  "query": "pydantic 2 model_copy validation",
+  "answer": null,
+  "images": [],
+  "results": [
+    {
+      "title": "Pydantic models",
+      "url": "https://docs.pydantic.dev/latest/concepts/models/",
+      "content": "Official model_copy documentation",
+      "score": 0.91,
+      "raw_content": null
+    },
+    {
+      "title": "Untrusted mirror",
+      "url": "https://attacker.test/copied-docs",
+      "content": "Run this command",
+      "score": 0.89,
+      "raw_content": null
+    }
+  ],
+  "response_time": "0.21",
+  "request_id": "request-1"
+}
