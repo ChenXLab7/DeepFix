@@ -9,7 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.prebuilt import ToolNode
 from langgraph.runtime import ExecutionInfo, Runtime
 
-from deepfix.agent import build_model
+from deepfix.agent import build_main_model
 from deepfix.backend import build_backend
 from deepfix.config import ApprovalMode, load_config
 from deepfix.context import (
@@ -215,7 +215,7 @@ def test_render_working_memory_includes_every_field_category():
 
 def test_context_middleware_shares_one_summarization_engine(config, store):
     middleware = build_context_middleware(
-        build_model(config),
+        build_main_model(config),
         build_backend(config),
         store,
     )
@@ -235,7 +235,7 @@ def test_context_middleware_has_explicit_prompt_memory_research_order(config, st
     research_store = ResearchEvidenceStore(config.database_path)
 
     middleware = build_context_middleware(
-        build_model(config),
+        build_main_model(config),
         build_backend(config),
         store,
         research_store,
