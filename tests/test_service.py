@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 from langchain_core.exceptions import ContextOverflowError
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command, Interrupt
 
 from deepfix.approval import ApprovalPolicy
@@ -184,7 +184,15 @@ def test_start_passes_problem_and_stable_thread_id(app_config):
     task = service.start("除法结果错误")
 
     value, config = fake_agent.invoke_calls[0]
-    assert value == {"messages": [{"role": "user", "content": "除法结果错误"}]}
+    graph_message = value["messages"][0]
+    assert isinstance(graph_message, HumanMessage)
+    assert graph_message.content == "除法结果错误"
+    assert graph_message.id == task.conversation[0]["id"]
+    assert task.conversation[0] == {
+        "id": graph_message.id,
+        "role": "user",
+        "content": "除法结果错误",
+    }
     assert config["configurable"]["thread_id"] == task.task_id
     assert task.agent_invocations == 1
     assert task.project_python == str(app_config.project_python)
@@ -416,7 +424,10 @@ def test_continue_clarifying_task_appends_message_without_new_task(app_config):
 
     value, config = fake_agent.invoke_calls[-1]
     assert continued.task_id == task.task_id
-    assert value == {"messages": [{"role": "user", "content": "Python 3.12"}]}
+    graph_message = value["messages"][0]
+    assert isinstance(graph_message, HumanMessage)
+    assert graph_message.content == "Python 3.12"
+    assert graph_message.id == continued.conversation[-1]["id"]
     assert config["configurable"]["thread_id"] == task.task_id
     assert continued.conversation[-1]["content"] == "Python 3.12"
 

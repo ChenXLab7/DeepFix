@@ -94,6 +94,30 @@ def stable_generated_message_id(task_id: str, scope_id: str, result_type: str) -
     )
 
 
+def stable_conversation_message_id(
+    task_id: str,
+    ordinal: int,
+    role: str,
+    content: Any,
+) -> str:
+    if ordinal < 0:
+        raise ValueError("conversation ordinal 不能为负数")
+    message_type = {
+        "user": "human",
+        "assistant": "ai",
+        "system": "system",
+        "tool": "tool",
+    }.get(_required(role, "role"), role)
+    return _prefixed_hash(
+        "msg",
+        _required(task_id, "task_id"),
+        str(ordinal),
+        message_type,
+        "",
+        _sha256(_canonical_content(content)),
+    )
+
+
 def _stable_message_id(task_id: str, ordinal: int, message: AnyMessage) -> str:
     content_hash = _sha256(_canonical_content(message.content))
     tool_ids = ",".join(sorted(_tool_call_ids(message)))

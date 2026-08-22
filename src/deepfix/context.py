@@ -22,6 +22,7 @@ from deepfix.compaction.models import (
     HypothesisProgressInput,
     HypothesisRecord,
     ProvenancedClaim,
+    ProvenanceRef,
     SnapshotCoverage,
 )
 from deepfix.memory import WorkingMemoryStore, WorkingMemoryVersion
@@ -312,9 +313,10 @@ def _render_claims(values: list[ProvenancedClaim] | list[str]) -> str:
     for value in values[:8]:
         text = value if isinstance(value, str) else value.text
         claim_id = "legacy" if isinstance(value, str) else value.claim_id
+        provenance = "" if isinstance(value, str) else _render_provenance(value.sources)
         lines.append(
             f'<fact claim_id="{_bounded(claim_id, 100)}">'
-            f"{_bounded(text, 200)}</fact>"
+            f"{_bounded(text, 200)}{provenance}</fact>"
         )
     if len(values) > 8:
         lines.append(f'<omitted_count value="{len(values) - 8}" />')
@@ -334,16 +336,25 @@ def _render_hypotheses(
             hypothesis_id, text, reason = "legacy", value, None
         else:
             hypothesis_id, text, reason = value.hypothesis_id, value.text, value.reason
+        provenance = "" if isinstance(value, str) else _render_provenance(value.sources)
         lines.append(
             f'<hypothesis hypothesis_id="{_bounded(hypothesis_id, 100)}">'
             f"<text>{_bounded(text, character_limit)}</text>"
             f"<reason>{_bounded(reason or '', character_limit)}</reason>"
+            f"{provenance}"
             "</hypothesis>"
         )
     if len(values) > item_limit:
         lines.append(f'<omitted_count value="{len(values) - item_limit}" />')
     lines.append(f"</{section_name}>")
     return "\n".join(lines)
+
+
+def _render_provenance(values: list[ProvenanceRef]) -> str:
+    return "<sources>" + "".join(
+        f'<source kind="{source.kind}" ref_id="{_bounded(source.ref_id, 120)}" />'
+        for source in values[:10]
+    ) + "</sources>"
 
 
 def _render_coverage(value: SnapshotCoverage) -> str:

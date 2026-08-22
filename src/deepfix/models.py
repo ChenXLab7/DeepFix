@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from deepfix.compaction.identity import stable_conversation_message_id
 from deepfix.compaction.models import ContextRecoveryMetadata
 from deepfix.config import ApprovalMode
 
@@ -239,6 +240,19 @@ class TaskState:
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> TaskState:
         payload = dict(value)
+        task_id = str(payload["task_id"])
+        payload["conversation"] = [
+            {
+                **entry,
+                "id": str(entry.get("id") or stable_conversation_message_id(
+                    task_id,
+                    ordinal,
+                    str(entry.get("role", "user")),
+                    entry.get("content", ""),
+                )),
+            }
+            for ordinal, entry in enumerate(payload.get("conversation", []))
+        ]
         payload["status"] = TaskStatus(str(payload["status"]))
         paused_from = payload.get("paused_from")
         payload["paused_from"] = TaskStatus(str(paused_from)) if paused_from else None

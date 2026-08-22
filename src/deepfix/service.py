@@ -5,11 +5,14 @@ from copy import deepcopy
 from typing import Any
 
 from langchain_core.exceptions import ContextOverflowError
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 
 from deepfix.approval import ApprovalPolicy, PolicyAction
-from deepfix.compaction.identity import ensure_message_ids
+from deepfix.compaction.identity import (
+    ensure_message_ids,
+    stable_conversation_message_id,
+)
 from deepfix.config import AppConfig
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus, TestResult
@@ -41,11 +44,20 @@ class BugfixService:
             self.config.approval_mode,
             self.config.project_python,
         )
-        message = {"role": "user", "content": task.user_problem}
+        message_id = stable_conversation_message_id(
+            task.task_id,
+            len(task.conversation),
+            "user",
+            task.user_problem,
+        )
+        message = {"id": message_id, "role": "user", "content": task.user_problem}
         task.conversation.append(message)
         task.transition_to(TaskStatus.INVESTIGATING)
         self._save(task)
-        return self._invoke(task, {"messages": [message]})
+        return self._invoke(
+            task,
+            {"messages": [HumanMessage(id=message_id, content=task.user_problem)]},
+        )
 
     def continue_task(
         self,
@@ -66,10 +78,20 @@ class BugfixService:
         if not user_message or not user_message.strip():
             raise ValueError("继续任务需要用户消息")
 
-        message = {"role": "user", "content": user_message.strip()}
+        content = user_message.strip()
+        message_id = stable_conversation_message_id(
+            task.task_id,
+            len(task.conversation),
+            "user",
+            content,
+        )
+        message = {"id": message_id, "role": "user", "content": content}
         task.conversation.append(message)
         self._save(task)
-        return self._invoke(task, {"messages": [message]})
+        return self._invoke(
+            task,
+            {"messages": [HumanMessage(id=message_id, content=content)]},
+        )
 
     def pending_actions(self, task_id: str) -> list[dict[str, object]]:
         return deepcopy(self.repository.get(task_id).pending_actions)

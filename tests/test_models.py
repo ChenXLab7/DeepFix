@@ -95,6 +95,24 @@ def test_task_from_old_payload_uses_context_defaults(tmp_path):
     assert restored.context_recovery is None
 
 
+def test_old_conversation_entries_receive_stable_ids(tmp_path):
+    task = TaskState.create(tmp_path, "修复错误", ApprovalMode.MANUAL)
+    payload = task.to_dict()
+    payload["conversation"] = [
+        {"role": "user", "content": "第一条"},
+        {"role": "user", "content": "第二条"},
+    ]
+
+    first = TaskState.from_dict(payload)
+    second = TaskState.from_dict(payload)
+
+    assert all(entry["id"] for entry in first.conversation)
+    assert [entry["id"] for entry in first.conversation] == [
+        entry["id"] for entry in second.conversation
+    ]
+    assert first.conversation[0]["id"] != first.conversation[1]["id"]
+
+
 def test_task_round_trip_preserves_research_summary(tmp_path):
     task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
     task.external_evidence_ids = ["evidence-2", "evidence-1"]
