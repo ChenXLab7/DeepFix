@@ -294,7 +294,7 @@ class CompactionCoordinator:
 
         try:
             delta = self.delta_generator.generate(
-                request.model,
+                self.model if self.model is not None else request.model,
                 retention.compressed_units,
             )
         except CompactionPreparationError as exc:
@@ -457,7 +457,7 @@ class CompactionCoordinator:
             ) from exc
         try:
             delta = await self.delta_generator.agenerate(
-                request.model,
+                self.model if self.model is not None else request.model,
                 retention.compressed_units,
             )
         except CompactionPreparationError as exc:

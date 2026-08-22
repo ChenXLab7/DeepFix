@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 from langchain.agents.middleware import ModelRequest
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
@@ -70,6 +72,26 @@ def test_measure_requires_profile_or_explicit_model_table_entry():
 
     with pytest.raises(ContextBudgetConfigurationError, match="max_input_tokens"):
         ContextBudgetMonitor(output_reserve_tokens=0).measure(request, [])
+
+
+@pytest.mark.parametrize("model_name", ["deepseek-v4-flash", "deepseek-v4-pro"])
+def test_v4_models_have_explicit_one_million_token_fallback(model_name):
+    monitor = ContextBudgetMonitor(
+        token_counter=lambda value: 820_000,
+        output_reserve_tokens=0,
+    )
+    request = SimpleNamespace(
+        model=SimpleNamespace(model_name=model_name, profile=None),
+        system_message=None,
+        messages=[HumanMessage(content="large")],
+        tools=[],
+    )
+
+    report = monitor.measure(request, [])
+
+    assert report.max_input_tokens == 1_000_000
+    assert report.usage_ratio == pytest.approx(0.82)
+    assert report.zone == "observe"
 
 
 def _unit(

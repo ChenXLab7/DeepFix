@@ -127,7 +127,15 @@ class _RecordingStore:
         return getattr(self.actual, name)
 
 
-def _coordinator(tmp_path, *, calls=None, adapter=None, store=None):
+def _coordinator(
+    tmp_path,
+    *,
+    calls=None,
+    adapter=None,
+    store=None,
+    delta_generator=None,
+    model=None,
+):
     database = tmp_path / "deepfix.sqlite3"
     actual_store = CompactionStore(database)
     memory = WorkingMemoryStore(database)
@@ -140,7 +148,7 @@ def _coordinator(tmp_path, *, calls=None, adapter=None, store=None):
         adapter=(
             _RecordingAdapter(artifact, calls) if calls is not None and not adapter else artifact
         ),
-        delta_generator=_RecordingDelta(calls),
+        delta_generator=delta_generator or _RecordingDelta(calls),
         snapshot_builder=_RecordingBuilder(calls),
         snapshot_store=(
             _RecordingStore(snapshot_store, calls)
@@ -148,6 +156,7 @@ def _coordinator(tmp_path, *, calls=None, adapter=None, store=None):
             else snapshot_store
         ),
         memory_store=memory,
+        model=model,
         partitioner=lambda messages, conflicts: _record_partition(
             calls, messages, conflicts
         ),
@@ -243,6 +252,49 @@ class _FailingAdapter:
 class _RuntimeFailingDelta:
     def generate(self, model, units):
         raise RuntimeError("delta failed")
+
+
+class _ModelRecordingFailingDelta:
+    def __init__(self):
+        self.models = []
+
+    def generate(self, model, units):
+        self.models.append(model)
+        raise RuntimeError("compaction model unavailable")
+
+
+def test_delta_failure_never_falls_back_to_main_model(tmp_path):
+    main_model = object()
+    compaction_model = object()
+    delta = _ModelRecordingFailingDelta()
+    coordinator, store, _ = _coordinator(
+        tmp_path,
+        delta_generator=delta,
+        model=compaction_model,
+    )
+    request = _request(ratio=0.85)
+    request = CompactionRequest(
+        task_id=request.task_id,
+        entrypoint=request.entrypoint,
+        messages=request.messages,
+        active_event=request.active_event,
+        protected_context=request.protected_context,
+        budget=request.budget,
+        model=main_model,
+        tool_call_id=request.tool_call_id,
+    )
+    handler_calls = []
+
+    coordinator.invoke_automatic(
+        request,
+        lambda messages: handler_calls.append(messages)
+        or ModelResponse(result=[AIMessage(content="continued")]),
+    )
+
+    assert delta.models == [compaction_model]
+    assert main_model not in delta.models
+    assert len(handler_calls) == 1
+    assert store.list_failures("task-a")[0].error_code == "delta_generation_failed"
 
 
 class _RuntimeFailingBuilder:

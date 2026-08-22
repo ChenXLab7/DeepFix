@@ -11,8 +11,8 @@ from deepfix.compaction.models import WorkUnit
 BudgetZone = Literal["normal", "observe", "normal_compaction", "emergency"]
 
 _MODEL_INPUT_LIMITS = {
-    "deepseek-chat": 64_000,
-    "deepseek-reasoner": 64_000,
+    "deepseek-v4-flash": 1_000_000,
+    "deepseek-v4-pro": 1_000_000,
 }
 
 
