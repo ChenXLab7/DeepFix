@@ -86,6 +86,15 @@ def test_role_models_use_independent_names_keys_and_shared_base_url(config):
     assert compaction.openai_api_key.get_secret_value() == "compact-secret"
 
 
+def test_both_role_models_disable_thinking_for_tool_choice_compatibility(config):
+    main = build_main_model(config)
+    compaction = build_compaction_model(config)
+
+    expected = {"thinking": {"type": "disabled"}}
+    assert main.extra_body == expected
+    assert compaction.extra_body == expected
+
+
 def _extension_tool(name):
     def run():
         return "ok"

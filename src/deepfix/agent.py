@@ -57,6 +57,7 @@ def _build_deepseek_model(role: ModelRoleConfig) -> ChatDeepSeek:
         base_url=role.base_url,
         temperature=0,
         profile=profile,
+        extra_body={"thinking": {"type": "disabled"}},
     )
 
 
