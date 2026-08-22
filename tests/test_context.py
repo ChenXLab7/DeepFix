@@ -19,6 +19,9 @@ from deepfix.context import (
     render_working_memory,
 )
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore, WorkingMemoryVersion
+from deepfix.prompting import PromptPolicyMiddleware
+from deepfix.research.middleware import ResearchEvidenceMiddleware
+from deepfix.research.store import ResearchEvidenceStore
 
 
 @pytest.fixture
@@ -186,3 +189,21 @@ def test_context_middleware_shares_one_summarization_engine(config, store):
     assert tool_layer._summarization is summarization
     assert summarization._lc_helper.trigger == ("fraction", 0.70)
     assert summarization._lc_helper.keep == ("fraction", 0.15)
+
+
+def test_context_middleware_has_explicit_prompt_memory_research_order(config, store):
+    research_store = ResearchEvidenceStore(config.database_path)
+
+    middleware = build_context_middleware(
+        build_model(config),
+        build_backend(config),
+        store,
+        research_store,
+    )
+    names = [type(item) for item in middleware]
+
+    assert names[-3:] == [
+        PromptPolicyMiddleware,
+        ContextMemoryMiddleware,
+        ResearchEvidenceMiddleware,
+    ]

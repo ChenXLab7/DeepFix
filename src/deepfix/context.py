@@ -18,6 +18,9 @@ from pydantic import ValidationError
 
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore, WorkingMemoryVersion
 from deepfix.models import Evidence
+from deepfix.prompting import PromptPolicyMiddleware
+from deepfix.research.middleware import ResearchEvidenceMiddleware
+from deepfix.research.store import ResearchEvidenceStore
 
 _TRUNCATION_MARKER = "…[truncated]"
 
@@ -94,7 +97,12 @@ def build_save_progress_tool(store: WorkingMemoryStore) -> BaseTool:
     )
 
 
-def build_context_middleware(model, backend, store: WorkingMemoryStore):
+def build_context_middleware(
+    model,
+    backend,
+    store: WorkingMemoryStore,
+    research_store: ResearchEvidenceStore | None = None,
+):
     summarization = SummarizationMiddleware(
         model=model,
         backend=backend,
@@ -107,6 +115,7 @@ def build_context_middleware(model, backend, store: WorkingMemoryStore):
             "truncation_text": "...(argument truncated)",
         },
     )
+    evidence_store = research_store or ResearchEvidenceStore(store.database_path)
     return [
         summarization,
         SummarizationToolMiddleware(
@@ -116,7 +125,9 @@ def build_context_middleware(model, backend, store: WorkingMemoryStore):
                 "再在上下文足够长时调用 compact_conversation。"
             ),
         ),
+        PromptPolicyMiddleware(store),
         ContextMemoryMiddleware(store),
+        ResearchEvidenceMiddleware(evidence_store),
     ]
 
 

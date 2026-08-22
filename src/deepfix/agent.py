@@ -17,7 +17,8 @@ from deepfix.context import build_context_middleware, build_save_progress_tool
 from deepfix.extensions import AgentExtensions, merge_extensions
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import RepairOutcome
-from deepfix.prompts import REPAIR_SYSTEM_PROMPT
+from deepfix.prompts import CORE_REPAIR_PROMPT
+from deepfix.research.store import ResearchEvidenceStore
 
 
 def build_model(config: AppConfig) -> ChatDeepSeek:
@@ -29,6 +30,7 @@ def build_agent(
     checkpointer,
     working_memory_store: WorkingMemoryStore,
     extensions: AgentExtensions | None = None,
+    research_evidence_store: ResearchEvidenceStore | None = None,
     *,
     allowed_skill_roots: tuple[str | Path, ...] = (),
 ):
@@ -66,10 +68,15 @@ def build_agent(
     }
     return create_deep_agent(
         model=model,
-        system_prompt=REPAIR_SYSTEM_PROMPT,
+        system_prompt=CORE_REPAIR_PROMPT,
         tools=[save_progress, *(item.tool for item in resolved.tools)],
         middleware=[
-            *build_context_middleware(model, backend, working_memory_store),
+            *build_context_middleware(
+                model,
+                backend,
+                working_memory_store,
+                research_evidence_store,
+            ),
             *resolved.middleware,
         ],
         backend=backend,
