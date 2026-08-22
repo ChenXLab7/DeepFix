@@ -552,6 +552,70 @@ class CompactionCoordinator:
             ),
         )
 
+    async def ainvoke_automatic(
+        self,
+        request: CompactionRequest,
+        handler: Callable[[tuple[AnyMessage, ...]], Any],
+    ) -> ModelResponse | ExtendedModelResponse:
+        self.memory_store.record_budget(
+            request.task_id,
+            request.budget.usage_ratio,
+            request.budget.zone,
+        )
+        input_hash = _input_hash(request, request.messages)
+        attempt_id = _attempt_id(request.task_id, input_hash)
+        if attempt_id in self._failed_attempts:
+            response = await handler(request.messages)
+            self.memory_store.record_passthrough(request.task_id)
+            return response
+        try:
+            prepared = await self.aprepare(request)
+        except CompactionPreparationError as exc:
+            failure = exc.failure
+            self.snapshot_store.record_failure(failure)
+            self.memory_store.record_compaction_failure(
+                request.task_id,
+                failure.error_code,
+            )
+            self._failed_attempts.add(failure.attempt_id)
+            if request.budget.zone == "emergency" or request.entrypoint == "overflow_recovery":
+                if failure.prepared_snapshot_version is not None:
+                    self.snapshot_store.abandon_snapshot(
+                        request.task_id,
+                        failure.prepared_snapshot_version,
+                        "emergency preparation failed",
+                    )
+                raise _recovery_required(request, failure) from exc
+            response = await handler(request.messages)
+            self.memory_store.record_passthrough(request.task_id)
+            if failure.prepared_snapshot_version is not None:
+                self.snapshot_store.abandon_snapshot(
+                    request.task_id,
+                    failure.prepared_snapshot_version,
+                    "passthrough produced newer conversation state",
+                )
+            return response
+
+        effective = (
+            prepared.snapshot_message,
+            *(
+                message
+                for message in request.messages
+                if str(message.id) in prepared.retention.retained_message_ids
+            ),
+        )
+        response = await handler(effective)
+        return ExtendedModelResponse(
+            model_response=response,
+            command=Command(
+                update={
+                    "_deepfix_compaction_event": prepared.event.model_dump(
+                        mode="json"
+                    )
+                }
+            ),
+        )
+
 
 def _with_task_scope(message: AnyMessage, task_id: str) -> AnyMessage:
     additional = dict(message.additional_kwargs)

@@ -15,6 +15,7 @@ from deepfix.compaction.models import (
     ResearchStatusEvidence,
     SystemTestEvidence,
 )
+from deepfix.compaction.snapshot import snapshot_content_hash
 from deepfix.persistence import open_sqlite_connection
 
 DeterministicEvidence: TypeAlias = (
@@ -100,9 +101,7 @@ class CompactionStore:
                 ).fetchone()
                 expected_version = int(row[0])
                 if snapshot.version != expected_version:
-                    raise ValueError(
-                        f"Snapshot version 必须为 {expected_version}，实际为 {snapshot.version}"
-                    )
+                    snapshot = _rebase_snapshot(snapshot, expected_version)
                 connection.execute(
                     """
                     INSERT INTO compaction_snapshots(
@@ -303,3 +302,34 @@ def _bounded_reason(value: str) -> str:
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds")
+
+
+def _rebase_snapshot(
+    snapshot: CompactionSnapshot,
+    version: int,
+) -> CompactionSnapshot:
+    old_version = snapshot.version
+
+    def rebase_hypotheses(items):
+        return [
+            item.model_copy(update={"updated_in_version": version})
+            if item.updated_in_version == old_version
+            else item
+            for item in items
+        ]
+
+    rebased = snapshot.model_copy(
+        update={
+            "version": version,
+            "active_hypotheses": rebase_hypotheses(snapshot.active_hypotheses),
+            "rejected_hypotheses": rebase_hypotheses(
+                snapshot.rejected_hypotheses
+            ),
+            "confirmed_hypotheses": rebase_hypotheses(
+                snapshot.confirmed_hypotheses
+            ),
+        }
+    )
+    return rebased.model_copy(
+        update={"content_hash": snapshot_content_hash(rebased)}
+    )

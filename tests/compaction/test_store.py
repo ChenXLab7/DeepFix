@@ -112,6 +112,20 @@ def test_abandoned_snapshot_never_resolves_as_active(tmp_path):
     assert store.active_snapshot_from_event("task-a", _event(1)) is None
 
 
+def test_new_prepared_snapshot_advances_past_abandoned_version(tmp_path):
+    store = CompactionStore(tmp_path / "deepfix.sqlite3")
+    store.save_prepared_snapshot(_snapshot(1, input_marker="a"), "input-1")
+    store.abandon_snapshot("task-a", 1, "superseded")
+
+    saved = store.save_prepared_snapshot(
+        _snapshot(1, input_marker="b"),
+        "input-2",
+    )
+
+    assert saved.version == 2
+    assert saved.lifecycle == "prepared"
+
+
 def test_failure_records_are_idempotent_by_attempt_and_stage(tmp_path):
     store = CompactionStore(tmp_path / "deepfix.sqlite3")
     failure = CompactionFailureRecord(
