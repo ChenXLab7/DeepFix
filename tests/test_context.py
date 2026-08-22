@@ -55,10 +55,9 @@ def progress_call(call_id: str, **overrides):
     args = {
         "phase": "investigating",
         "summary": "已复现失败",
-        "facts": ["失败可复现"],
+        "facts": [{"text": "失败可复现", "sources": []}],
         "evidence": [],
-        "active_hypotheses": [],
-        "rejected_hypotheses": [],
+        "hypotheses": [],
         "checked_files": [],
         "experiments": [],
         "next_steps": ["检查调用链"],
@@ -107,10 +106,16 @@ def test_save_progress_uses_thread_id_and_does_not_expose_task_id(tmp_path):
     result = invoke_tool(tool, progress_call("save-1"), "task-a")
 
     assert "task_id" not in tool.args
+    assert "claim_id" not in str(tool.args)
+    assert "active_hypotheses" not in tool.args
+    assert "rejected_hypotheses" not in tool.args
+    assert "hypotheses" in tool.args
     assert store.latest("task-a").version == 1
     assert store.latest("task-a").snapshot.summary == "已复现失败"
     assert result.status == "success"
-    assert result.artifact == {"version": 1}
+    assert result.artifact["version"] == 1
+    assert len(result.artifact["claim_ids"]) == 1
+    assert result.artifact["hypothesis_ids"] == []
 
 
 def test_save_progress_rejects_invalid_snapshot_without_writing_version(tmp_path):
@@ -118,13 +123,22 @@ def test_save_progress_rejects_invalid_snapshot_without_writing_version(tmp_path
     tool = build_save_progress_tool(store)
     call = progress_call(
         "save-invalid",
-        active_hypotheses=[f"假设 {index}" for index in range(11)],
+        hypotheses=[
+            {
+                "hypothesis_id": "hyp-old",
+                "text": "缓存过期",
+                "target_state": "active",
+                "reason": "新证据",
+                "reopens_hypothesis_id": "hyp-rejected",
+                "sources": [],
+            }
+        ],
     )
 
     result = invoke_tool(tool, call, "task-invalid")
 
     assert result.status == "error"
-    assert "active_hypotheses" in result.text
+    assert "hypothesis_id" in result.text
     assert store.latest("task-invalid") is None
 
 
@@ -171,6 +185,32 @@ def test_render_working_memory_has_a_hard_injection_bound():
     assert "事实-0-" in rendered
     assert "事实-8-" not in rendered
     assert len(rendered) <= 12_000
+
+
+def test_render_working_memory_includes_every_field_category():
+    complete = snapshot().model_copy(
+        update={
+            "rejected_hypotheses": ["路径问题已排除"],
+            "checked_files": ["src/calc.py"],
+            "experiments": ["pytest 退出码为 1"],
+        }
+    )
+
+    rendered = render_working_memory(
+        WorkingMemoryVersion(
+            task_id="task-a",
+            version=2,
+            snapshot=complete,
+            created_at="2026-08-21T00:00:00+00:00",
+        )
+    )
+
+    assert "<rejected_hypotheses>" in rendered
+    assert "路径问题已排除" in rendered
+    assert "<checked_files>" in rendered
+    assert "src/calc.py" in rendered
+    assert "<experiments>" in rendered
+    assert "pytest 退出码为 1" in rendered
 
 
 def test_context_middleware_shares_one_summarization_engine(config, store):

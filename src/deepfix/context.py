@@ -10,13 +10,21 @@ from deepagents.middleware.summarization import (
 )
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain.tools import ToolRuntime
-from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.config import get_config
 from pydantic import ValidationError
 
-from deepfix.memory import ProgressSnapshot, WorkingMemoryStore, WorkingMemoryVersion
+from deepfix.compaction.identity import ensure_message_ids, stable_generated_message_id
+from deepfix.compaction.models import (
+    FactCandidate,
+    HypothesisProgressInput,
+    HypothesisRecord,
+    ProvenancedClaim,
+    SnapshotCoverage,
+)
+from deepfix.memory import WorkingMemoryStore, WorkingMemoryVersion
 from deepfix.models import Evidence
 from deepfix.prompting import PromptPolicyMiddleware
 from deepfix.research.middleware import ResearchEvidenceMiddleware
@@ -36,10 +44,9 @@ def build_save_progress_tool(store: WorkingMemoryStore) -> BaseTool:
             "reviewing",
         ],
         summary: str,
-        facts: list[str],
+        facts: list[FactCandidate],
         evidence: list[Evidence],
-        active_hypotheses: list[str],
-        rejected_hypotheses: list[str],
+        hypotheses: list[HypothesisProgressInput],
         checked_files: list[str],
         experiments: list[str],
         next_steps: list[str],
@@ -55,36 +62,76 @@ def build_save_progress_tool(store: WorkingMemoryStore) -> BaseTool:
                 name="save_progress",
                 tool_call_id=runtime.tool_call_id or "",
                 status="error",
+                id=stable_generated_message_id(
+                    "unknown", runtime.tool_call_id or "save-progress", "missing_task"
+                ),
             )
 
         try:
-            snapshot = ProgressSnapshot(
+            state_messages = list(runtime.state.get("messages", []))
+            identities = ensure_message_ids(thread_id, state_messages)
+            valid_source_ids = {
+                str(message.id) for message in identities.messages if message.id
+            }
+            last_user_message_id = next(
+                (
+                    str(message.id)
+                    for message in reversed(identities.messages)
+                    if isinstance(message, HumanMessage) and message.id
+                ),
+                None,
+            )
+            saved = store.save_progress(
+                thread_id,
                 phase=phase,
                 summary=summary,
                 facts=facts,
                 evidence=evidence,
-                active_hypotheses=active_hypotheses,
-                rejected_hypotheses=rejected_hypotheses,
+                hypotheses=hypotheses,
                 checked_files=checked_files,
                 experiments=experiments,
                 next_steps=next_steps,
                 unresolved_questions=unresolved_questions,
+                coverage=SnapshotCoverage(
+                    last_user_message_id=last_user_message_id,
+                    covered_message_ids=[
+                        str(message.id)
+                        for message in identities.messages
+                        if message.id
+                    ],
+                ),
+                valid_source_ids=valid_source_ids,
             )
-        except ValidationError as exc:
+        except (ValidationError, ValueError) as exc:
             return ToolMessage(
                 content=f"保存工作记忆失败：{exc}",
                 name="save_progress",
                 tool_call_id=runtime.tool_call_id or "",
                 status="error",
+                id=stable_generated_message_id(
+                    thread_id,
+                    runtime.tool_call_id or "save-progress",
+                    "validation_error",
+                ),
             )
 
-        saved = store.save(thread_id, snapshot)
         return ToolMessage(
             content=f"工作记忆已保存为版本 {saved.version}",
             name="save_progress",
             tool_call_id=runtime.tool_call_id or "",
             status="success",
-            artifact={"version": saved.version},
+            artifact={
+                "version": saved.version,
+                "claim_ids": [item.claim_id for item in saved.snapshot.facts],
+                "hypothesis_ids": [
+                    item.hypothesis_id for item in saved.snapshot.all_hypotheses()
+                ],
+            },
+            id=stable_generated_message_id(
+                thread_id,
+                runtime.tool_call_id or f"save-progress-{saved.version}",
+                "success",
+            ),
         )
 
     return StructuredTool.from_function(
@@ -137,14 +184,31 @@ def render_working_memory(version: WorkingMemoryVersion) -> str:
         f'<deepfix_working_memory version="{version.version}">',
         f"<phase>{_bounded(snapshot.phase, 40)}</phase>",
         f"<summary>{_bounded(snapshot.summary, 1200)}</summary>",
-        _render_text_items("facts", "fact", snapshot.facts, 8, 200),
+        _render_claims(snapshot.facts),
         _render_evidence(snapshot.evidence),
-        _render_text_items(
+        _render_hypotheses(
             "active_hypotheses",
-            "hypothesis",
             snapshot.active_hypotheses,
             5,
             200,
+        ),
+        _render_hypotheses(
+            "rejected_hypotheses",
+            snapshot.rejected_hypotheses,
+            10,
+            240,
+        ),
+        _render_hypotheses(
+            "confirmed_hypotheses",
+            snapshot.confirmed_hypotheses,
+            10,
+            240,
+        ),
+        _render_text_items(
+            "checked_files", "file", snapshot.checked_files, 20, 240
+        ),
+        _render_text_items(
+            "experiments", "experiment", snapshot.experiments, 15, 300
         ),
         _render_text_items("next_steps", "step", snapshot.next_steps, 5, 200),
         _render_text_items(
@@ -154,6 +218,7 @@ def render_working_memory(version: WorkingMemoryVersion) -> str:
             5,
             200,
         ),
+        _render_coverage(snapshot.coverage),
         "</deepfix_working_memory>",
     ]
     return "\n".join(sections)
@@ -239,4 +304,57 @@ def _render_evidence(values: list[Evidence]) -> str:
     if len(values) > 10:
         lines.append(f"<truncated>{_TRUNCATION_MARKER}</truncated>")
     lines.append("</evidence>")
+    return "\n".join(lines)
+
+
+def _render_claims(values: list[ProvenancedClaim] | list[str]) -> str:
+    lines = ["<facts>"]
+    for value in values[:8]:
+        text = value if isinstance(value, str) else value.text
+        claim_id = "legacy" if isinstance(value, str) else value.claim_id
+        lines.append(
+            f'<fact claim_id="{_bounded(claim_id, 100)}">'
+            f"{_bounded(text, 200)}</fact>"
+        )
+    if len(values) > 8:
+        lines.append(f'<omitted_count value="{len(values) - 8}" />')
+    lines.append("</facts>")
+    return "\n".join(lines)
+
+
+def _render_hypotheses(
+    section_name: str,
+    values: list[HypothesisRecord] | list[str],
+    item_limit: int,
+    character_limit: int,
+) -> str:
+    lines = [f"<{section_name}>"]
+    for value in values[:item_limit]:
+        if isinstance(value, str):
+            hypothesis_id, text, reason = "legacy", value, None
+        else:
+            hypothesis_id, text, reason = value.hypothesis_id, value.text, value.reason
+        lines.append(
+            f'<hypothesis hypothesis_id="{_bounded(hypothesis_id, 100)}">'
+            f"<text>{_bounded(text, character_limit)}</text>"
+            f"<reason>{_bounded(reason or '', character_limit)}</reason>"
+            "</hypothesis>"
+        )
+    if len(values) > item_limit:
+        lines.append(f'<omitted_count value="{len(values) - item_limit}" />')
+    lines.append(f"</{section_name}>")
+    return "\n".join(lines)
+
+
+def _render_coverage(value: SnapshotCoverage) -> str:
+    lines = ["<coverage>"]
+    if value.last_user_message_id:
+        lines.append(
+            f"<last_user_message_id>{_bounded(value.last_user_message_id, 100)}</last_user_message_id>"
+        )
+    lines.append(f"<covered_message_count>{len(value.covered_message_ids)}</covered_message_count>")
+    lines.append(
+        f"<covered_work_unit_count>{len(value.covered_work_unit_ids)}</covered_work_unit_count>"
+    )
+    lines.append("</coverage>")
     return "\n".join(lines)

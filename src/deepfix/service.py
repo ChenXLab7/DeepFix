@@ -330,7 +330,10 @@ class BugfixService:
                     evidence_keys.add(key)
             task.hypotheses = list(
                 dict.fromkeys(
-                    [*task.hypotheses, *latest.snapshot.active_hypotheses]
+                    [
+                        *task.hypotheses,
+                        *(item.text for item in latest.snapshot.active_hypotheses),
+                    ]
                 )
             )
 

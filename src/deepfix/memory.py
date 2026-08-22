@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from dataclasses import asdict, dataclass
@@ -7,8 +8,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 
+from deepfix.compaction.identity import (
+    stable_claim_id,
+    stable_hypothesis_id,
+    stable_reopened_hypothesis_id,
+)
+from deepfix.compaction.models import (
+    FactCandidate,
+    HypothesisProgressInput,
+    HypothesisRecord,
+    ProvenancedClaim,
+    ProvenanceRef,
+    SnapshotCoverage,
+)
 from deepfix.models import ContextMetrics, Evidence
 from deepfix.persistence import open_sqlite_connection
 
@@ -32,14 +46,66 @@ class ProgressSnapshot(BaseModel):
         "reviewing",
     ]
     summary: SummaryText
-    facts: list[MemoryText] = Field(default_factory=list, max_length=30)
+    facts: list[ProvenancedClaim] = Field(default_factory=list, max_length=30)
     evidence: list[Evidence] = Field(default_factory=list, max_length=50)
-    active_hypotheses: list[MemoryText] = Field(default_factory=list, max_length=10)
-    rejected_hypotheses: list[MemoryText] = Field(default_factory=list, max_length=20)
+    active_hypotheses: list[HypothesisRecord] = Field(default_factory=list, max_length=10)
+    rejected_hypotheses: list[HypothesisRecord] = Field(default_factory=list, max_length=20)
+    confirmed_hypotheses: list[HypothesisRecord] = Field(default_factory=list, max_length=20)
     checked_files: list[MemoryText] = Field(default_factory=list, max_length=50)
     experiments: list[MemoryText] = Field(default_factory=list, max_length=30)
     next_steps: list[MemoryText] = Field(default_factory=list, max_length=10)
     unresolved_questions: list[MemoryText] = Field(default_factory=list, max_length=10)
+    coverage: SnapshotCoverage = Field(default_factory=SnapshotCoverage)
+
+    @field_validator("facts", mode="before")
+    @classmethod
+    def migrate_legacy_facts(cls, value):
+        return [
+            {
+                "claim_id": f"legacy_claim_{_text_hash(item)}",
+                "text": item,
+                "sources": [],
+                "state": "confirmed",
+            }
+            if isinstance(item, str)
+            else item
+            for item in (value or [])
+        ]
+
+    @field_validator(
+        "active_hypotheses",
+        "rejected_hypotheses",
+        "confirmed_hypotheses",
+        mode="before",
+    )
+    @classmethod
+    def migrate_legacy_hypotheses(cls, value, info):
+        state = {
+            "active_hypotheses": "active",
+            "rejected_hypotheses": "rejected",
+            "confirmed_hypotheses": "confirmed",
+        }[info.field_name]
+        return [
+            {
+                "hypothesis_id": f"legacy_hyp_{_text_hash(item)}",
+                "text": item,
+                "state": state,
+                "reason": "legacy working memory" if state != "active" else None,
+                "reopens_hypothesis_id": None,
+                "sources": [],
+                "updated_in_version": 1,
+            }
+            if isinstance(item, str)
+            else item
+            for item in (value or [])
+        ]
+
+    def all_hypotheses(self) -> list[HypothesisRecord]:
+        return [
+            *self.active_hypotheses,
+            *self.rejected_hypotheses,
+            *self.confirmed_hypotheses,
+        ]
 
 
 @dataclass(frozen=True)
@@ -62,6 +128,7 @@ class WorkingMemoryStore:
         snapshot: ProgressSnapshot,
     ) -> WorkingMemoryVersion:
         normalized_task_id = self._normalize_task_id(task_id)
+        snapshot = self._canonicalize_legacy_ids(normalized_task_id, snapshot)
         created_at = self._now()
         with self._connection() as connection:
             try:
@@ -96,6 +163,71 @@ class WorkingMemoryStore:
             snapshot=snapshot,
             created_at=created_at,
         )
+
+    def save_progress(
+        self,
+        task_id: str,
+        *,
+        phase: Literal[
+            "clarifying", "investigating", "planning", "editing", "testing", "reviewing"
+        ],
+        summary: str,
+        facts: list[FactCandidate],
+        evidence: list[Evidence],
+        hypotheses: list[HypothesisProgressInput],
+        checked_files: list[str],
+        experiments: list[str],
+        next_steps: list[str],
+        unresolved_questions: list[str],
+        coverage: SnapshotCoverage,
+        valid_source_ids: set[str],
+    ) -> WorkingMemoryVersion:
+        normalized_task_id = self._normalize_task_id(task_id)
+        self._validate_sources(facts, hypotheses, valid_source_ids)
+        latest = self.latest(normalized_task_id)
+        next_version = (latest.version if latest else 0) + 1
+        existing = {
+            item.hypothesis_id: item
+            for item in (latest.snapshot.all_hypotheses() if latest else [])
+        }
+        for update in hypotheses:
+            self._apply_hypothesis_update(
+                normalized_task_id,
+                next_version,
+                existing,
+                update,
+            )
+
+        claims = [
+            ProvenancedClaim(
+                claim_id=stable_claim_id(normalized_task_id, item.text),
+                text=item.text,
+                sources=item.sources,
+                state="confirmed",
+            )
+            for item in facts
+        ]
+        snapshot = ProgressSnapshot(
+            phase=phase,
+            summary=summary,
+            facts=claims,
+            evidence=evidence,
+            active_hypotheses=[
+                item for item in existing.values() if item.state == "active"
+            ],
+            rejected_hypotheses=[
+                item for item in existing.values() if item.state == "rejected"
+            ],
+            confirmed_hypotheses=[
+                item for item in existing.values() if item.state == "confirmed"
+            ],
+            checked_files=checked_files,
+            experiments=experiments,
+            next_steps=next_steps,
+            unresolved_questions=unresolved_questions,
+            coverage=coverage,
+        )
+        return self.save(normalized_task_id, snapshot)
 
     def latest(self, task_id: str) -> WorkingMemoryVersion | None:
         normalized_task_id = self._normalize_task_id(task_id)
@@ -202,6 +334,124 @@ class WorkingMemoryStore:
         return open_sqlite_connection(self.database_path)
 
     @staticmethod
+    def _validate_sources(
+        facts: list[FactCandidate],
+        hypotheses: list[HypothesisProgressInput],
+        valid_source_ids: set[str],
+    ) -> None:
+        for source in (
+            source
+            for item in [*facts, *hypotheses]
+            for source in item.sources
+        ):
+            if source.ref_id not in valid_source_ids:
+                raise ValueError(f"source ref_id 不属于当前任务: {source.ref_id}")
+
+    @staticmethod
+    def _apply_hypothesis_update(
+        task_id: str,
+        version: int,
+        existing: dict[str, HypothesisRecord],
+        update: HypothesisProgressInput,
+    ) -> None:
+        if update.hypothesis_id and update.reopens_hypothesis_id:
+            raise ValueError("hypothesis_id 与 reopens_hypothesis_id 不能同时提供")
+        if update.reopens_hypothesis_id:
+            previous = existing.get(update.reopens_hypothesis_id)
+            if previous is None or previous.state != "rejected":
+                raise ValueError("reopens_hypothesis_id 必须引用已排除假设")
+            if update.target_state != "active" or not update.reason or not update.sources:
+                raise ValueError("重新开启假设需要 active、reason 和 new evidence source")
+            first_source = update.sources[0].ref_id
+            new_id = stable_reopened_hypothesis_id(
+                task_id,
+                previous.hypothesis_id,
+                first_source,
+                update.text,
+            )
+            existing[new_id] = HypothesisRecord(
+                hypothesis_id=new_id,
+                text=update.text,
+                state="active",
+                reason=update.reason,
+                reopens_hypothesis_id=previous.hypothesis_id,
+                sources=update.sources,
+                updated_in_version=version,
+            )
+            return
+        if update.hypothesis_id:
+            previous = existing.get(update.hypothesis_id)
+            if previous is None:
+                raise ValueError("hypothesis_id 不属于当前任务")
+            if previous.state != "active" and update.target_state != previous.state:
+                raise ValueError("只有 active 假设可以进行普通状态迁移")
+            if update.target_state in {"rejected", "confirmed"} and not update.reason:
+                raise ValueError("迁移到 rejected/confirmed 必须提供 reason")
+            existing[previous.hypothesis_id] = previous.model_copy(
+                update={
+                    "text": update.text,
+                    "state": update.target_state,
+                    "reason": update.reason,
+                    "sources": _merge_sources(previous.sources, update.sources),
+                    "updated_in_version": version,
+                }
+            )
+            return
+        if update.target_state != "active":
+            raise ValueError("新假设只能以 active 创建，状态迁移必须提供 hypothesis_id")
+        if not update.sources:
+            raise ValueError("新假设必须提供 source")
+        new_id = stable_hypothesis_id(task_id, update.sources[0].ref_id, update.text)
+        existing[new_id] = HypothesisRecord(
+            hypothesis_id=new_id,
+            text=update.text,
+            state="active",
+            reason=update.reason,
+            reopens_hypothesis_id=None,
+            sources=update.sources,
+            updated_in_version=version,
+        )
+
+    @staticmethod
+    def _canonicalize_legacy_ids(
+        task_id: str,
+        snapshot: ProgressSnapshot,
+    ) -> ProgressSnapshot:
+        facts = [
+            item.model_copy(update={"claim_id": stable_claim_id(task_id, item.text)})
+            if item.claim_id.startswith("legacy_claim_")
+            else item
+            for item in snapshot.facts
+        ]
+        hypotheses = []
+        for item in snapshot.all_hypotheses():
+            if item.hypothesis_id.startswith("legacy_hyp_"):
+                item = item.model_copy(
+                    update={
+                        "hypothesis_id": stable_hypothesis_id(
+                            task_id,
+                            "legacy-working-memory",
+                            item.text,
+                        )
+                    }
+                )
+            hypotheses.append(item)
+        return snapshot.model_copy(
+            update={
+                "facts": facts,
+                "active_hypotheses": [
+                    item for item in hypotheses if item.state == "active"
+                ],
+                "rejected_hypotheses": [
+                    item for item in hypotheses if item.state == "rejected"
+                ],
+                "confirmed_hypotheses": [
+                    item for item in hypotheses if item.state == "confirmed"
+                ],
+            }
+        )
+
+    @staticmethod
     def _read_metrics(
         connection: sqlite3.Connection,
         task_id: str,
@@ -259,3 +509,17 @@ class WorkingMemoryStore:
     @staticmethod
     def _now() -> str:
         return datetime.now(UTC).isoformat(timespec="microseconds")
+
+
+def _text_hash(value: str) -> str:
+    return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()[:24]
+
+
+def _merge_sources(
+    previous: list[ProvenanceRef],
+    current: list[ProvenanceRef],
+) -> list[ProvenanceRef]:
+    merged: dict[tuple[str, str], ProvenanceRef] = {}
+    for source in [*previous, *current]:
+        merged[(source.kind, source.ref_id)] = source
+    return list(merged.values())
