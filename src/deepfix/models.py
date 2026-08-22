@@ -115,6 +115,8 @@ class TestResult:
     command: str
     exit_code: int
     summary: str
+    tool_call_id: str | None = None
+    source_message_id: str | None = None
 
 
 @dataclass

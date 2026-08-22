@@ -10,7 +10,7 @@ from langgraph.types import Command, Interrupt
 from deepfix.approval import ApprovalPolicy
 from deepfix.config import ApprovalMode, load_config
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
-from deepfix.models import Evidence, RepairOutcome, TaskStatus
+from deepfix.models import Evidence, RepairOutcome, TaskState, TaskStatus
 from deepfix.persistence import TaskRepository
 from deepfix.research.models import ExternalEvidence, SearchCandidate
 from deepfix.research.store import ResearchEvidenceStore
@@ -84,6 +84,7 @@ def passing_outcome(command="pytest -q"):
                 ],
             ),
             ToolMessage(
+                id="test-message-1",
                 content="1 passed",
                 name="execute",
                 tool_call_id="test-call-1",
@@ -91,6 +92,18 @@ def passing_outcome(command="pytest -q"):
             ),
         ],
     }
+
+
+def test_recorded_test_result_keeps_tool_and_message_provenance(app_config):
+    service, _ = make_service(app_config, FakeAgent())
+    task = TaskState.create(app_config.project_root, "修复错误", ApprovalMode.MANUAL)
+
+    service._record_tool_results(task, passing_outcome())
+    service._record_tool_results(task, passing_outcome())
+
+    assert len(task.test_results) == 1
+    assert task.test_results[0].tool_call_id == "test-call-1"
+    assert task.test_results[0].source_message_id == "test-message-1"
 
 
 @pytest.fixture

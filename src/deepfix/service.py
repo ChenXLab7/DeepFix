@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command
 
 from deepfix.approval import ApprovalPolicy, PolicyAction
+from deepfix.compaction.identity import ensure_message_ids
 from deepfix.config import AppConfig
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus, TestResult
@@ -241,7 +242,8 @@ class BugfixService:
         return self._invoke(task, Command(resume={"decisions": graph_decisions}))
 
     def _record_tool_results(self, task: TaskState, result: Mapping[str, Any]) -> None:
-        messages = result.get("messages", [])
+        raw_messages = result.get("messages", [])
+        messages = ensure_message_ids(task.task_id, raw_messages).messages
         calls: dict[str, tuple[str, Mapping[str, object]]] = {}
         for message in messages:
             if isinstance(message, AIMessage):
@@ -268,7 +270,13 @@ class BugfixService:
                 continue
             exit_code = int(artifact["exit_code"])
             task.test_results.append(
-                TestResult(command, exit_code, str(message.content))
+                TestResult(
+                    command=command,
+                    exit_code=exit_code,
+                    summary=str(message.content),
+                    tool_call_id=call_id,
+                    source_message_id=str(message.id),
+                )
             )
             if exit_code == 0:
                 task.consecutive_test_failures = 0
