@@ -253,14 +253,15 @@ Graph Messages 仍然存在。Research Evidence 继续以 `ResearchEvidenceStore
 ### 6.6 去重投影规则
 
 Store 可以为恢复和审计保存重叠投影，但一次 ModelRequest 中同一规范实体只能展示一次。
-`ProtectedContextProjector` 在渲染前建立三个全局索引：`constraint_id`、`evidence_id`、
-`hypothesis_id`。索引采用固定所有者：
+`ProtectedContextProjector` 在渲染前建立四个全局索引：`constraint_id`、`evidence_id`、
+`hypothesis_id`、`claim_id`。索引采用固定所有者：
 
 | 规范实体 | 当前状态的展示所有者 | Snapshot 在模型请求中的职责 |
 |---|---|---|
 | constraint_id | Task Anchor | 不重复约束正文或状态，只保留未被当前 Anchor 覆盖的历史来源 |
 | evidence_id | Deterministic Evidence | 不重复测试、文件、审批或研究记录，只保留历史 WorkUnit/artifact 来源 |
 | hypothesis_id | 最新 Working Memory；若不存在才使用 Snapshot | 不重复当前假设，只补充历史迁移来源和已压缩工作单元 |
+| claim_id | 最新 Working Memory；若不存在才使用 Snapshot | 不重复当前语义事实，只补充增加的 provenance 和历史版本 |
 
 投影顺序固定为 Task Anchor → Deterministic Evidence → Working Memory → CompactionSnapshot。前一层登记
 的 ID，后一层不得再次渲染实体正文、当前状态或同义副本。后一层携带的新 provenance 合并进唯一的
@@ -272,11 +273,53 @@ Snapshot version、WorkUnit ID 和 artifact 引用追溯历史。
 Protected Context 存在对应 ID 时，Snapshot 不展示这些字段的实体内容。不同 ID 即使文本相同也不
 自动合并，除非 Builder 的规范化规则能证明它们是同一实体。去重只影响展示，不删除 Store 数据。
 
-为让假设去重可执行，Working Memory 的 active/rejected 假设在持久化层归一化为带
-`hypothesis_id` 的记录。新的 `save_progress` 可以回传保护区中已有的 ID；兼容旧字符串输入时，Store
-先按当前任务已有 Snapshot/Working Memory 的规范化文本和 provenance 查找原 ID，找不到才按
-`task_id + 首次来源 ID + 规范化文本` 生成稳定 ID。同一假设从 active 迁移到 rejected/confirmed 时
-复用该 ID，不能因状态变化创建重复实体。
+为让假设去重可执行，Working Memory 的 active/rejected/confirmed 假设在持久化层归一化为带
+`hypothesis_id` 的记录。运行时身份由结构化 `save_progress` 输入决定，不能用文本相似度猜测同一假设：
+
+```python
+class HypothesisProgressInput(BaseModel):
+    hypothesis_id: str | None = None
+    text: str
+    target_state: Literal["active", "rejected", "confirmed"]
+    reason: str | None = None
+    reopens_hypothesis_id: str | None = None
+    sources: list[ProvenanceRef]
+```
+
+- 新假设不提供两个 ID，由 Store 根据 `task_id + 首次来源 ID + 规范化文本` 生成 ID。
+- 普通状态迁移必须提供现有 `hypothesis_id`，复用该 ID；迁移到 rejected/confirmed 时 `reason` 必填。
+- 新证据重新开启已排除假设时，`target_state` 必须为 active，提供
+  `reopens_hypothesis_id`、`reason` 和新证据来源，不提供 `hypothesis_id`。Store 保留旧 rejected 记录并
+  根据 `task_id + reopens_hypothesis_id + 首个新证据来源 ID + 规范化文本` 为重新开启的记录生成新 ID，
+  同时保存 `reopens_hypothesis_id` 关系。
+- 同时提供 `hypothesis_id` 和 `reopens_hypothesis_id`、引用不存在/非 rejected 的旧假设，或缺少必要
+  reason/source 都拒绝保存。ToolMessage 返回解析后的 ID 和 Working Memory version。
+
+`save_progress` 使用单一 `hypotheses: list[HypothesisProgressInput]` 投影出三种状态列表；旧版字符串列表
+只在一次性迁移器中按首次来源生成 legacy ID，不参与运行时文本匹配。事实输入仍是无规范 ID 的
+`FactCandidate`，由与 Snapshot Builder 相同的确定性身份函数生成 `claim_id` 后再写入 Working Memory；
+模型和 Tool 参数都不能指定规范 `claim_id`。
+
+### 6.7 所有 Graph Messages 的稳定身份
+
+`MessageIdentityNormalizer` 在 EvidenceCollector、WorkUnitPartitioner、coverage 和 history 序列化之前，
+为当前任务的每条 Graph Message 确保稳定 ID：
+
+1. 已有非空 `message.id` 时原样复用。
+2. 缺失时，以消息首次进入未压缩 Graph state 时的原始序号 `original_ordinal`，结合 `task_id`、消息
+   类型、规范化 `tool_call_ids` 和规范化内容哈希，确定性生成
+   `msg_<sha256(task_id|original_ordinal|type|tool_call_ids|content_hash)>`。
+3. 内容规范化只统一换行，并对结构化 content 使用键排序、无多余空白的 JSON；不删除有语义的空格。
+   AIMessage 使用排序后的全部 Tool Call ID，ToolMessage 使用自己的 `tool_call_id`，其他消息使用空列表。
+4. Normalizer 通过 Graph state update 写回缺失 ID 和 `original_ordinal` 元数据；压缩后不得按新列表位置
+   重新计算。已有 ID 冲突时不擅自改写，记录 identity conflict，并把涉及区域视为 ambiguous 整体保留。
+
+DeepFix 生成的 Snapshot Message、主动压缩结果 ToolMessage 和失败 ToolMessage 也必须有确定性 ID；
+分别由 task ID 加 Snapshot version/content hash，或 task ID 加 compaction attempt ID/结果类型生成。
+`WorkUnit.unit_id` 由有序规范 message IDs 生成；`ProvenanceRef(kind="user_message")` 和其他消息来源
+引用使用规范 message ID，work_unit 来源引用使用上述稳定 unit ID。`SnapshotCoverage`、history
+manifest、artifact 幂等和 `compaction_event_id` 输入哈希沿用这套身份链。这样一次重试不会重复
+history 事件，压缩前后也不会因消息位置变化失去来源关系。
 
 ## 7. 完整工作单元
 
@@ -350,8 +393,9 @@ Monitor，且必须是正整数。不能让 Deep Agents 和 DeepFix 使用不同
 | `> 0.90` | 紧急压缩区 | 事务式压缩，只保留必保单元并以 `<= 0.65` 为目标 |
 
 Working Memory “过旧”采用覆盖关系而非时间猜测。`save_progress` 由 Runtime 自动记录
-`SnapshotCoverage(last_user_message_id, covered_tool_call_ids)`；当最新用户消息或最新完成工作单元的
-Tool Call ID 未被 coverage 覆盖时，Working Memory 过旧。旧版本没有 coverage 时视为过旧。
+`SnapshotCoverage(last_user_message_id, covered_message_ids, covered_work_unit_ids)`；这些字段都使用
+§6.7 的稳定 ID。当最新用户消息或最新完成工作单元的任一消息 ID 未被 coverage 覆盖时，Working
+Memory 过旧。Tool Call ID 只用于配对，不再单独承担消息覆盖身份。旧版本没有 coverage 时视为过旧。
 
 观察区提示对同一 `(working_memory_version, latest_work_unit_id)` 只出现一次，避免每次 Model Call
 重复消耗上下文。
@@ -379,7 +423,11 @@ class CompactionSnapshot(BaseModel):
     task_id: str
     version: int
     previous_version: int | None
+    lifecycle: Literal["prepared", "active", "abandoned"]
     created_at: str
+    activated_at: str | None
+    abandoned_at: str | None
+    abandon_reason: str | None
     source_work_unit_ids: list[str]
     task_goal: str
     user_constraints: list[UserConstraint]
@@ -413,6 +461,7 @@ class ProvenancedText(BaseModel):
     sources: list[ProvenanceRef]
 
 class ProvenancedClaim(ProvenancedText):
+    claim_id: str
     state: Literal["confirmed", "conflict"]
 
 class HypothesisRecord(BaseModel):
@@ -420,6 +469,7 @@ class HypothesisRecord(BaseModel):
     text: str
     state: Literal["active", "rejected", "confirmed"]
     reason: str | None
+    reopens_hypothesis_id: str | None
     sources: list[ProvenanceRef]
     updated_in_version: int
 
@@ -457,11 +507,16 @@ class UserConstraintCandidate(BaseModel):
     requested_state: Literal["active", "revoked"]
     supersedes_constraint_id: str | None
 
+class FactCandidate(ProvenancedText):
+    # 模型只能提交候选文本和来源，不能提交规范 claim_id
+    pass
+
 class HypothesisTransition(BaseModel):
     hypothesis_id: str | None
     text: str
     target_state: Literal["active", "rejected", "confirmed"]
     reason: str | None
+    reopens_hypothesis_id: str | None
     sources: list[ProvenanceRef]
 
 class ConflictCandidate(BaseModel):
@@ -474,7 +529,7 @@ class ConflictCandidate(BaseModel):
 
 class CompactionDelta(BaseModel):
     user_constraint_candidates: list[UserConstraintCandidate]
-    confirmed_fact_candidates: list[ProvenancedClaim]
+    confirmed_fact_candidates: list[FactCandidate]
     hypothesis_transitions: list[HypothesisTransition]
     experiments: list[ExperimentRecord]
     conflict_candidates: list[ConflictCandidate]
@@ -484,7 +539,11 @@ class CompactionDelta(BaseModel):
 
 `changed_files` 和 `test_results` 是 `deterministic_evidence` 的规范投影，方便模型消费；Builder 必须从
 系统证据生成，不能接受模型提供的另一份值。`content_hash` 对除自身外的规范 JSON 计算，用于写后
-校验和重复请求幂等判断。
+校验和重复请求幂等判断。Delta 输出 schema 中不存在 `claim_id`；Builder 校验 candidate provenance
+后，按精确规范化文本查找已有规范 claim 并复用 ID、合并来源；未命中时根据
+`task_id + claim_normalization_version + 规范化文本` 生成确定性 `claim_id`。来源增加不会改变 claim
+身份；相同规范文本但语义作用域冲突时生成 `ConflictRecord`，而不是让模型选择 ID。模型返回的未知字段一律拒绝，
+因此不能自行选择、覆盖或伪造规范 claim 身份。
 
 ### 9.2 合并输入与规则
 
@@ -509,9 +568,11 @@ class CompactionDelta(BaseModel):
 - 用户约束只能由带来源的用户消息新增、撤销或替换。
 - tests、file changes 和 approvals 每次从 deterministic evidence ledger 重建；external verification
   每次从 ResearchEvidenceStore 重建；各自覆盖 Snapshot 中对应类型的旧投影。
-- 假设允许 `active -> rejected` 或 `active -> confirmed`。被排除假设重新出现时创建新 ID，并通过
-  provenance 指向旧记录，不能删除原排除原因。
-- 同一规范事实按稳定 ID 去重；文本相同但来源增加时合并来源。
+- 假设允许 `active -> rejected` 或 `active -> confirmed`，普通迁移必须携带现有 hypothesis ID。被排除
+  假设因新证据重新开启时遵循 §6.6 的 `reopens_hypothesis_id` 协议，创建新 ID 并保留原排除原因；
+  不能只靠文本匹配决定迁移或重新开启。
+- 同一规范事实按 Builder 生成的稳定 `claim_id` 去重；文本相同且身份规则命中时合并来源，否则保留为
+  不同 candidate 或生成 semantic conflict。
 - 新信息与用户/系统权威来源冲突时添加 `ConflictRecord`，按 `information_type` 查找该类型的
   `source_of_truth`；纯语义冲突没有确定来源时保持 `unresolved_semantic`。
 - 旧的详细消息转为 artifact 引用，但 Snapshot 中保留足以判断结论和定位来源的结构化信息。
@@ -519,8 +580,21 @@ class CompactionDelta(BaseModel):
 
 ### 9.3 Snapshot 存储与模型可见性
 
-新增 `compaction_snapshots(task_id, version, payload, input_hash, created_at)`，复用现有 SQLite WAL、
-busy timeout 和任务复合主键模式。版本按任务单调递增。
+新增 `compaction_snapshots(task_id, version, lifecycle, payload, input_hash, created_at, activated_at,
+abandoned_at, abandon_reason)`，复用现有 SQLite WAL、busy timeout 和任务复合主键模式。版本按任务
+单调递增。Snapshot 首次写入是 `prepared`；只有生效的 `_deepfix_compaction_event` 指向该版本后才标记
+`active`。这里 `active` 表示该版本曾成功生效，不表示它永远是当前版本；当前唯一权威仍是 Graph event
+中的 `active_snapshot_version`，不能通过查询最新 `active` 行推断。
+
+`content_hash` 只覆盖不可变的规范语义 payload，不覆盖 `lifecycle`、三个生命周期时间、
+`abandon_reason` 或 `content_hash` 自身。prepared→active/abandoned 只改变操作元数据，不改变通过写后
+校验的 Snapshot 内容；任何语义字段变化都必须创建新 version。
+
+已准备但未提交 event 的 Snapshot 可在相同 input hash 下安全复用。原请求继续后产生了新消息、输入
+哈希变化或准备记录校验失败时，将其标记为 `abandoned` 并记录有界原因；`abandoned` 永不生效也不参与
+合并。event 提交与 Store 生命周期标记不是跨存储原子事务，因此每次读取先以 event 为准执行幂等
+reconciliation：event 指向的 prepared 行补标 active；没有 event 的 active 行按审计错误处理，不能
+擅自成为当前 Snapshot。
 
 模型请求中的旧自然语言摘要被一个有界的结构化 Snapshot 消息替代：
 
@@ -546,38 +620,73 @@ Message 动态注入，因此 Snapshot 消息即使为了预算缩短，也不�
 4. 生成 `CompactionDelta`，由 Builder 与旧 Snapshot、Working Memory、Task Anchor、系统证据合并。
 5. 完成 schema、task ID、用户约束、确定性证据、工作单元覆盖和 artifact 引用校验。
 6. 在 SQLite 事务中写入新 Snapshot，再回读校验 version 和 `content_hash`。
-7. 构造 `snapshot message + 完整保留单元` 的请求视图。
-8. 最后提交新的 DeepFix compaction event；只有该 event 被 Graph state 接受后，旧消息才不再进入
-   后续有效上下文。
+7. 构造 `snapshot message + 完整保留单元` 的请求视图。自动入口用该视图调用模型 handler；主动 Tool
+   入口构造包含成功 ToolMessage 和状态更新的 Command，不在 Tool 内递归调用模型。
+8. 自动入口只在 handler 成功后返回 compaction event；主动入口只在 1—6 成功后随 Command 返回该
+   event。只有 event 被 Graph state 接受后，旧消息才不再进入后续有效上下文，并由 reconciliation
+   将对应 Snapshot 从 prepared 标记为 active。
 
-步骤 1—6 不删除或替换任何旧消息。步骤 7 的模型调用失败时不提交 event；已写 artifact/Snapshot
-是可复用的安全准备记录，而不是当前生效版本。event 保存 `active_snapshot_version`，系统只能使用
-event 指向的 Snapshot，不能把未提交的“最新行”误当成生效版本。
+步骤 1—6 不删除或替换任何旧消息。自动入口步骤 7 的模型调用失败时不提交 event；已写 artifact/Snapshot
+仍是 prepared 安全记录，而不是当前生效版本。相同 input hash 可复用；原请求直通产生新消息或输入
+发生变化时标记 abandoned。event 保存 `active_snapshot_version`，系统只能使用 event 指向的 Snapshot，
+不能把未提交的“最新行”误当成生效版本。
 
 这里“完整 Conversation Artifact”指所有即将退出有效上下文的消息逐条、无摘要地写入 history；
 仍被保留的消息继续存在于 Graph checkpoint。history event 另外保存保留单元的 ID/哈希清单，因此
 `history + checkpoint` 可以重建压缩前的完整有效会话，而不是只留下模型摘要。
 
 主动 `compact_conversation` 返回成功 ToolMessage 前同样必须完成 1—6；尚未达到压缩条件时仍返回
-“不需要压缩”的正常 ToolMessage，事务开始后的失败则抛出类型化协调异常，不更新 compaction event。
-自动与主动入口以同一输入哈希实现幂等，重试不能重复追加同一 history 事件。
+“不需要压缩”的正常 ToolMessage。失败按下一节的预算区域和入口类型处理，任何失败都不更新
+compaction event。自动与主动入口以同一输入哈希实现幂等，重试不能重复追加同一 history 事件。
 
-### 10.2 Artifact 或 Snapshot 失败
+### 10.2 分级失败策略
 
-- 一旦自动或主动压缩事务已经开始，artifact、Delta、Snapshot 或写后校验失败都停止本次模型调用，
-  保留原消息并抛出类型化协调异常；不能在失败后静默改用未压缩请求继续。
-- 异常携带失败阶段、usage ratio、原消息是否保持、Working Memory 版本、已确认 artifact 和准备好的
-  Snapshot 版本。BugfixService 捕获后把任务转为 `PAUSED` 并持久化恢复元数据。
-- `usage_ratio > 0.90` 仍属于同一传播路径，只是异常代码标记为 `emergency_compaction_failed`，便于报告
-  说明任务已经接近上限。
-- 没有成功 artifact/Snapshot 时不得通过删除旧消息构造最小上下文。
+权威保护区和压缩准备采用不同边界。Task Anchor、确定性证据或其他构造当前 Protected Context 所需的
+权威 Store 读取失败时，不论 usage ratio 都抛出 `ProtectedContextLoadError`；缺少权威当前状态时禁止
+模型继续，由 Service 暂停。
+
+Artifact 写入/回读、Delta 生成/校验、Snapshot 合并/写入/回读属于“压缩准备失败”。协调器始终先
+保留原消息、记录 `CompactionFailureRecord`，再按入口和区域处理：
+
+| 入口与区域 | 准备失败后的行为 |
+|---|---|
+| 自动，`> 0.82 and <= 0.90` | 不提交 event；原消息不变；已有 prepared Snapshot 在原请求直通产生新消息后标记 abandoned；使用原始未压缩请求调用 handler **一次**，本 ModelRequest 不再尝试压缩 |
+| 主动 Tool，`<= 0.90` | 不提交 event；原消息不变；已有 prepared Snapshot 标记 abandoned；返回 `status=error` 的 ToolMessage，包含有界 error code 和可重试提示，不抛暂停异常 |
+| 自动或主动，`> 0.90` | 不提交 event；原消息不变；不可复用准备记录标记 abandoned；抛出带恢复元数据的 `ContextRecoveryRequired`（cause 保留具体阶段异常），由 Service 暂停 |
+| Overflow 恢复准备 | 必须满足 §10.3；准备失败或一次最小重试仍 Overflow 时抛出 `ContextRecoveryRequired`，由 Service 暂停 |
+
+正常压缩区的“继续一次”只允许原始 handler 调用一次，不是再次准备压缩；若该调用成功，任务正常继续，
+若发生 `ContextOverflowError` 则立即进入 §10.3，若发生其他模型异常则按既有模型错误策略传播。主动
+Tool 的 error ToolMessage 使用 §6.7 的稳定消息 ID，不能声称压缩成功。任何路径都不得因准备失败删除
+消息，也不得在没有成功 artifact/Snapshot 时裁剪出最小上下文。
+
+```python
+class CompactionFailureRecord(BaseModel):
+    attempt_id: str
+    task_id: str
+    entrypoint: Literal["automatic", "manual_tool", "overflow_recovery"]
+    budget_zone: Literal["normal", "observe", "normal_compaction", "emergency"]
+    stage: str
+    error_code: str
+    input_hash: str
+    original_messages_preserved: bool
+    artifact_reference: str | None
+    prepared_snapshot_version: int | None
+    recorded_at: str
+```
+
+该记录进入协调器技术 ledger/metrics，不修改业务 TaskState。一个 attempt ID 同一 stage 幂等写入，且
+不保存原始敏感异常正文。已经验证成功的 history event 与 prepared Snapshot 一样按 input hash 可复用；
+原请求直通产生新消息后，在技术 ledger 追加 abandoned 标记，不删除已写 artifact，也不把该 history
+event 当成已生效 compaction event。
 
 ### 10.3 ContextOverflow 最小安全重试
 
 任意区域第一次捕获 `ContextOverflowError` 时：
 
 1. 增加 overflow 指标并检查本次调用的 `overflow_retry_attempted` 标记。
-2. 确认本轮完整 conversation artifact 和 Snapshot 已按事务顺序成功。
+2. 尝试并确认本轮完整 conversation artifact 和 prepared Snapshot 已按事务顺序成功；任何准备失败
+   直接抛出 `ContextRecoveryRequired`，不能使用正常区的原请求直通策略形成循环。
 3. 构造最小安全上下文，目标 `<= 0.50`：三个保护块、当前结构化 Snapshot、最近用户输入、所有未完成
    或 ambiguous 工作单元，以及恢复 artifact 引用。
 4. 调用同一个模型 handler 一次，并设置 `overflow_retry_attempted=True`。
@@ -601,6 +710,7 @@ class ContextRecoveryMetadata(BaseModel):
     working_memory_version: int | None
     active_snapshot_version: int | None
     prepared_snapshot_version: int | None
+    prepared_snapshot_lifecycle: Literal["prepared", "active", "abandoned"] | None
     conversation_artifact: str | None
     original_messages_preserved: bool
 
@@ -608,19 +718,30 @@ class ContextCoordinationError(RuntimeError):
     recovery: ContextRecoveryMetadata
 
 class ProtectedContextLoadError(ContextCoordinationError): ...
-class ArtifactPersistenceError(ContextCoordinationError): ...
-class SnapshotBuildError(ContextCoordinationError): ...
-class SnapshotPersistenceError(ContextCoordinationError): ...
 class ContextRecoveryRequired(ContextCoordinationError): ...
+
+class CompactionPreparationError(RuntimeError):
+    failure: CompactionFailureRecord
+
+class ArtifactPersistenceError(CompactionPreparationError): ...
+class SnapshotBuildError(CompactionPreparationError): ...
+class SnapshotPersistenceError(CompactionPreparationError): ...
 ```
+
+`ArtifactPersistenceError`、`SnapshotBuildError` 和 `SnapshotPersistenceError` 是保留具体失败阶段和
+cause 的类型；在正常压缩区由 Coordinator 捕获并转换为 failure record/直通结果，在紧急或 Overflow
+路径再包装为带完整 recovery metadata 的 `ContextRecoveryRequired` 越过 Service 边界。
+`ContextCoordinationError` 因此只表示
+“调用方必须进入恢复暂停”的异常，不代表每次压缩尝试失败。
 
 Middleware/Coordinator 可以写自己的 artifact、Snapshot、ledger 和技术指标，但不能导入
 `TaskStatus`、调用 `TaskRepository.save()`、调用 `BugfixService._pause()`，也不能直接修改 TaskState
 业务状态。它只返回正常 ModelResponse/Tool 结果，或抛出上述类型化异常。
 
-`BugfixService._invoke()` 是唯一业务状态边界：捕获 `ContextCoordinationError`，验证异常 task ID 与
+`BugfixService._invoke()` 是唯一业务状态边界：捕获越过协调器边界的 `ContextCoordinationError`，验证异常 task ID 与
 当前任务一致，把经过长度限制且不含原始敏感内容的 recovery 元数据复制到 TaskState，然后调用统一
-pause 流程。任意协调异常都转为 `PAUSED`，而不是 `FAILED`。非协调层的一般模型/Tool 异常仍沿用现有
+pause 流程。该类恢复异常都转为 `PAUSED`，而不是 `FAILED`。正常压缩区的 failure record、原请求直通
+结果和主动 Tool error 不进入这一捕获路径。非协调层的一般模型/Tool 异常仍沿用现有
 错误策略，不被此规则吞掉。
 
 ## 11. Deep Agents 复用边界
@@ -674,9 +795,16 @@ Snapshot 合并、cutoff 或事件提交。唯一额外例外是旧任务迁移�
   evidence ID；CompactionSnapshot 只读取该 ledger，不能成为其反向写入者。
 - TaskState 增加可空 `context_recovery: ContextRecoveryMetadata | None`。只有 BugfixService 在捕获
   类型化协调异常时写入；Middleware、Coordinator 和 Snapshot Builder 均没有该字段的写权限。
+- 新增协调器技术表 `compaction_failures(task_id, attempt_id, stage, payload, recorded_at)`；正常区的
+  failure record 只写该表和指标，不写 `context_recovery`，也不改变 TaskStatus。
 - 旧 Working Memory 没有 `SnapshotCoverage` 时仍可注入，但在观察区视为过旧。
-- 旧 TaskState 用户消息生成稳定 ID；旧 changed_files 标记为 `approved_target`；旧测试结果保留原退出码
-  并使用稳定 legacy provenance。
+- 旧 Graph Messages 全部按 §6.7 惰性补齐稳定 ID 和 original ordinal，而不只处理用户消息；已有 ID
+  原样复用。旧 changed_files 标记为 `approved_target`；旧测试结果保留原退出码并使用稳定 legacy
+  provenance。
+- 旧 Working Memory 字符串假设只由迁移器生成 legacy hypothesis ID；迁移后所有运行时迁移/重新开启
+  必须使用结构化身份接口。旧事实由 Builder 身份函数补齐 claim ID。
+- Snapshot Store 增加生命周期字段；旧 event 已指向的 Snapshot 迁移为 active，未被任何 event 指向的
+  旧准备行迁移为 prepared，并在首次 input hash 不匹配时转 abandoned。当前生效版本始终从 event 读取。
 - 已有 Deep Agents 自然语言 `_summarization_event` 作为 `legacy_summary` 非权威输入处理：先写入
   history artifact 并建立引用，再由第一次结构化 Snapshot 吸收可验证内容。它不能覆盖用户约束或
   系统证据。
@@ -691,6 +819,8 @@ Snapshot 合并、cutoff 或事件提交。唯一额外例外是旧任务迁移�
 - `normal_compaction_count`
 - `emergency_compaction_count`
 - `compaction_failure_count`
+- `normal_zone_passthrough_count`
+- `manual_compaction_error_count`
 - `overflow_retry_count`
 - `active_compaction_snapshot_version`
 - `last_compaction_artifact`
@@ -719,15 +849,18 @@ Snapshot 合并、cutoff 或事件提交。唯一额外例外是旧任务迁移�
   Service 暂停。
 - WorkUnit 边界模糊：整段保留，记录诊断；不能猜测切点。
 - token 窗口能力缺失或非法：启动配置失败，不能退回固定消息数伪装百分比预算。
-- history 写入或回读校验失败：旧消息保持有效，Coordinator 抛出 `ArtifactPersistenceError`。
-- Delta 模型调用、schema 或合并校验失败：不写 Snapshot、不提交 event，抛出
-  `SnapshotBuildError`。
-- Snapshot SQLite 写入或回读校验失败：不提交 event，抛出 `SnapshotPersistenceError`。
-- 模型处理 compacted request 失败：不提交 event；Coordinator 包装为带
-  `stage=compacted_model_call` 的 `ContextCoordinationError`，准备好的 artifact/Snapshot 可按输入
-  哈希复用。
-- 第二次 ContextOverflow：不再重试，抛出 `ContextRecoveryRequired`。
-- 以上异常均由 BugfixService 捕获并转成 `PAUSED`；Middleware/Coordinator 不修改 TaskState 状态。
+- history 写入/回读、Delta 生成/校验、Snapshot 合并/写入/回读失败：旧消息保持有效，先产生对应的
+  `CompactionPreparationError` 和幂等 failure record，再由 §10.2 的入口/区域策略决定直通、Tool error
+  或包装为 `ContextRecoveryRequired`。
+- 正常压缩区自动准备失败：原请求只直通一次；直通成功不暂停，直通 Overflow 转 §10.3，其他模型异常
+  按既有模型策略传播。
+- 非紧急区主动 compact 准备失败：返回稳定 ID 的 error ToolMessage，不进入 Service 恢复捕获路径。
+- 紧急区准备失败、Overflow 恢复准备失败或第二次 ContextOverflow：抛出
+  `ContextRecoveryRequired`，由 Service 暂停。
+- 模型处理 compacted request 失败：不提交 event；prepared Snapshot 在相同 input hash 下可复用。
+  非 Overflow 模型异常按既有模型错误策略传播；不能伪装成压缩成功，也不因它自动改变 TaskStatus。
+- 只有越过 Coordinator 边界的 `ProtectedContextLoadError` 或 `ContextRecoveryRequired` 由
+  BugfixService 转成 `PAUSED`；Middleware/Coordinator 永远不修改 TaskState 状态。
 
 ## 16. 测试设计
 
@@ -742,17 +875,29 @@ LangChain Message 对象。
 - 超预算条目包含 omitted_count、哈希和可读引用，不发生静默丢失。
 - 模型记忆声称 pytest 通过、但系统 exit_code 非零时，保护区只把系统结果作为当前事实并显示冲突。
 - protected block 不进入 `request.messages` 或 Graph messages。
-- 相同 constraint_id、evidence_id、hypothesis_id 在完整 ModelRequest 中各只出现一个规范实体；
+- 相同 constraint_id、evidence_id、hypothesis_id、claim_id 在完整 ModelRequest 中各只出现一个规范实体；
   Snapshot 只贡献未重复的历史和来源引用。
 
-### 16.2 WorkUnitPartitioner
+### 16.2 消息与记忆实体身份
+
+- 每一种 Graph Message 缺失 ID 时都由 task ID、原始序号、类型、Tool Call IDs 和规范内容哈希生成稳定
+  ID；同一 checkpoint 重载和压缩前后结果不变。
+- 已有 ID 原样复用；已有重复 ID 产生 identity conflict，相关区域 ambiguous 且不被切分。
+- Snapshot Message、成功/错误 compact ToolMessage 也有稳定 ID；history 重试不会重复事件。
+- WorkUnit、provenance、coverage、history manifest 和 compaction input hash 都引用同一组 message IDs。
+- Delta 模型只能返回 FactCandidate，额外返回 claim_id 时 schema 拒绝；Builder 对相同候选生成相同
+  claim_id，对新来源按合并规则复用或生成冲突。
+- `save_progress` 新建、普通迁移、重新开启三条路径分别验证：普通迁移复用 ID；重新开启要求
+  reopens_hypothesis_id/new evidence/reason 并保留旧 rejected 记录；相似文本不能触发隐式迁移。
+
+### 16.3 WorkUnitPartitioner
 
 - 单 Tool Call、配对 ToolMessage 和 Assistant 解释整体分组。
 - 一个 AIMessage 的多个并行 Tool Call、乱序返回结果仍属于同一单元。
 - 缺失结果、孤立 ToolMessage、重复 ID 和无法识别边界均标记 incomplete/ambiguous 并保留。
 - cutoff 永远落在 WorkUnit 之间；属性测试随机生成消息序列，断言没有配对 ID 分居两侧。
 
-### 16.3 自适应预算
+### 16.4 自适应预算
 
 - 精确覆盖 0.75、0.82、0.90 三个边界及其前后值。
 - 观察区仅在 coverage 过旧时提示一次保存 Working Memory。
@@ -760,7 +905,7 @@ LangChain Message 对象。
 - 选择顺序依次验证最近用户、未完成单元、修改/验证、失败测试/分析、其他最近单元。
 - 预算计算包含 System/保护区/messages/tools 和输出预留。
 
-### 16.4 结构化 Snapshot
+### 16.5 结构化 Snapshot
 
 - 连续三次及以上压缩后，用户约束逐字不变、排除假设及原因不变、真实测试 command/exit_code 不变。
 - tests/changed_files/approvals/external verification 无法被伪造 Delta 覆盖。
@@ -769,18 +914,27 @@ LangChain Message 对象。
   unresolved_semantic。
 - 相同输入哈希重试不重复版本或 history 事件；不同输入产生单调新版本。
 - 后续压缩读取 Store Snapshot，不把上一条 Snapshot 消息交给模型再次自然语言总结。
+- 新 Snapshot 从 prepared 开始；event 生效后 reconciliation 标记 active。未生效的最新 prepared 行不能
+  改变 active_snapshot_version；输入变化后转 abandoned，abandoned 永不参与合并。
+- 模拟 event/SQLite 生命周期标记提交间崩溃，恢复时仍以 event 为权威幂等修复状态。
 
-### 16.5 事务失败
+### 16.6 事务失败
 
 - artifact write 返回错误、抛异常、回读缺少 event 或哈希不符时，compaction event 和有效消息不变。
 - Delta/Snapshot 校验失败、SQLite 写入失败或回读哈希不符时，旧消息不删除。
 - compacted model call 失败时，event 不生效，准备记录可复用。
-- 主动 compact Tool 在事务开始后失败时抛出类型化异常，不报告 `Conversation compacted.`。
-- 任一区域发生压缩准备失败时，Service 捕获异常并暂停；90% 以上使用 emergency 错误代码。
-- Middleware/Coordinator 的测试断言它们从不写 TaskState/TaskRepository；Service 测试断言所有
-  ContextCoordinationError 子类都转为 PAUSED 并保存恢复元数据。
+- 正常压缩区自动准备失败时写一条幂等 failure record，handler 收到完整原请求且仅调用一次；不提交
+  event、不暂停，同一 ModelRequest 不再准备压缩。
+- 非紧急区主动 compact Tool 准备失败时返回带稳定 ID 的 error ToolMessage，不报告
+  `Conversation compacted.`，Service 不暂停。
+- 紧急区自动/主动准备失败和 Overflow 恢复准备失败都抛出 `ContextRecoveryRequired`；Service 暂停并
+  保存恢复元数据。
+- Protected Context 任一权威读取失败在所有预算区都抛出 `ProtectedContextLoadError` 并暂停。
+- 原请求直通若 Overflow，只进入一次 Overflow 恢复而不会再次走正常区准备；其他模型异常不被吞掉。
+- Middleware/Coordinator 的测试断言它们从不写 TaskState/TaskRepository；Service 只对越过边界的
+  ContextCoordinationError 转为 PAUSED，failure record 和 Tool error 不触发状态变化。
 
-### 16.6 Deep Agents 适配边界
+### 16.7 Deep Agents 适配边界
 
 - Adapter 契约覆盖 Backend/Artifact 路由、history 序列化、媒体/大型结果卸载和 Tool 外观。
 - 把 Deep Agents 私有 summary、cutoff 和 event 方法替换成会立即失败的哨兵，完整压缩工作流仍通过，
@@ -790,14 +944,14 @@ LangChain Message 对象。
 - legacy `_summarization_event` 只被迁移器读取一次，迁移后的 state 只包含
   `_deepfix_compaction_event`。
 
-### 16.7 Overflow
+### 16.8 Overflow
 
 - 第一次 ContextOverflow 构造不高于 50% 的最小安全上下文并只重试一次。
 - 第二次仍 Overflow 时 Service 暂停；一次 agent invocation 的 handler 调用总数为 2。
 - artifact/Snapshot 未确认时不得删除消息执行最小重试。
 - Overflow 最小上下文仍包含三个保护块、最新用户输入、未完成单元和 artifact 引用。
 
-### 16.8 一次性 Bug 项目端到端测试
+### 16.9 一次性 Bug 项目端到端测试
 
 构造一个不访问网络的一次性 Python Bug 项目和长消息历史，包含：并行只读调查、失败 pytest、错误
 假设及排除原因、文件修改审批、成功修改、通过 pytest、外部证据状态和至少三轮压缩。端到端断言：
@@ -816,6 +970,7 @@ src/deepfix/
 ├── compaction/
 │   ├── models.py              # WorkUnit、Snapshot、Conflict、Budget 模型
 │   ├── errors.py              # 类型化协调异常与恢复元数据
+│   ├── identity.py            # Graph Message、claim 与新假设的确定性身份
 │   ├── budget.py              # ContextBudgetMonitor
 │   ├── evidence.py            # EvidenceCollector
 │   ├── work_units.py          # WorkUnitPartitioner
@@ -835,13 +990,20 @@ src/deepfix/
 - 不再存在固定 70% 触发、固定 15% 保留的 DeepFix 配置。
 - 每次模型调用都有任务隔离的 Task Anchor、完整字段 Working Memory 和系统确定性证据保护块。
 - 用户约束、测试/文件/审批和研究状态分别由对应权威 Store 决定，不存在跨类型全局优先级。
-- 相同 constraint_id、evidence_id、hypothesis_id 在单次模型请求中只展示一个规范实体；Snapshot
+- 所有 Graph Messages 都有可持久化的稳定 ID，且 WorkUnit、provenance、coverage 和 history 幂等统一
+  使用该 ID。
+- 相同 constraint_id、evidence_id、hypothesis_id、claim_id 在单次模型请求中只展示一个规范实体；Snapshot
   主要提供压缩历史和来源引用。
+- 模型只产生 FactCandidate，claim_id 由 Builder 生成；save_progress 使用显式假设 ID/迁移/reopen 协议，
+  不依赖文本匹配身份。
 - 任何压缩切点都不能拆分单个或并行 Tool 工作单元。
 - 三次以上压缩后用户约束、排除原因和真实测试结果保持一致并可追溯。
-- artifact、Snapshot 或校验失败时旧消息保持有效；90% 以上安全暂停。
+- artifact、Delta、Snapshot 或校验失败时旧消息保持有效；正常压缩区自动请求只直通一次，非紧急主动
+  Tool 返回 error，90% 以上或 Overflow 恢复失败安全暂停。
+- Snapshot 具有 prepared/active/abandoned 生命周期；当前 active_snapshot_version 只由生效 event 决定。
 - ContextOverflow 只执行一次最小安全重试，第二次暂停并保留恢复信息。
 - Deep Agents Backend/Artifact、history 序列化、大型 ToolMessage/media 卸载、Tool 外观和模型实例
   仍被复用；Delta、校验、合并和 event 提交由 DeepFix 负责。
-- 所有协调失败以恢复元数据异常传播到 BugfixService；只有 Service 修改任务为 `PAUSED`。
+- 权威保护区读取失败及紧急/Overflow 恢复失败以恢复元数据异常传播到 BugfixService；正常区准备失败
+  留在协调器的分级结果路径。只有 Service 修改任务为 `PAUSED`。
 - 原有单 Agent、HITL、研究证据隔离和本地测试完成门禁全部回归通过。
