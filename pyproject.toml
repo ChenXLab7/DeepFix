@@ -26,6 +26,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--strict-markers -m 'not online'"
+markers = [
+  "online: accesses only approved public endpoints and requires DEEPFIX_RUN_ONLINE=1",
+]
 
 [tool.ruff]
 line-length = 100

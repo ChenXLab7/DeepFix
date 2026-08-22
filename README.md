@@ -15,6 +15,14 @@ deepfix new --project 'C:\projects\broken-python-app' --mode manual '运行 pyte
 
 不要把真实 API Key 写进源码、配置样例、测试或 Git 历史。
 
+如果目标项目使用的不是当前终端里的 Python，显式传入它的解释器。DeepFix 会把该路径保存在任务中，恢复任务时继续使用同一个环境：
+
+```powershell
+deepfix new --project 'C:\projects\broken-python-app' `
+  --python 'C:\projects\broken-python-app\.venv\Scripts\python.exe' `
+  --mode manual '运行 pytest 时 test_divide 失败'
+```
+
 ## 终端命令
 
 ```powershell
@@ -47,6 +55,10 @@ Single Repair Agent ───────── LangGraph Checkpointer(SQLite)
     │                              消息历史与图恢复位置
     ├── read/search Tools
     ├── file/shell Tools + HITL
+    ├── research Tools ────── ResearchEvidenceStore(SQLite)
+    │                              查询、候选、验证状态；按 task_id 隔离
+    │          └───────────── DEEPFIX_HOME/artifacts/research
+    │                              清洗后的完整外部正文
     ├── save_progress ─────── WorkingMemoryStore(SQLite)
     │                              版本化事实、证据、假设、下一步
     └── compact_conversation
@@ -63,6 +75,40 @@ Single Repair Agent ───────── LangGraph Checkpointer(SQLite)
 
 Agent 可以主动调用 `compact_conversation`；如果它忘记，70% 上下文阈值会自动压缩，压缩后保留最近约 15%。主动和自动压缩共享同一个引擎和 `_summarization_event` 状态。压缩前，系统提示要求 Agent 先调用 `save_progress` 保存完整进度快照。
 
+## 技术资料证据流
+
+LLM 的训练知识可能过期，因此 Agent 可以查找佐证，但外部网页永远只是线索，不能替代本地源码和测试。单 Agent 内注册了四个边界清晰的工具：
+
+1. `inspect_dependency(package_name)`：只读目标项目的 `pyproject.toml`、`requirements.txt`、`poetry.lock`、`uv.lock`，再通过 `--python` 指定的解释器查询已安装版本；不访问网络。
+2. `search_technical_sources(query, package_name)`：先拒绝密钥、用户路径、内部域名、长代码/日志等敏感查询，再检索 PyPI、确认后的官方 GitHub 仓库和可选 Tavily 官方域名结果。查询和候选项写入 SQLite。
+3. `fetch_external_evidence(candidate_id)`：只能抓取当前任务已经保存的候选项，不能接收任意 URL。每次请求和重定向都重新执行 HTTPS、DNS、公网地址和域名校验；正文清洗后写入 artifact，SQLite 只保存有界摘要和元数据。
+4. `link_external_evidence(...)`：把外部结论关联到真实、成对出现的 `execute` Tool Call/ToolMessage。`verified` 必须引用整数 `exit_code=0` 的 pytest；失败测试只能支持 `contradicted`，伪造 ID 不能改变状态。
+
+证据等级描述“来源本身有多可靠”，本地验证状态描述“它是否适用于当前项目”，二者不能混为一谈：
+
+| 等级 | 含义 | 典型来源 |
+|---|---|---|
+| E1 | 官方一手资料 | PyPI 元数据、官方文档、官方源码、Release |
+| E2 | 有维护者或仓库状态佐证 | 已合并 PR、已关闭 Issue、维护者回复、已回答 Discussion |
+| E3 | 未确认的外部线索 | 普通用户尚未确认的 Issue/Discussion |
+
+一条 E1 资料也可能与当前项目版本不一致；一条 E3 线索经过真实本地测试后也可以成为有效支持。报告会明确区分“仅为外部线索”“已通过真实测试关联”和“已被本地证据推翻”，并保留版本差异警告。
+
+### 可选在线能力
+
+只配置 `DEEPSEEK_API_KEY` 时，Agent 仍可完成本地修复，并可使用无密钥的 PyPI 和 GitHub REST 公共查询。额外配置都是可选的：
+
+```powershell
+# 提高 GitHub API 配额，并启用官方仓库 Discussions 查询
+$env:GITHUB_TOKEN = "your-github-token"
+
+# 仅在两项同时存在时启用 Tavily；结果仍限制在已确认的官方域名
+$env:DEEPFIX_SEARCH_PROVIDER = "tavily"
+$env:TAVILY_API_KEY = "your-tavily-key"
+```
+
+缺少 GitHub/Tavily Token 不会阻止启动，也不会阻止本地调查、修改和验证。Token 只在构造请求时读取，不会进入任务配置、候选记录、错误文本或目标项目 Shell 环境。
+
 ## 审批与安全模型
 
 | 等级 | 示例 | manual | guarded |
@@ -74,6 +120,14 @@ Agent 可以主动调用 `compact_conversation`；如果它忘记，70% 上下�
 
 `LocalShellBackend` 始终以目标项目为根目录，并通过显式环境白名单启动 Shell，`DEEPSEEK_API_KEY` 不会传给项目命令。DeepFix 自己的历史文件通过 `CompositeBackend` 写到 `DEEPFIX_HOME/artifacts`，不会污染目标项目 Git 工作区。
 
+研究工具不会削弱原有审批策略：只读依赖检查和经过约束的搜索/抓取按登记风险执行；项目写入、删除、Shell、安装依赖及未知工具仍由 HITL 策略独立判断。外部正文被包裹为“不可信来源”，不能把网页里的提示当成 Agent 指令。
+
+研究数据按 `task_id` 隔离。候选 ID、证据 ID、真实 URL 和 artifact 路径由系统生成或查询，模型不能在公开 Tool 参数中提供 task ID、任意 URL、Token 或保存路径。完整正文位于：
+
+```text
+DEEPFIX_HOME/artifacts/research/<task_id>/<evidence_id>.md
+```
+
 这不是操作系统级沙箱。真实项目运行前仍应使用一次性副本、容器或受限账户，并审查每一个 L2 操作。
 
 ## 确定性完成条件
@@ -84,10 +138,41 @@ Agent 可以主动调用 `compact_conversation`；如果它忘记，70% 上下�
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe -m ruff check src tests
+.\.venv\Scripts\python.exe -m ruff check .
+
+# 默认测试永不访问真实网络；online 用例会被自动排除
+.\.venv\Scripts\python.exe -m pytest --collect-only -q
+
+# 显式在线冒烟测试。没有开关时会安全跳过
+$env:DEEPFIX_RUN_ONLINE = "1"
+.\.venv\Scripts\python.exe -m pytest -m online tests/research/test_online.py -q
 ```
 
-确定性测试不调用真实 DeepSeek，覆盖版本并发、任务隔离、ToolRuntime 身份、上下文注入、Backend 路由、主动压缩去重、溢出暂停、HITL 和 CLI 交互。
+确定性测试不调用真实 DeepSeek，覆盖版本并发、任务隔离、ToolRuntime 身份、上下文注入、Backend 路由、主动压缩去重、溢出暂停、HITL、CLI 交互，以及从依赖检查、官方检索、E1/E2/E3 抓取、真实 pytest 关联、状态同步到报告渲染的完整离线证据链。
+
+## 面试演示：一次性 Python Bug 项目
+
+不要直接拿重要仓库做现场演示。下面先创建一个可随时删除的一次性项目，其中 `discount` 的边界条件故意写错：
+
+```powershell
+$demo = Join-Path $env:TEMP 'deepfix-interview-demo'
+New-Item -ItemType Directory -Force $demo | Out-Null
+@'
+def discount(total: int) -> int:
+    return 10 if total > 100 else 0
+'@ | Set-Content -Encoding utf8 (Join-Path $demo 'pricing.py')
+@'
+from pricing import discount
+
+def test_discount_starts_at_100():
+    assert discount(100) == 10
+'@ | Set-Content -Encoding utf8 (Join-Path $demo 'test_pricing.py')
+python -m pytest -q $demo
+deepfix new --project $demo --python (Get-Command python).Source --mode manual `
+  'pytest 的 100 元折扣边界测试失败；请调查根因、最小修复并验证'
+```
+
+演示时按顺序讲五件事：Agent 先用本地证据复现；有版本/API 疑问时才查官方资料；网页只能成为候选线索；写文件和 Shell 受审批策略控制；最终完成状态只认真实 pytest 的 `exit_code`。最后展示任务 ID、审批记录、修改文件、测试结果、外部证据分类及 artifact 路径。这样面试官看到的是一条可审计的工程闭环，而不是“模型说修好了”。
 
 ## 多 Agent 演进方向
 
