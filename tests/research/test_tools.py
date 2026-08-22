@@ -4,23 +4,35 @@ import json
 
 from deepagents.backends.protocol import WriteResult
 from langchain.tools import ToolRuntime
+from langchain_core.messages import AIMessage, ToolMessage
 
+from deepfix.models import Evidence
 from deepfix.research.fetcher import FetchedEvidenceBody
-from deepfix.research.models import DependencyContext, DependencyFinding, SearchCandidate
+from deepfix.research.models import (
+    DependencyContext,
+    DependencyFinding,
+    ExternalEvidence,
+    SearchCandidate,
+)
 from deepfix.research.providers import SearchCandidateDraft, TechnicalSearchResult
 from deepfix.research.sanitizer import QuerySanitizer
 from deepfix.research.store import ResearchEvidenceStore
 from deepfix.research.tools import (
     build_fetch_external_evidence_tool,
     build_inspect_dependency_tool,
+    build_link_external_evidence_tool,
     build_search_technical_sources_tool,
 )
 
 
-def _runtime(task_id: str = "task-a") -> ToolRuntime:
+def _runtime(
+    task_id: str = "task-a",
+    *,
+    messages: list[AIMessage | ToolMessage] | None = None,
+) -> ToolRuntime:
     configurable = {"thread_id": task_id} if task_id else {}
     return ToolRuntime(
-        state={},
+        state={"messages": messages or []},
         context=None,
         config={"configurable": configurable},
         stream_writer=lambda _: None,
@@ -129,6 +141,66 @@ def _save_candidate(store: ResearchEvidenceStore, task_id: str = "task-a") -> Se
             )
         ],
     )[0]
+
+
+def _save_external_evidence(
+    store: ResearchEvidenceStore,
+    task_id: str = "task-a",
+) -> ExternalEvidence:
+    candidate = _save_candidate(store, task_id)
+    evidence = ExternalEvidence(
+        evidence_id="123e4567e89b42d3a456426614174000",
+        task_id=task_id,
+        candidate_id=candidate.candidate_id,
+        source_type="official_docs",
+        evidence_level="E1",
+        title="Pydantic model_copy documentation",
+        url=candidate.url,
+        query=candidate.query,
+        relevant_excerpt="model_copy supports update.",
+        retrieved_at="2026-08-22T00:01:00+00:00",
+        dependency_name="pydantic",
+        documented_version="2.8",
+        project_version="2.8.4",
+        local_verification="unverified",
+        local_evidence=[],
+        linked_test_tool_call_ids=[],
+        verification_explanation=None,
+        artifact_path=(
+            f"/.deepfix-artifacts/research/{task_id}/"
+            "123e4567e89b42d3a456426614174000.md"
+        ),
+    )
+    store.save_evidence(evidence)
+    return evidence
+
+
+def _execute_messages(
+    *,
+    call_id: str = "pytest-call-1",
+    command: str = "pytest -q",
+    exit_code: int | None = 0,
+) -> list[AIMessage | ToolMessage]:
+    artifact = {} if exit_code is None else {"exit_code": exit_code}
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "execute",
+                    "args": {"command": command},
+                    "id": call_id,
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content="1 passed" if exit_code == 0 else "1 failed",
+            name="execute",
+            tool_call_id=call_id,
+            artifact=artifact,
+        ),
+    ]
 
 
 def test_tool_schemas_expose_only_model_supplied_business_arguments(tmp_path):
@@ -278,3 +350,241 @@ def test_artifact_write_failure_creates_no_evidence_row(tmp_path):
     assert message.status == "error"
     assert backend.calls
     assert store.list_evidence("task-a") == []
+
+
+def test_link_schema_exposes_evidence_claim_but_not_task_id(tmp_path):
+    tool = build_link_external_evidence_tool(
+        ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    )
+
+    assert set(tool.args) == {
+        "evidence_id",
+        "status",
+        "test_tool_call_ids",
+        "local_evidence",
+        "explanation",
+    }
+    assert "task_id" not in tool.args
+
+
+def test_link_rejects_evidence_owned_by_another_task(tmp_path):
+    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    evidence = _save_external_evidence(store, "task-b")
+    tool = build_link_external_evidence_tool(store)
+
+    message = tool.func(
+        evidence_id=evidence.evidence_id,
+        status="verified",
+        test_tool_call_ids=["pytest-call-1"],
+        local_evidence=[],
+        explanation="回归测试通过",
+        runtime=_runtime("task-a", messages=_execute_messages()),
+    )
+
+    assert message.status == "error"
+    assert store.get_evidence("task-b", evidence.evidence_id).local_verification == (
+        "unverified"
+    )
+
+
+def test_link_rejects_fabricated_tool_call_id(tmp_path):
+    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    evidence = _save_external_evidence(store)
+    tool = build_link_external_evidence_tool(store)
+
+    message = tool.func(
+        evidence_id=evidence.evidence_id,
+        status="verified",
+        test_tool_call_ids=["invented-call"],
+        local_evidence=[],
+        explanation="模型声称测试通过",
+        runtime=_runtime(messages=_execute_messages()),
+    )
+
+    assert message.status == "error"
+    assert store.get_evidence("task-a", evidence.evidence_id).local_verification == (
+        "unverified"
+    )
+
+
+def test_link_rejects_test_result_without_integer_exit_code(tmp_path):
+    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    evidence = _save_external_evidence(store)
+    tool = build_link_external_evidence_tool(store)
+
+    message = tool.func(
+        evidence_id=evidence.evidence_id,
+        status="verified",
+        test_tool_call_ids=["pytest-call-1"],
+        local_evidence=[],
+        explanation="缺少可信退出码",
+        runtime=_runtime(messages=_execute_messages(exit_code=None)),
+    )
+
+    assert message.status == "error"
+    assert store.get_evidence("task-a", evidence.evidence_id).local_verification == (
+        "unverified"
+    )
+
+
+def test_link_cannot_use_failing_pytest_to_mark_evidence_verified(tmp_path):
+    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    evidence = _save_external_evidence(store)
+    tool = build_link_external_evidence_tool(store)
+
+    message = tool.func(
+        evidence_id=evidence.evidence_id,
+        status="verified",
+        test_tool_call_ids=["pytest-call-1"],
+        local_evidence=[],
+        explanation="测试其实失败了",
+        runtime=_runtime(messages=_execute_messages(exit_code=1)),
+    )
+
+    assert message.status == "error"
+    assert store.get_evidence("task-a", evidence.evidence_id).local_verification == (
+        "unverified"
+    )
+
+
+def test_link_cannot_use_non_pytest_success_to_mark_evidence_verified(tmp_path):
+    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    evidence = _save_external_evidence(store)
+    tool = build_link_external_evidence_tool(store)
+
+    message = tool.func(
+        evidence_id=evidence.evidence_id,
+        status="verified",
+        test_tool_call_ids=["pytest-call-1"],
+        local_evidence=[],
+        explanation="普通命令成功不等于测试通过",
+        runtime=_runtime(messages=_execute_messages(command="python app.py")),
+    )
+
+    assert message.status == "error"
+
+
+def test_link_accepts_real_passing_pytest_for_verified_evidence(tmp_path):
+    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    evidence = _save_external_evidence(store)
+    tool = build_link_external_evidence_tool(store)
+
+    message = tool.func(
+        evidence_id=evidence.evidence_id,
+        status="verified",
+        test_tool_call_ids=["pytest-call-1"],
+        local_evidence=[Evidence("tests/test_models.py:10", "回归测试覆盖该分支")],
+        explanation="目标项目的回归测试通过",
+        runtime=_runtime(messages=_execute_messages(exit_code=0)),
+    )
+    updated = store.get_evidence("task-a", evidence.evidence_id)
+
+    assert message.status == "success"
+    assert message.artifact == {
+        "evidence_id": evidence.evidence_id,
+        "local_verification": "verified",
+    }
+    assert updated.local_verification == "verified"
+    assert updated.linked_test_tool_call_ids == ["pytest-call-1"]
+    assert updated.local_evidence == [
+        Evidence("tests/test_models.py:10", "回归测试覆盖该分支")
+    ]
+    assert updated.verification_explanation == "目标项目的回归测试通过"
+
+
+def test_link_accepts_real_failed_pytest_for_contradicted_evidence(tmp_path):
+    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    evidence = _save_external_evidence(store)
+    tool = build_link_external_evidence_tool(store)
+
+    message = tool.func(
+        evidence_id=evidence.evidence_id,
+        status="contradicted",
+        test_tool_call_ids=["pytest-call-1"],
+        local_evidence=[],
+        explanation="官方示例在当前项目版本中复现失败",
+        runtime=_runtime(messages=_execute_messages(exit_code=1)),
+    )
+    updated = store.get_evidence("task-a", evidence.evidence_id)
+
+    assert message.status == "success"
+    assert updated.local_verification == "contradicted"
+    assert updated.linked_test_tool_call_ids == ["pytest-call-1"]
+
+
+def test_link_accepts_explicit_source_evidence_for_contradiction(tmp_path):
+    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    evidence = _save_external_evidence(store)
+    tool = build_link_external_evidence_tool(store)
+
+    message = tool.func(
+        evidence_id=evidence.evidence_id,
+        status="contradicted",
+        test_tool_call_ids=[],
+        local_evidence=[
+            Evidence(
+                "src/models.py:42",
+                "当前项目覆盖了 model_copy，并忽略 update 参数",
+            )
+        ],
+        explanation="本地覆盖实现与官方默认行为不同",
+        runtime=_runtime(),
+    )
+
+    assert message.status == "success"
+    assert store.get_evidence(
+        "task-a", evidence.evidence_id
+    ).local_verification == "contradicted"
+
+
+def test_link_rejects_empty_contradiction(tmp_path):
+    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    evidence = _save_external_evidence(store)
+    tool = build_link_external_evidence_tool(store)
+
+    message = tool.func(
+        evidence_id=evidence.evidence_id,
+        status="contradicted",
+        test_tool_call_ids=[],
+        local_evidence=[],
+        explanation="没有本地证据",
+        runtime=_runtime(),
+    )
+
+    assert message.status == "error"
+    assert store.get_evidence("task-a", evidence.evidence_id).local_verification == (
+        "unverified"
+    )
+
+
+def test_relink_updates_the_existing_evidence_instead_of_duplicating(tmp_path):
+    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    evidence = _save_external_evidence(store)
+    tool = build_link_external_evidence_tool(store)
+    first_messages = _execute_messages(call_id="passing-call", exit_code=0)
+    second_messages = _execute_messages(call_id="failing-call", exit_code=1)
+
+    first = tool.func(
+        evidence_id=evidence.evidence_id,
+        status="verified",
+        test_tool_call_ids=["passing-call"],
+        local_evidence=[],
+        explanation="第一次验证",
+        runtime=_runtime(messages=first_messages),
+    )
+    second = tool.func(
+        evidence_id=evidence.evidence_id,
+        status="contradicted",
+        test_tool_call_ids=["failing-call"],
+        local_evidence=[],
+        explanation="新测试推翻了原结论",
+        runtime=_runtime(messages=second_messages),
+    )
+    updated = store.get_evidence("task-a", evidence.evidence_id)
+
+    assert first.status == "success"
+    assert second.status == "success"
+    assert len(store.list_evidence("task-a")) == 1
+    assert updated.local_verification == "contradicted"
+    assert updated.linked_test_tool_call_ids == ["failing-call"]
+    assert updated.verification_explanation == "新测试推翻了原结论"
