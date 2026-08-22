@@ -13,6 +13,7 @@ dependencies = [
   "langgraph-checkpoint-sqlite>=3,<4",
   "packaging>=24,<27",
   "pydantic>=2,<3",
+  "python-dotenv>=1,<2",
 ]
 
 [project.optional-dependencies]

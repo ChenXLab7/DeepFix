@@ -12,6 +12,7 @@ from langchain_core.exceptions import ContextOverflowError
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.runtime import ExecutionInfo, Runtime
+from pydantic import SecretStr
 
 from deepfix.approval import ApprovalPolicy
 from deepfix.compaction.adapter import DeepAgentsArtifactAdapter
@@ -35,7 +36,7 @@ from deepfix.compaction.models import (
 from deepfix.compaction.snapshot import CompactionSnapshotBuilder
 from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.work_units import partition_work_units
-from deepfix.config import AppConfig, ApprovalMode
+from deepfix.config import AppConfig, ApprovalMode, ModelRoleConfig
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, TaskState, TaskStatus
 from deepfix.models import TestResult as RepairTestResult
@@ -475,7 +476,16 @@ def _service(tmp_path, agent):
         project_root=project,
         database_path=database,
         artifacts_path=tmp_path / "artifacts",
-        model_name="deepseek-chat",
+        main_model=ModelRoleConfig(
+            model_name="deepseek-v4-pro",
+            api_key=SecretStr("offline-main"),
+            base_url="https://api.deepseek.com",
+        ),
+        compaction_model=ModelRoleConfig(
+            model_name="deepseek-v4-flash",
+            api_key=SecretStr("offline-compaction"),
+            base_url="https://api.deepseek.com",
+        ),
         approval_mode=ApprovalMode.MANUAL,
         project_python=Path(sys.executable),
     )
