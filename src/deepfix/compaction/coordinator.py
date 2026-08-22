@@ -5,16 +5,18 @@ import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, Literal
 
 from langchain.agents.middleware import ModelResponse
 from langchain.agents.middleware.types import ExtendedModelResponse
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage, SystemMessage
+from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage
 from langgraph.types import Command
 
 from deepfix.compaction.adapter import DeepAgentsArtifactAdapter
 from deepfix.compaction.budget import (
+    ContextBudgetMonitor,
     ContextBudgetReport,
     RetentionPlan,
     select_retained_units,
@@ -45,7 +47,11 @@ from deepfix.compaction.snapshot import (
 from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.work_units import WorkUnitPartition, partition_work_units
 from deepfix.memory import WorkingMemoryStore
-from deepfix.protected_context import ProtectedContext
+from deepfix.protected_context import (
+    ProtectedContext,
+    ProtectedContextBuilder,
+    ProtectedContextProjector,
+)
 
 
 @dataclass(frozen=True)
@@ -71,6 +77,22 @@ class PreparedCompaction:
     event: DeepFixCompactionEvent
 
 
+class _StaticArtifactAdapter:
+    def __init__(self, artifact: ArtifactReference) -> None:
+        self.artifact = artifact
+
+    def persist_history(self, *args: Any, **kwargs: Any) -> ArtifactReference:
+        return self.artifact
+
+
+class _StaticDeltaGenerator:
+    def __init__(self, delta: Any) -> None:
+        self.delta = delta
+
+    def generate(self, model: Any, units: Any) -> Any:
+        return self.delta
+
+
 class CompactionCoordinator:
     def __init__(
         self,
@@ -80,6 +102,9 @@ class CompactionCoordinator:
         snapshot_builder: CompactionSnapshotBuilder | Any,
         snapshot_store: CompactionStore | Any,
         memory_store: WorkingMemoryStore,
+        budget_monitor: ContextBudgetMonitor | None = None,
+        protected_builder: ProtectedContextBuilder | None = None,
+        model: BaseChatModel | None = None,
         partitioner: Callable[
             [Sequence[AnyMessage], set[str] | frozenset[str]],
             WorkUnitPartition,
@@ -90,8 +115,146 @@ class CompactionCoordinator:
         self.snapshot_builder = snapshot_builder
         self.snapshot_store = snapshot_store
         self.memory_store = memory_store
+        self.budget_monitor = budget_monitor
+        self.protected_builder = protected_builder
+        self.model = model
         self.partitioner = partitioner
         self._failed_attempts: set[str] = set()
+
+    def compact_manually(self, runtime: Any) -> Command:
+        request, immediate = self._manual_request(runtime)
+        if immediate is not None:
+            return immediate
+        assert request is not None
+        try:
+            prepared = self.prepare(request)
+        except CompactionPreparationError as exc:
+            return self._manual_failure(request, exc)
+        return self._manual_success(request, prepared)
+
+    async def acompact_manually(self, runtime: Any) -> Command:
+        request, immediate = self._manual_request(runtime)
+        if immediate is not None:
+            return immediate
+        assert request is not None
+        try:
+            prepared = await self.aprepare(request)
+        except CompactionPreparationError as exc:
+            return self._manual_failure(request, exc)
+        return self._manual_success(request, prepared)
+
+    def _manual_request(
+        self,
+        runtime: Any,
+    ) -> tuple[CompactionRequest | None, Command | None]:
+        if (
+            self.budget_monitor is None
+            or self.protected_builder is None
+            or self.model is None
+        ):
+            raise RuntimeError("manual compaction dependencies are not configured")
+        task_id = _runtime_task_id(runtime)
+        messages = tuple(runtime.state.get("messages", ()))
+        event_value = runtime.state.get("_deepfix_compaction_event")
+        event = (
+            DeepFixCompactionEvent.model_validate(event_value)
+            if event_value is not None
+            else None
+        )
+        protected = self.protected_builder.build(task_id, messages, event)
+        projected = ProtectedContextProjector().project(protected)
+        budget = self.budget_monitor.measure(
+            SimpleNamespace(
+                model=self.model,
+                system_message=None,
+                messages=list(messages),
+                tools=list(getattr(runtime, "tools", ()) or ()),
+            ),
+            [
+                projected.task_anchor_xml,
+                projected.working_memory_xml,
+                projected.deterministic_evidence_xml,
+            ],
+        )
+        tool_call_id = str(getattr(runtime, "tool_call_id", "") or "")
+        if budget.zone in {"normal", "observe"}:
+            message = _manual_tool_message(
+                task_id,
+                tool_call_id or "manual-noop",
+                "manual_noop",
+                tool_call_id,
+                "当前上下文尚未达到压缩条件。",
+                "success",
+            )
+            return None, Command(update={"messages": [message]})
+
+        request = CompactionRequest(
+            task_id=task_id,
+            entrypoint="manual_tool",
+            messages=messages,
+            active_event=event,
+            protected_context=protected,
+            budget=budget,
+            model=self.model,
+            tool_call_id=tool_call_id or None,
+        )
+        return request, None
+
+    def _manual_failure(
+        self,
+        request: CompactionRequest,
+        error: CompactionPreparationError,
+    ) -> Command:
+        failure = error.failure
+        self.snapshot_store.record_failure(failure)
+        self.memory_store.record_compaction_failure(
+            request.task_id, failure.error_code
+        )
+        self.memory_store.record_manual_error(request.task_id)
+        if request.budget.zone == "emergency":
+            if failure.prepared_snapshot_version is not None:
+                self.snapshot_store.abandon_snapshot(
+                    request.task_id,
+                    failure.prepared_snapshot_version,
+                    "emergency manual compaction failed",
+                )
+            raise _recovery_required(request, failure) from error
+        if failure.prepared_snapshot_version is not None:
+            self.snapshot_store.abandon_snapshot(
+                request.task_id,
+                failure.prepared_snapshot_version,
+                "manual compaction returned error",
+            )
+        message = _manual_tool_message(
+            request.task_id,
+            failure.attempt_id,
+            "manual_error",
+            request.tool_call_id or "",
+            f"上下文压缩失败（{failure.error_code}），可稍后重试。",
+            "error",
+        )
+        return Command(update={"messages": [message]})
+
+    @staticmethod
+    def _manual_success(
+        request: CompactionRequest,
+        prepared: PreparedCompaction,
+    ) -> Command:
+        message = _manual_tool_message(
+            request.task_id,
+            prepared.attempt_id,
+            "manual_success",
+            request.tool_call_id or "",
+            f"上下文已安全压缩为 Snapshot v{prepared.snapshot.version}。",
+            "success",
+        )
+        return Command(
+            update={
+                "_deepfix_compaction_event": prepared.event.model_dump(mode="json"),
+                "_deepfix_compaction_session_id": prepared.attempt_id,
+                "messages": [message],
+            }
+        )
 
     def prepare(self, request: CompactionRequest) -> PreparedCompaction:
         identities = ensure_message_ids(request.task_id, request.messages)
@@ -258,6 +421,73 @@ class CompactionCoordinator:
             event=event,
         )
 
+    async def aprepare(self, request: CompactionRequest) -> PreparedCompaction:
+        identities = ensure_message_ids(request.task_id, request.messages)
+        messages = tuple(
+            _with_task_scope(message, request.task_id)
+            for message in identities.messages
+        )
+        partition = self.partitioner(messages, identities.conflicted_message_ids)
+        input_hash = _input_hash(request, messages)
+        attempt_id = _attempt_id(request.task_id, input_hash)
+        retention = select_retained_units(
+            request.budget,
+            partition.units,
+            request.protected_context.task_anchor.latest_user_message_id,
+        )
+        compressed_ids = {unit.unit_id for unit in retention.compressed_units}
+        try:
+            artifact = await self.adapter.apersist_history(
+                request.task_id,
+                attempt_id,
+                messages,
+                retention.retained_message_ids,
+                work_unit_ids=compressed_ids,
+            )
+        except CompactionPreparationError as exc:
+            raise _rebind_error(exc, request, attempt_id, input_hash) from exc
+        except Exception as exc:
+            raise _new_preparation_error(
+                ArtifactPersistenceError,
+                request,
+                attempt_id,
+                input_hash,
+                "artifact_write",
+                "artifact_write_failed",
+            ) from exc
+        try:
+            delta = await self.delta_generator.agenerate(
+                request.model,
+                retention.compressed_units,
+            )
+        except CompactionPreparationError as exc:
+            raise _rebind_error(
+                exc,
+                request,
+                attempt_id,
+                input_hash,
+                artifact=artifact,
+            ) from exc
+        except Exception as exc:
+            raise _new_preparation_error(
+                SnapshotBuildError,
+                request,
+                attempt_id,
+                input_hash,
+                "delta_generation",
+                "delta_generation_failed",
+                artifact=artifact,
+            ) from exc
+        coordinator = CompactionCoordinator(
+            adapter=_StaticArtifactAdapter(artifact),
+            delta_generator=_StaticDeltaGenerator(delta),
+            snapshot_builder=self.snapshot_builder,
+            snapshot_store=self.snapshot_store,
+            memory_store=self.memory_store,
+            partitioner=self.partitioner,
+        )
+        return coordinator.prepare(request)
+
     def invoke_automatic(
         self,
         request: CompactionRequest,
@@ -285,6 +515,12 @@ class CompactionCoordinator:
             )
             self._failed_attempts.add(failure.attempt_id)
             if request.budget.zone == "emergency" or request.entrypoint == "overflow_recovery":
+                if failure.prepared_snapshot_version is not None:
+                    self.snapshot_store.abandon_snapshot(
+                        request.task_id,
+                        failure.prepared_snapshot_version,
+                        "emergency preparation failed",
+                    )
                 raise _recovery_required(request, failure) from exc
             response = handler(request.messages)
             self.memory_store.record_passthrough(request.task_id)
@@ -486,6 +722,37 @@ def _recovery_required(
 def _stable_id(prefix: str, *parts: str) -> str:
     value = "|".join((f"{prefix}:v1", *parts))
     return f"{prefix}_{hashlib.sha256(value.encode('utf-8')).hexdigest()[:32]}"
+
+
+def _runtime_task_id(runtime: Any) -> str:
+    execution_info = getattr(runtime, "execution_info", None)
+    if execution_info is not None and execution_info.thread_id:
+        return str(execution_info.thread_id).strip()
+    task_id = str(
+        getattr(runtime, "config", {})
+        .get("configurable", {})
+        .get("thread_id", "")
+    ).strip()
+    if not task_id:
+        raise ValueError("manual compaction runtime 缺少 thread_id")
+    return task_id
+
+
+def _manual_tool_message(
+    task_id: str,
+    scope_id: str,
+    result_type: str,
+    tool_call_id: str,
+    content: str,
+    status: Literal["success", "error"],
+) -> ToolMessage:
+    return ToolMessage(
+        id=stable_generated_message_id(task_id, scope_id, result_type),
+        content=content[:500],
+        name="compact_conversation",
+        tool_call_id=tool_call_id,
+        status=status,
+    )
 
 
 def _utc_now() -> str:
