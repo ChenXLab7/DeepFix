@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -18,9 +19,17 @@ _MODEL_ENV_NAMES = (
 
 @pytest.fixture(autouse=True)
 def isolate_model_environment(monkeypatch, tmp_path):
+    missing = object()
+    original = {name: os.environ.get(name, missing) for name in _MODEL_ENV_NAMES}
     for name in _MODEL_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    yield
+    for name, value in original.items():
+        if value is missing:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 def load_isolated(project, mode, tmp_path, **kwargs):

@@ -46,11 +46,17 @@ from deepfix.research.store import ResearchEvidenceStore
 
 
 def _build_deepseek_model(role: ModelRoleConfig) -> ChatDeepSeek:
+    profile = (
+        {"max_input_tokens": 1_000_000}
+        if role.model_name in {"deepseek-v4-flash", "deepseek-v4-pro"}
+        else None
+    )
     return ChatDeepSeek(
         model=role.model_name,
         api_key=role.api_key,
         base_url=role.base_url,
         temperature=0,
+        profile=profile,
     )
 
 

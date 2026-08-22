@@ -439,3 +439,28 @@ def test_run_interaction_queries_report_evidence_for_current_task_only(tmp_path)
     )
 
     assert store.calls == [task.task_id]
+
+
+def test_config_loads_package_env_independent_of_current_directory(
+    tmp_path,
+    monkeypatch,
+):
+    env_file = tmp_path / "package" / ".env"
+    env_file.parent.mkdir()
+    env_file.write_text("DEEPSEEK_API_KEY=file-secret\n", encoding="utf-8")
+    project = tmp_path / "target"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setattr("deepfix.config._DEFAULT_ENV_FILE", env_file)
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    for name in (
+        "DEEPSEEK_API_KEY",
+        "DEEPFIX_MAIN_API_KEY",
+        "DEEPFIX_COMPACTION_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = cli_module.load_config(project, ApprovalMode.MANUAL)
+
+    assert config.main_model.api_key.get_secret_value() == "file-secret"
+    assert config.compaction_model.api_key.get_secret_value() == "file-secret"

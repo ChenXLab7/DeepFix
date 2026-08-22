@@ -9,11 +9,22 @@ cd 'C:\Users\17823\Documents\AI Agent\deepfix-agent'
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
-$env:DEEPSEEK_API_KEY = "your-key"
 deepfix new --project 'C:\projects\broken-python-app' --mode manual '运行 pytest 时 test_divide 失败'
 ```
 
-不要把真实 API Key 写进源码、配置样例、测试或 Git 历史。
+在 `src/deepfix/.env` 配置模型。只提供一个通用 Key 就能运行：
+
+```dotenv
+DEEPSEEK_API_KEY=sk-your-key
+DEEPFIX_MAIN_MODEL=deepseek-v4-pro
+DEEPFIX_MAIN_API_KEY=
+DEEPFIX_COMPACTION_MODEL=deepseek-v4-flash
+DEEPFIX_COMPACTION_API_KEY=
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+```
+
+进程环境变量优先于这个文件。不要把真实 API Key 写进源码、配置样例、测试或 Git 历史，也不要提交
+`src/deepfix/.env`。
 
 如果目标项目使用的不是当前终端里的 Python，显式传入它的解释器。DeepFix 会把该路径保存在任务中，恢复任务时继续使用同一个环境：
 
@@ -62,7 +73,8 @@ Single Repair Agent ───────── LangGraph Checkpointer(SQLite)
     ├── save_progress ─────── WorkingMemoryStore(SQLite)
     │                              版本化事实、证据、假设、下一步
     └── compact_conversation
-             │
+             ├────────────── Compaction Model
+             │                    仅提取结构化 CompactionDelta，无工具
              └────────────── DEEPFIX_HOME/artifacts
                               完整历史与大型 Tool 输出
 ```
@@ -73,6 +85,10 @@ Single Repair Agent ───────── LangGraph Checkpointer(SQLite)
 - WorkingMemoryStore 保证有损摘要不会删除关键事实和下一步。
 - CompactionSnapshot 保存结构化压缩历史、来源和生命周期。
 - Conversation Artifact 保存被压缩消息的完整可恢复副本。
+
+主模型负责调查、工具调用、修复、验证和最终答复，也由它决定何时调用 `save_progress`；保存 Working
+Memory 不会额外调用模型。压缩模型只从完整 WorkUnit 提取不可信的结构化 `CompactionDelta`，没有工具，
+不能修改项目、任务状态或系统确定性证据。
 
 ### 证据保真的上下文管理
 
@@ -116,7 +132,14 @@ LLM 的训练知识可能过期，因此 Agent 可以查找佐证，但外部网
 
 ### 可选在线能力
 
-只配置 `DEEPSEEK_API_KEY` 时，Agent 仍可完成本地修复，并可使用无密钥的 PyPI 和 GitHub REST 公共查询。额外配置都是可选的：
+只配置 `DEEPSEEK_API_KEY` 时，主模型和压缩模型共用这个 Key。也可以按角色独立配置：主模型按
+`DEEPFIX_MAIN_API_KEY -> DEEPSEEK_API_KEY` 回退；压缩模型按
+`DEEPFIX_COMPACTION_API_KEY -> DEEPFIX_MAIN_API_KEY -> DEEPSEEK_API_KEY` 回退。两个角色的模型名也可独立
+设置：都使用 `deepseek-v4-flash` 是成本优先方案；主模型使用 Pro、压缩模型使用 Flash 是质量与成本的
+平衡方案。
+
+仅有模型 Key 时，Agent 仍可完成本地修复，并可使用无密钥的 PyPI 和 GitHub REST 公共查询。下面的额外
+配置都是可选的：
 
 ```powershell
 # 提高 GitHub API 配额，并启用官方仓库 Discussions 查询
@@ -138,7 +161,9 @@ $env:TAVILY_API_KEY = "your-tavily-key"
 | L2 | 安装依赖、组合命令、未知命令、删除 | 人工审批 | 人工审批 |
 | L3 | `git reset --hard`、递归强制删除、关机命令 | 强制拒绝 | 强制拒绝 |
 
-`LocalShellBackend` 始终以目标项目为根目录，并通过显式环境白名单启动 Shell，`DEEPSEEK_API_KEY` 不会传给项目命令。DeepFix 自己的历史文件通过 `CompositeBackend` 写到 `DEEPFIX_HOME/artifacts`，不会污染目标项目 Git 工作区。
+`LocalShellBackend` 始终以目标项目为根目录，并通过显式环境白名单启动 Shell；通用 Key、主模型 Key 和
+压缩模型 Key 都不会传给项目命令。DeepFix 自己的历史文件通过 `CompositeBackend` 写到
+`DEEPFIX_HOME/artifacts`，不会污染目标项目 Git 工作区。
 
 研究工具不会削弱原有审批策略：只读依赖检查和经过约束的搜索/抓取按登记风险执行；项目写入、删除、Shell、安装依赖及未知工具仍由 HITL 策略独立判断。外部正文被包裹为“不可信来源”，不能把网页里的提示当成 Agent 指令。
 

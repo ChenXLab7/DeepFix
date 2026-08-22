@@ -14,7 +14,7 @@ from deepfix.compaction.identity import (
     stable_conversation_message_id,
 )
 from deepfix.compaction.store import CompactionStore
-from deepfix.config import AppConfig
+from deepfix.config import AppConfig, redact_config_secrets
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus, TestResult
 from deepfix.persistence import TaskRepository
@@ -138,7 +138,8 @@ class BugfixService:
                 f"上下文协调需要恢复：{exc.recovery.error_code}",
             )
         except Exception as exc:  # noqa: BLE001 - persist every Agent boundary failure
-            task.final_summary = f"Agent 执行失败: {exc}"
+            safe_error = redact_config_secrets(str(exc), self.config)
+            task.final_summary = f"Agent 执行失败: {safe_error}"
             task.transition_to(TaskStatus.FAILED)
             self._save(task)
             return task

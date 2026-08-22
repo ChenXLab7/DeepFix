@@ -22,20 +22,27 @@ def test_backend_is_rooted_at_target_project(tmp_path, monkeypatch):
 
 
 def test_backend_shell_uses_project_cwd_without_exposing_api_key(tmp_path, monkeypatch):
-    secret = "super-secret-for-test"
-    monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
+    secrets = {
+        "DEEPSEEK_API_KEY": "common-secret",
+        "DEEPFIX_MAIN_API_KEY": "main-secret",
+        "DEEPFIX_COMPACTION_API_KEY": "compact-secret",
+    }
+    for name, secret in secrets.items():
+        monkeypatch.setenv(name, secret)
     monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
     backend = build_backend(load_config(tmp_path, ApprovalMode.MANUAL))
 
     result = backend.execute(
         "python -c \"import os; print(os.getcwd()); "
-        "print(os.getenv('DEEPSEEK_API_KEY'))\""
+        "print(os.getenv('DEEPSEEK_API_KEY')); "
+        "print(os.getenv('DEEPFIX_MAIN_API_KEY')); "
+        "print(os.getenv('DEEPFIX_COMPACTION_API_KEY'))\""
     )
 
     assert result.exit_code == 0
     assert str(tmp_path.resolve()) in result.output
-    assert secret not in result.output
-    assert "None" in result.output
+    assert all(secret not in result.output for secret in secrets.values())
+    assert result.output.count("None") == 3
 
 
 def test_backend_routes_context_artifacts_outside_target_project(tmp_path, monkeypatch):

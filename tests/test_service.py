@@ -352,6 +352,32 @@ def test_agent_exception_is_saved_as_failed(app_config):
     assert repository.get(task.task_id).status is TaskStatus.FAILED
 
 
+def test_agent_failure_redacts_both_model_role_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPFIX_MAIN_API_KEY", "main-secret-value")
+    monkeypatch.setenv("DEEPFIX_COMPACTION_API_KEY", "compact-secret-value")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    config = load_config(
+        tmp_path,
+        ApprovalMode.MANUAL,
+        env_file=tmp_path / "missing.env",
+    )
+    service, repository = make_service(
+        config,
+        FakeAgent(RuntimeError("auth failed main-secret-value compact-secret-value")),
+    )
+
+    task = service.start("修复错误")
+    persisted = repository.get(task.task_id)
+
+    assert task.status is TaskStatus.FAILED
+    assert "main-secret-value" not in persisted.final_summary
+    assert "compact-secret-value" not in persisted.final_summary
+    assert (
+        persisted.final_summary
+        == "Agent 执行失败: auth failed [REDACTED] [REDACTED]"
+    )
+
+
 def test_shell_budget_pauses_before_command_is_resumed(app_config):
     limited = replace(app_config, max_shell_calls=0)
     fake_agent = FakeAgent(make_interrupt("execute", {"command": "pytest -q"}))
