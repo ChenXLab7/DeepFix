@@ -94,6 +94,33 @@ def test_task_from_old_payload_uses_context_defaults(tmp_path):
     assert restored.offloaded_artifacts == []
 
 
+def test_task_round_trip_preserves_research_summary(tmp_path):
+    task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
+    task.external_evidence_ids = ["evidence-2", "evidence-1"]
+    task.research_query_count = 3
+    task.research_provider_errors = ["github: rate limited"]
+
+    restored = TaskState.from_dict(task.to_dict())
+
+    assert restored.external_evidence_ids == ["evidence-2", "evidence-1"]
+    assert restored.research_query_count == 3
+    assert restored.research_provider_errors == ["github: rate limited"]
+
+
+def test_task_from_old_payload_uses_research_defaults(tmp_path):
+    task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
+    payload = task.to_dict()
+    payload.pop("external_evidence_ids")
+    payload.pop("research_query_count")
+    payload.pop("research_provider_errors")
+
+    restored = TaskState.from_dict(payload)
+
+    assert restored.external_evidence_ids == []
+    assert restored.research_query_count == 0
+    assert restored.research_provider_errors == []
+
+
 def test_active_task_cannot_resume(tmp_path):
     task = TaskState.create(tmp_path, "除法结果错误", ApprovalMode.MANUAL)
     task.transition_to(TaskStatus.INVESTIGATING)

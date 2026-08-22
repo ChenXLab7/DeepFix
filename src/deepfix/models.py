@@ -173,6 +173,9 @@ class TaskState:
     working_memory_version: int = 0
     context_metrics: ContextMetrics = field(default_factory=ContextMetrics)
     offloaded_artifacts: list[str] = field(default_factory=list)
+    external_evidence_ids: list[str] = field(default_factory=list)
+    research_query_count: int = 0
+    research_provider_errors: list[str] = field(default_factory=list)
 
     @classmethod
     def create(
