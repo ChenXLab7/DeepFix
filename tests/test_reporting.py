@@ -94,6 +94,17 @@ def test_report_renders_deterministic_context_metrics_and_artifacts(tmp_path):
         active_compaction_count=1,
         working_memory_version=3,
         last_compaction_at="2026-08-21T10:00:00+00:00",
+        latest_usage_ratio=0.91,
+        latest_budget_zone="emergency",
+        normal_compaction_count=2,
+        emergency_compaction_count=1,
+        compaction_failure_count=3,
+        normal_zone_passthrough_count=1,
+        manual_compaction_error_count=1,
+        overflow_retry_count=2,
+        active_compaction_snapshot_version=4,
+        last_compaction_artifact="conversation_history/task.md",
+        last_compaction_error="snapshot_verify_failed",
     )
     task.offloaded_artifacts = ["conversation_history/task.md"]
 
@@ -103,6 +114,13 @@ def test_report_renders_deterministic_context_metrics_and_artifacts(tmp_path):
     assert "上下文峰值估算：4200 tokens" in report
     assert "主动压缩次数：1" in report
     assert "上下文溢出次数：0" in report
+    assert "最近预算区域：emergency (91.0%)" in report
+    assert "普通/紧急压缩次数：2/1" in report
+    assert "失败/直通/主动错误次数：3/1/1" in report
+    assert "Overflow 重试次数：2" in report
+    assert "生效 Snapshot 版本：4" in report
+    assert "最后压缩 Artifact：conversation_history/task.md" in report
+    assert "最后压缩错误：snapshot_verify_failed" in report
     assert "conversation_history/task.md" in report
 
 

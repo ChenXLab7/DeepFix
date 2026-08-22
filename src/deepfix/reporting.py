@@ -49,6 +49,31 @@ def render_report(
         f"上下文峰值估算：{task.context_metrics.context_peak_tokens} tokens",
         f"主动压缩次数：{task.context_metrics.active_compaction_count}",
         f"上下文溢出次数：{task.context_metrics.context_overflow_count}",
+        (
+            f"最近预算区域：{task.context_metrics.latest_budget_zone or '无'} "
+            f"({task.context_metrics.latest_usage_ratio:.1%})"
+        ),
+        (
+            "普通/紧急压缩次数："
+            f"{task.context_metrics.normal_compaction_count}/"
+            f"{task.context_metrics.emergency_compaction_count}"
+        ),
+        (
+            "失败/直通/主动错误次数："
+            f"{task.context_metrics.compaction_failure_count}/"
+            f"{task.context_metrics.normal_zone_passthrough_count}/"
+            f"{task.context_metrics.manual_compaction_error_count}"
+        ),
+        f"Overflow 重试次数：{task.context_metrics.overflow_retry_count}",
+        (
+            "生效 Snapshot 版本："
+            f"{task.context_metrics.active_compaction_snapshot_version or '无'}"
+        ),
+        (
+            "最后压缩 Artifact："
+            f"{task.context_metrics.last_compaction_artifact or '无'}"
+        ),
+        f"最后压缩错误：{task.context_metrics.last_compaction_error or '无'}",
         f"最后主动压缩时间：{task.context_metrics.last_compaction_at or '无'}",
         "卸载文件：",
         *_list_or_none(task.offloaded_artifacts),

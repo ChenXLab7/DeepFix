@@ -111,6 +111,16 @@ def test_context_metrics_record_budget_failures_and_event_versions(tmp_path):
     assert metrics.last_compaction_error == "artifact_write_failed"
 
 
+def test_context_metrics_bound_last_error_without_changing_failure_count(tmp_path):
+    store = WorkingMemoryStore(tmp_path / "deepfix.sqlite3")
+
+    metrics = store.record_compaction_failure("task-a", "x" * 500)
+
+    assert metrics.compaction_failure_count == 1
+    assert len(metrics.last_compaction_error) == 300
+    assert metrics.last_compaction_error.endswith("…")
+
+
 def test_store_rejects_blank_task_id_and_negative_token_estimate(tmp_path):
     store = WorkingMemoryStore(tmp_path / "deepfix.sqlite3")
 

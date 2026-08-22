@@ -20,6 +20,10 @@ from deepfix.compaction.middleware import (
     DeepFixCompactionMiddleware,
     MessageIdentityMiddleware,
 )
+from deepfix.compaction.migration import (
+    LegacyContextMigrationMiddleware,
+    LegacyContextStores,
+)
 from deepfix.compaction.snapshot import (
     CompactionDeltaGenerator,
     CompactionSnapshotBuilder,
@@ -125,6 +129,10 @@ def build_agent(
         ],
         middleware=[
             MessageIdentityMiddleware(),
+            LegacyContextMigrationMiddleware(
+                LegacyContextStores(tasks, working_memory_store, compaction),
+                DeepAgentsArtifactAdapter(resolved_backend),
+            ),
             PromptPolicyMiddleware(working_memory_store),
             ProtectedContextMiddleware(protected_builder),
             DeepFixCompactionMiddleware(

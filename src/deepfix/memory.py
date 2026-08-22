@@ -316,7 +316,7 @@ class WorkingMemoryStore:
 
         def update(metrics: ContextMetrics) -> None:
             metrics.compaction_failure_count += 1
-            metrics.last_compaction_error = normalized_error
+            metrics.last_compaction_error = _bounded_metric_error(normalized_error)
 
         return self._update_metrics(task_id, update)
 
@@ -590,6 +590,10 @@ class WorkingMemoryStore:
 
 def _text_hash(value: str) -> str:
     return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()[:24]
+
+
+def _bounded_metric_error(value: str) -> str:
+    return value if len(value) <= 300 else value[:299] + "…"
 
 
 def _merge_sources(

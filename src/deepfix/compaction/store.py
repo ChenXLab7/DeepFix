@@ -215,6 +215,57 @@ class CompactionStore:
             ).fetchall()
         return [CompactionFailureRecord.model_validate_json(str(row[0])) for row in rows]
 
+    def list_snapshots(self, task_id: str) -> list[CompactionSnapshot]:
+        with open_sqlite_connection(self.database_path) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM compaction_snapshots
+                WHERE task_id = ? ORDER BY version
+                """,
+                (_required(task_id, "task_id"),),
+            ).fetchall()
+        return [CompactionSnapshot.model_validate_json(str(row[0])) for row in rows]
+
+    def migration_version(self, task_id: str) -> int | None:
+        with open_sqlite_connection(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT version FROM context_migrations WHERE task_id = ?",
+                (_required(task_id, "task_id"),),
+            ).fetchone()
+        return None if row is None else int(row[0])
+
+    def migrated_event(self, task_id: str) -> DeepFixCompactionEvent | None:
+        with open_sqlite_connection(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT event_payload FROM context_migrations WHERE task_id = ?",
+                (_required(task_id, "task_id"),),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else DeepFixCompactionEvent.model_validate_json(str(row[0]))
+        )
+
+    def record_migration(
+        self,
+        task_id: str,
+        version: int,
+        event: DeepFixCompactionEvent,
+    ) -> None:
+        task_id = _required(task_id, "task_id")
+        if version < 1 or event.task_id != task_id:
+            raise ValueError("legacy migration 元数据无效")
+        with open_sqlite_connection(self.database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO context_migrations(task_id, version, event_payload, migrated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(task_id) DO NOTHING
+                """,
+                (task_id, version, event.model_dump_json(), _utc_now()),
+            )
+            connection.commit()
+
     def _update_snapshot_lifecycle(self, snapshot: CompactionSnapshot) -> None:
         with open_sqlite_connection(self.database_path) as connection:
             cursor = connection.execute(
@@ -270,6 +321,12 @@ class CompactionStore:
                     payload TEXT NOT NULL,
                     recorded_at TEXT NOT NULL,
                     PRIMARY KEY(task_id, attempt_id, stage)
+                );
+                CREATE TABLE IF NOT EXISTS context_migrations (
+                    task_id TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL,
+                    event_payload TEXT NOT NULL,
+                    migrated_at TEXT NOT NULL
                 );
                 """
             )

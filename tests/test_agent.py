@@ -128,8 +128,9 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert tool_names.count("search_technical_sources") == 1
     assert tool_names.count("fetch_external_evidence") == 1
     assert tool_names.count("link_external_evidence") == 1
-    assert middleware_names[:4] == [
+    assert middleware_names[:5] == [
         "MessageIdentityMiddleware",
+        "LegacyContextMigrationMiddleware",
         "PromptPolicyMiddleware",
         "ProtectedContextMiddleware",
         "DeepFixCompactionMiddleware",
@@ -140,8 +141,9 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
         "ContextMemoryMiddleware",
         "ResearchEvidenceMiddleware",
     } & set(middleware_names)
-    identity, prompt, protected, compaction = middleware[:4]
+    identity, migration, prompt, protected, compaction = middleware[:5]
     assert isinstance(identity, MessageIdentityMiddleware)
+    assert type(migration).__name__ == "LegacyContextMigrationMiddleware"
     assert isinstance(prompt, PromptPolicyMiddleware)
     assert isinstance(protected, ProtectedContextMiddleware)
     assert isinstance(compaction, DeepFixCompactionMiddleware)
