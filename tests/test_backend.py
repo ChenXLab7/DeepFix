@@ -1,6 +1,7 @@
 from deepagents.backends import CompositeBackend, LocalShellBackend
 
 from deepfix.backend import build_backend
+from deepfix.compaction.adapter import DeepAgentsArtifactAdapter
 from deepfix.config import ApprovalMode, load_config
 
 
@@ -54,3 +55,19 @@ def test_backend_routes_context_artifacts_outside_target_project(tmp_path, monke
     ).read_text(encoding="utf-8") == "history"
     assert not (config.project_root / ".deepfix-artifacts").exists()
     assert not (config.project_root / "conversation_history").exists()
+
+
+def test_history_adapter_uses_internal_artifact_route(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    config = load_config(tmp_path, ApprovalMode.MANUAL)
+
+    ref = DeepAgentsArtifactAdapter(build_backend(config)).persist_history(
+        "task-a",
+        "attempt-1",
+        [],
+        set(),
+    )
+
+    assert ref.path == "/.deepfix-artifacts/conversation_history/task-a.md"
+    assert (config.artifacts_path / "conversation_history" / "task-a.md").exists()
