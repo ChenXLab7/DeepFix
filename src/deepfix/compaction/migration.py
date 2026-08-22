@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any, NotRequired
 
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import PrivateStateAttr
 from langchain_core.messages import AnyMessage, HumanMessage, RemoveMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
@@ -41,8 +42,14 @@ class LegacyContextStores:
     compaction: CompactionStore
 
 
+class LegacyContextMigrationState(DeepFixCompactionState):
+    _summarization_event: NotRequired[
+        Annotated[dict[str, object] | None, PrivateStateAttr]
+    ]
+
+
 class LegacyContextMigrationMiddleware(AgentMiddleware):
-    state_schema = DeepFixCompactionState
+    state_schema = LegacyContextMigrationState
 
     def __init__(
         self,
@@ -54,7 +61,7 @@ class LegacyContextMigrationMiddleware(AgentMiddleware):
 
     def before_agent(
         self,
-        state: DeepFixCompactionState,
+        state: LegacyContextMigrationState,
         runtime: Runtime,
     ) -> dict[str, object] | None:
         if state.get("_summarization_event") is None:

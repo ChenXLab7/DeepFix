@@ -67,13 +67,33 @@ Single Repair Agent ───────── LangGraph Checkpointer(SQLite)
                               完整历史与大型 Tool 输出
 ```
 
-三层数据各自解决不同问题：
+四层数据各自解决不同问题：
 
 - Checkpointer 保证多轮任务和审批中断可以恢复。
-- Summarization Middleware 保证当前对话能放进模型上下文。
 - WorkingMemoryStore 保证有损摘要不会删除关键事实和下一步。
+- CompactionSnapshot 保存结构化压缩历史、来源和生命周期。
+- Conversation Artifact 保存被压缩消息的完整可恢复副本。
 
-Agent 可以主动调用 `compact_conversation`；如果它忘记，70% 上下文阈值会自动压缩，压缩后保留最近约 15%。主动和自动压缩共享同一个引擎和 `_summarization_event` 状态。压缩前，系统提示要求 Agent 先调用 `save_progress` 保存完整进度快照。
+### 证据保真的上下文管理
+
+DeepFix 不再采用固定的“70% 时压缩、保留最近 15%”，也不依赖 Deep Agents 的自然语言摘要作为运行时记忆。每次模型调用都会动态注入三个不可压缩保护块：Task Anchor、完整 Working Memory 和系统确定性证据。测试退出码、文件操作、审批和研究验证状态分别来自对应 Store；模型只能生成带来源的语义事实候选和假设，不能覆盖这些权威记录。
+
+预算分为四个区域：
+
+| 使用率 | 行为 |
+|---|---|
+| 0%～75% | 正常运行 |
+| >75%～82% | 观察区；Working Memory 覆盖过旧时提示保存 |
+| >82%～90% | 按完整工作单元执行普通压缩 |
+| >90% | 紧急压缩；无法安全准备时暂停任务 |
+
+一个工作单元包含操作目的、AI Tool Call、全部配对 ToolMessage，以及 Assistant 对结果的解释；并行 Tool Call 也属于同一单元。压缩时整个单元保留或整个进入 Snapshot，无法确认边界时优先保留。所有 Graph Message 都有稳定 ID：已有 `message.id` 原样复用，缺失 ID 根据任务、原始序号、消息类型、Tool Call ID 和规范化内容确定性生成。WorkUnit、来源、覆盖范围和 history 幂等都使用这些 ID。
+
+Agent 可以主动调用 `compact_conversation`，自动和主动入口共享 DeepFix Compaction Coordinator。协调器严格按“写入并回读完整 history artifact → 构造并校验 Snapshot → 保存 prepared Snapshot → 模型调用成功后提交 event”的顺序运行。Snapshot 具有 `prepared`、`active`、`abandoned` 生命周期；真正生效的版本始终由 `_deepfix_compaction_event.active_snapshot_version` 决定。后续压缩按字段合并旧 Snapshot、新工作单元、最新 Working Memory 和系统证据，不反复总结旧自然语言摘要。
+
+普通压缩区的准备失败会保留原消息、记录失败，并允许原请求直通一次；主动压缩在非紧急区失败会返回 error ToolMessage。紧急区失败或一次最小安全上下文重试后仍然 Overflow 时，`BugfixService` 把任务转为 `PAUSED`，并保存 `context_recovery`（失败阶段、错误码、Snapshot/Artifact 引用及“原消息是否保留”）。恢复时继续使用原 task ID 和 checkpoint；恢复成功后才清除该字段。
+
+完整 conversation history、大型 Tool 结果和媒体仍写在 `DEEPFIX_HOME/artifacts` 下，通过独立 Backend 路由保存，不会写入目标项目。Snapshot 只保留有界结构化状态与 artifact 引用。
 
 ## 技术资料证据流
 

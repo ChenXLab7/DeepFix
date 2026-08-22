@@ -34,9 +34,6 @@ from deepfix.protected_context import (
 
 
 class DeepFixCompactionState(AgentState):
-    _summarization_event: NotRequired[
-        Annotated[dict[str, object] | None, PrivateStateAttr]
-    ]
     _deepfix_compaction_event: NotRequired[
         Annotated[dict[str, object] | None, PrivateStateAttr]
     ]
