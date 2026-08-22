@@ -83,6 +83,34 @@ def test_context_metrics_keep_peak_and_count_events(tmp_path):
     assert metrics.last_compaction_at is not None
 
 
+def test_context_metrics_record_budget_failures_and_event_versions(tmp_path):
+    store = WorkingMemoryStore(tmp_path / "deepfix.sqlite3")
+
+    store.record_budget("task-a", 0.85, "normal_compaction")
+    store.record_compaction_failure("task-a", "artifact_write_failed")
+    store.record_passthrough("task-a")
+    store.record_manual_error("task-a")
+    store.record_overflow_retry("task-a")
+    store.record_compaction_event(
+        "task-a",
+        snapshot_version=3,
+        artifact_path="conversation_history/task-a.md",
+        emergency=False,
+    )
+
+    metrics = store.metrics("task-a")
+    assert metrics.latest_usage_ratio == 0.85
+    assert metrics.latest_budget_zone == "normal_compaction"
+    assert metrics.compaction_failure_count == 1
+    assert metrics.normal_zone_passthrough_count == 1
+    assert metrics.manual_compaction_error_count == 1
+    assert metrics.overflow_retry_count == 1
+    assert metrics.normal_compaction_count == 1
+    assert metrics.active_compaction_snapshot_version == 3
+    assert metrics.last_compaction_artifact == "conversation_history/task-a.md"
+    assert metrics.last_compaction_error == "artifact_write_failed"
+
+
 def test_store_rejects_blank_task_id_and_negative_token_estimate(tmp_path):
     store = WorkingMemoryStore(tmp_path / "deepfix.sqlite3")
 

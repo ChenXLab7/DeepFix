@@ -92,6 +92,7 @@ def test_task_from_old_payload_uses_context_defaults(tmp_path):
     assert restored.working_memory_version == 0
     assert restored.context_metrics == ContextMetrics()
     assert restored.offloaded_artifacts == []
+    assert restored.context_recovery is None
 
 
 def test_task_round_trip_preserves_research_summary(tmp_path):

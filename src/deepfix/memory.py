@@ -287,6 +287,83 @@ class WorkingMemoryStore:
 
         return self._update_metrics(task_id, update)
 
+    def record_budget(
+        self,
+        task_id: str,
+        usage_ratio: float,
+        zone: str,
+    ) -> ContextMetrics:
+        if not 0 <= usage_ratio:
+            raise ValueError("usage ratio 不能为负数")
+        normalized_zone = zone.strip()
+        if not normalized_zone:
+            raise ValueError("budget zone 不能为空")
+
+        def update(metrics: ContextMetrics) -> None:
+            metrics.latest_usage_ratio = usage_ratio
+            metrics.latest_budget_zone = normalized_zone
+
+        return self._update_metrics(task_id, update)
+
+    def record_compaction_failure(
+        self,
+        task_id: str,
+        error_code: str,
+    ) -> ContextMetrics:
+        normalized_error = error_code.strip()
+        if not normalized_error:
+            raise ValueError("error code 不能为空")
+
+        def update(metrics: ContextMetrics) -> None:
+            metrics.compaction_failure_count += 1
+            metrics.last_compaction_error = normalized_error
+
+        return self._update_metrics(task_id, update)
+
+    def record_passthrough(self, task_id: str) -> ContextMetrics:
+        def update(metrics: ContextMetrics) -> None:
+            metrics.normal_zone_passthrough_count += 1
+
+        return self._update_metrics(task_id, update)
+
+    def record_manual_error(self, task_id: str) -> ContextMetrics:
+        def update(metrics: ContextMetrics) -> None:
+            metrics.manual_compaction_error_count += 1
+
+        return self._update_metrics(task_id, update)
+
+    def record_overflow_retry(self, task_id: str) -> ContextMetrics:
+        def update(metrics: ContextMetrics) -> None:
+            metrics.overflow_retry_count += 1
+
+        return self._update_metrics(task_id, update)
+
+    def record_compaction_event(
+        self,
+        task_id: str,
+        *,
+        snapshot_version: int,
+        artifact_path: str,
+        emergency: bool,
+    ) -> ContextMetrics:
+        if snapshot_version < 1:
+            raise ValueError("snapshot version 必须为正整数")
+        normalized_path = artifact_path.strip()
+        if not normalized_path:
+            raise ValueError("artifact path 不能为空")
+
+        def update(metrics: ContextMetrics) -> None:
+            metrics.active_compaction_count += 1
+            metrics.last_compaction_at = self._now()
+            metrics.active_compaction_snapshot_version = snapshot_version
+            metrics.last_compaction_artifact = normalized_path
+            if emergency:
+                metrics.emergency_compaction_count += 1
+            else:
+                metrics.normal_compaction_count += 1
+
+        return self._update_metrics(task_id, update)
+
     def _update_metrics(self, task_id: str, update) -> ContextMetrics:
         normalized_task_id = self._normalize_task_id(task_id)
         with self._connection() as connection:

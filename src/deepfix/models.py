@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from deepfix.compaction.models import ContextRecoveryMetadata
 from deepfix.config import ApprovalMode
 
 
@@ -130,6 +131,17 @@ class ContextMetrics:
     active_compaction_count: int = 0
     working_memory_version: int = 0
     last_compaction_at: str | None = None
+    latest_usage_ratio: float = 0.0
+    latest_budget_zone: str | None = None
+    normal_compaction_count: int = 0
+    emergency_compaction_count: int = 0
+    compaction_failure_count: int = 0
+    normal_zone_passthrough_count: int = 0
+    manual_compaction_error_count: int = 0
+    overflow_retry_count: int = 0
+    active_compaction_snapshot_version: int | None = None
+    last_compaction_artifact: str | None = None
+    last_compaction_error: str | None = None
 
 
 class RepairOutcome(BaseModel):
@@ -180,6 +192,7 @@ class TaskState:
     external_evidence_ids: list[str] = field(default_factory=list)
     research_query_count: int = 0
     research_provider_errors: list[str] = field(default_factory=list)
+    context_recovery: ContextRecoveryMetadata | None = None
 
     @classmethod
     def create(
@@ -242,4 +255,11 @@ class TaskState:
         context_metrics = payload.get("context_metrics")
         if context_metrics is not None and not isinstance(context_metrics, ContextMetrics):
             payload["context_metrics"] = ContextMetrics(**context_metrics)
+        context_recovery = payload.get("context_recovery")
+        if context_recovery is not None and not isinstance(
+            context_recovery, ContextRecoveryMetadata
+        ):
+            payload["context_recovery"] = ContextRecoveryMetadata.model_validate(
+                context_recovery
+            )
         return cls(**payload)
