@@ -13,6 +13,7 @@ from deepfix.config import AppConfig
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus, TestResult
 from deepfix.persistence import TaskRepository
+from deepfix.research.store import ResearchEvidenceStore
 
 
 class BugfixService:
@@ -23,18 +24,21 @@ class BugfixService:
         policy: ApprovalPolicy,
         config: AppConfig,
         working_memory_store: WorkingMemoryStore,
+        research_evidence_store: ResearchEvidenceStore,
     ) -> None:
         self.agent = agent
         self.repository = repository
         self.policy = policy
         self.config = config
         self.working_memory_store = working_memory_store
+        self.research_evidence_store = research_evidence_store
 
     def start(self, problem: str) -> TaskState:
         task = TaskState.create(
             self.config.project_root,
             problem,
             self.config.approval_mode,
+            self.config.project_python,
         )
         message = {"role": "user", "content": task.user_problem}
         task.conversation.append(message)
@@ -331,6 +335,16 @@ class BugfixService:
             )
 
         task.context_metrics = self.working_memory_store.metrics(task.task_id)
+        external_evidence = self.research_evidence_store.list_evidence(task.task_id)
+        task.external_evidence_ids = [item.evidence_id for item in external_evidence]
+        query_count, provider_errors = self.research_evidence_store.query_summary(
+            task.task_id
+        )
+        task.research_query_count = query_count
+        task.research_provider_errors = [
+            _bounded_provider_error(error)
+            for error in provider_errors[:10]
+        ]
         if self.config.artifacts_path.exists():
             task.offloaded_artifacts = sorted(
                 path.relative_to(self.config.artifacts_path).as_posix()
@@ -344,3 +358,7 @@ class BugfixService:
         return normalized == "pytest" or normalized.startswith(
             ("pytest ", "python -m pytest")
         )
+
+
+def _bounded_provider_error(value: str, limit: int = 300) -> str:
+    return value if len(value) <= limit else value[: limit - 1] + "…"

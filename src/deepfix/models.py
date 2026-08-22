@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -150,6 +151,9 @@ class TaskState:
     project_root: str
     user_problem: str
     approval_mode: str
+    project_python: str = field(
+        default_factory=lambda: str(Path(sys.executable).resolve())
+    )
     status: TaskStatus = TaskStatus.CREATED
     conversation: list[dict[str, str]] = field(default_factory=list)
     evidence: list[Evidence] = field(default_factory=list)
@@ -183,6 +187,7 @@ class TaskState:
         project_root: str | Path,
         problem: str,
         approval_mode: ApprovalMode,
+        project_python: str | Path | None = None,
     ) -> TaskState:
         normalized_problem = problem.strip()
         if not normalized_problem:
@@ -192,6 +197,9 @@ class TaskState:
             project_root=str(Path(project_root).expanduser().resolve()),
             user_problem=normalized_problem,
             approval_mode=approval_mode.value,
+            project_python=str(
+                Path(project_python or sys.executable).expanduser().resolve()
+            ),
         )
 
     def transition_to(self, next_status: TaskStatus) -> None:

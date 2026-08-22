@@ -2,6 +2,34 @@ from deepfix.config import ApprovalMode
 from deepfix.models import ApprovalRecord, ContextMetrics, Evidence, TaskState
 from deepfix.models import TestResult as RepairTestResult
 from deepfix.reporting import render_report
+from deepfix.research.models import ExternalEvidence
+
+
+def external_evidence(**overrides):
+    values = {
+        "evidence_id": "evidence-1",
+        "task_id": "task-1",
+        "candidate_id": "candidate-1",
+        "source_type": "official_docs",
+        "evidence_level": "E1",
+        "title": "Pydantic model_copy",
+        "url": "https://docs.pydantic.dev/models/",
+        "query": "pydantic model_copy",
+        "relevant_excerpt": "model_copy accepts update.",
+        "retrieved_at": "2026-08-22T00:00:00+00:00",
+        "dependency_name": "pydantic",
+        "documented_version": "2.8",
+        "project_version": "2.8.4",
+        "local_verification": "verified",
+        "local_evidence": [
+            Evidence("tests/test_models.py:10", "目标回归测试通过")
+        ],
+        "linked_test_tool_call_ids": ["pytest-call-1"],
+        "verification_explanation": "本地回归确认官方结论适用",
+        "artifact_path": "/.deepfix-artifacts/research/task-1/evidence-1.md",
+    }
+    values.update(overrides)
+    return ExternalEvidence.model_validate(values)
 
 
 def test_report_contains_evidence_changes_tests_approvals_and_risks(tmp_path):
@@ -76,3 +104,73 @@ def test_report_renders_deterministic_context_metrics_and_artifacts(tmp_path):
     assert "主动压缩次数：1" in report
     assert "上下文溢出次数：0" in report
     assert "conversation_history/task.md" in report
+
+
+def test_report_renders_verified_external_evidence_with_true_local_linkage(tmp_path):
+    task = TaskState.create(tmp_path, "模型复制失败", ApprovalMode.MANUAL)
+    evidence = external_evidence(task_id=task.task_id)
+
+    report = render_report(task, [evidence])
+
+    assert "## 外部研究证据" in report
+    assert "[E1/verified] Pydantic model_copy" in report
+    assert "资料版本：2.8" in report
+    assert "项目版本：2.8.4" in report
+    assert "外部结论：model_copy accepts update." in report
+    assert "tests/test_models.py:10：目标回归测试通过" in report
+    assert "pytest-call-1" in report
+    assert evidence.url in report
+    assert evidence.artifact_path in report
+
+
+def test_report_marks_unverified_e3_as_external_clue(tmp_path):
+    task = TaskState.create(tmp_path, "模型复制失败", ApprovalMode.MANUAL)
+    evidence = external_evidence(
+        task_id=task.task_id,
+        evidence_level="E3",
+        source_type="github_issue",
+        local_verification="unverified",
+        local_evidence=[],
+        linked_test_tool_call_ids=[],
+        verification_explanation=None,
+    )
+
+    report = render_report(task, [evidence])
+
+    assert "[E3/unverified]" in report
+    assert "仅为外部线索" in report
+
+
+def test_report_keeps_contradiction_and_version_mismatch_visible(tmp_path):
+    task = TaskState.create(tmp_path, "模型复制失败", ApprovalMode.MANUAL)
+    evidence = external_evidence(
+        task_id=task.task_id,
+        documented_version="3.0",
+        project_version="2.8.4",
+        local_verification="contradicted",
+        verification_explanation="当前版本测试失败，官方结论不适用",
+    )
+
+    report = render_report(task, [evidence])
+
+    assert "已被本地证据推翻" in report
+    assert "当前版本测试失败，官方结论不适用" in report
+    assert "版本不一致" in report
+
+
+def test_report_uses_store_records_instead_of_task_model_prose(tmp_path):
+    task = TaskState.create(tmp_path, "模型复制失败", ApprovalMode.MANUAL)
+    task.evidence.append(Evidence("agent", "模型声称官方资料已验证"))
+    stored = external_evidence(
+        task_id=task.task_id,
+        local_verification="unverified",
+        local_evidence=[],
+        linked_test_tool_call_ids=[],
+        verification_explanation=None,
+    )
+
+    report = render_report(task, [stored])
+
+    assert "[E1/unverified]" in report
+    assert "仅为外部线索" in report
+    assert "[E1/verified]" not in report

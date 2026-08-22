@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from deepfix.models import TaskState
+from deepfix.research.models import ExternalEvidence
+from deepfix.research.reporting import render_external_evidence
 
 
-def render_report(task: TaskState) -> str:
+def render_report(
+    task: TaskState,
+    external_evidence: Sequence[ExternalEvidence] = (),
+) -> str:
+    current_evidence = [
+        item for item in external_evidence if item.task_id == task.task_id
+    ]
     sections = [
         "# DeepFix 修复报告",
         "",
@@ -16,6 +26,10 @@ def render_report(task: TaskState) -> str:
         f"根因：{task.diagnosis or '无'}",
         "证据：",
         *_evidence_lines(task),
+        "",
+        "## 外部研究证据",
+        "",
+        *render_external_evidence(current_evidence),
         "",
         "## 修改文件",
         "",

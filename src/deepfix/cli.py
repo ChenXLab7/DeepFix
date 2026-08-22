@@ -1,17 +1,37 @@
 from __future__ import annotations
 
 import argparse
+import os
 from collections.abc import Callable, Mapping
 
+import httpx
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from deepfix.agent import build_agent
 from deepfix.approval import ApprovalPolicy
+from deepfix.backend import build_backend
 from deepfix.config import ApprovalMode, load_config, state_database_path
+from deepfix.extensions import AgentExtensions, build_research_extensions
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import TaskState, TaskStatus
 from deepfix.persistence import TaskRepository
 from deepfix.reporting import render_report
+from deepfix.research.dependency import DependencyInspector
+from deepfix.research.fetcher import SafeEvidenceFetcher
+from deepfix.research.providers import (
+    CompositeTechnicalSearchProvider,
+    GitHubProvider,
+    PyPIProvider,
+    TavilyProvider,
+)
+from deepfix.research.sanitizer import QuerySanitizer, UrlSafetyPolicy
+from deepfix.research.store import ResearchEvidenceStore
+from deepfix.research.tools import (
+    build_fetch_external_evidence_tool,
+    build_inspect_dependency_tool,
+    build_link_external_evidence_tool,
+    build_search_technical_sources_tool,
+)
 from deepfix.service import BugfixService
 
 
@@ -21,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     new_parser = subparsers.add_parser("new", help="创建新的代码修复任务")
     new_parser.add_argument("--project", required=True, help="目标 Python 项目路径")
+    new_parser.add_argument(
+        "--python",
+        help="目标项目使用的 Python 解释器路径",
+    )
     new_parser.add_argument(
         "--mode",
         choices=("manual", "guarded"),
@@ -43,6 +67,7 @@ def run_interaction(
     *,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
+    research_evidence_store: ResearchEvidenceStore | None = None,
 ) -> TaskState:
     while task.status is TaskStatus.WAITING_APPROVAL and task.pending_actions:
         decisions: list[str] = []
@@ -80,7 +105,12 @@ def run_interaction(
     if task.status is TaskStatus.CLARIFYING:
         output_fn(f"需要补充信息: {task.pending_question or '请提供更多信息'}")
     else:
-        output_fn(render_report(task))
+        external_evidence = (
+            research_evidence_store.list_evidence(task.task_id)
+            if research_evidence_store is not None
+            else []
+        )
+        output_fn(render_report(task, external_evidence))
     return task
 
 
@@ -115,7 +145,11 @@ def main(
         return 0
 
     if args.command == "new":
-        config = load_config(args.project, ApprovalMode(args.mode))
+        config = load_config(
+            args.project,
+            ApprovalMode(args.mode),
+            project_python=args.python,
+        )
         stored_task = None
     else:
         try:
@@ -126,37 +160,97 @@ def main(
         config = load_config(
             stored_task.project_root,
             ApprovalMode(stored_task.approval_mode),
+            project_python=stored_task.project_python or None,
         )
 
     working_memory_store = WorkingMemoryStore(config.database_path)
-    with repository.checkpoint_connection() as connection:
-        checkpointer = SqliteSaver(connection)
-        agent = build_agent(
+    research_evidence_store = ResearchEvidenceStore(config.database_path)
+    artifact_backend = build_backend(config)
+    with build_research_client() as client:
+        extensions = build_cli_research_extensions(
             config,
-            checkpointer,
-            working_memory_store,
+            research_evidence_store,
+            client,
+            artifact_backend,
         )
-        service = BugfixService(
-            agent,
-            repository,
-            ApprovalPolicy(config.approval_mode),
-            config,
-            working_memory_store,
-        )
-        if args.command == "new":
-            task = service.start(args.problem)
-        else:
-            assert stored_task is not None
-            task = _resume_from_cli(service, stored_task, args.message, write_output)
-            if task is None:
-                return 2
-        run_interaction(
-            service,
-            task,
-            input_fn=read_input,
-            output_fn=write_output,
-        )
+        with repository.checkpoint_connection() as connection:
+            checkpointer = SqliteSaver(connection)
+            agent = build_agent(
+                config,
+                checkpointer,
+                working_memory_store,
+                extensions,
+                research_evidence_store,
+            )
+            service = BugfixService(
+                agent,
+                repository,
+                ApprovalPolicy(config.approval_mode),
+                config,
+                working_memory_store,
+                research_evidence_store,
+            )
+            if args.command == "new":
+                task = service.start(args.problem)
+            else:
+                assert stored_task is not None
+                task = _resume_from_cli(service, stored_task, args.message, write_output)
+                if task is None:
+                    return 2
+            run_interaction(
+                service,
+                task,
+                input_fn=read_input,
+                output_fn=write_output,
+                research_evidence_store=research_evidence_store,
+            )
     return 0
+
+
+def build_research_client() -> httpx.Client:
+    return httpx.Client(timeout=httpx.Timeout(15.0, connect=5.0))
+
+
+def build_cli_research_extensions(
+    config,
+    store: ResearchEvidenceStore,
+    client: httpx.Client,
+    artifact_backend,
+) -> AgentExtensions:
+    url_policy = UrlSafetyPolicy()
+    inspector = DependencyInspector(config.project_root, config.project_python)
+    pypi = PyPIProvider(client, url_policy)
+    github = GitHubProvider(
+        client,
+        url_policy,
+        token=os.environ.get("GITHUB_TOKEN"),
+    )
+    tavily = TavilyProvider(
+        client,
+        url_policy,
+        api_key=(
+            os.environ.get("TAVILY_API_KEY")
+            if config.search_provider == "tavily"
+            else None
+        ),
+    )
+    provider = CompositeTechnicalSearchProvider((pypi, github, tavily))
+    fetcher = SafeEvidenceFetcher(client, url_policy)
+    return build_research_extensions(
+        inspect_dependency=build_inspect_dependency_tool(inspector),
+        search_technical_sources=build_search_technical_sources_tool(
+            QuerySanitizer(),
+            inspector,
+            provider,
+            store,
+        ),
+        fetch_external_evidence=build_fetch_external_evidence_tool(
+            fetcher,
+            store,
+            artifact_backend,
+        ),
+        link_external_evidence=build_link_external_evidence_tool(store),
+    )
 
 
 def _resume_from_cli(

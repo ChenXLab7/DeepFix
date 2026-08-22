@@ -1,5 +1,6 @@
 from collections import deque
 from dataclasses import replace
+from uuid import uuid4
 
 import pytest
 from langchain_core.exceptions import ContextOverflowError
@@ -11,6 +12,8 @@ from deepfix.config import ApprovalMode, load_config
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
 from deepfix.models import Evidence, RepairOutcome, TaskStatus
 from deepfix.persistence import TaskRepository
+from deepfix.research.models import ExternalEvidence, SearchCandidate
+from deepfix.research.store import ResearchEvidenceStore
 from deepfix.service import BugfixService
 
 
@@ -102,9 +105,10 @@ def memory_store(app_config):
     return WorkingMemoryStore(app_config.database_path)
 
 
-def make_service(config, fake_agent, memory_store=None):
+def make_service(config, fake_agent, memory_store=None, research_store=None):
     repository = TaskRepository(config.database_path)
     memory_store = memory_store or WorkingMemoryStore(config.database_path)
+    research_store = research_store or ResearchEvidenceStore(config.database_path)
     return (
         BugfixService(
             fake_agent,
@@ -112,9 +116,52 @@ def make_service(config, fake_agent, memory_store=None):
             ApprovalPolicy(config.approval_mode),
             config,
             memory_store,
+            research_store,
         ),
         repository,
     )
+
+
+def save_external_evidence(store, task_id, *, excerpt="EXTERNAL ONLY"):
+    candidate = store.save_candidates(
+        task_id,
+        "pydantic model_copy",
+        [
+            SearchCandidate(
+                candidate_id="draft",
+                task_id="draft",
+                source_type="official_docs",
+                evidence_level="E1",
+                title="Pydantic models",
+                url="https://docs.pydantic.dev/models/",
+                query="draft",
+                repository="pydantic/pydantic",
+                created_at="draft",
+            )
+        ],
+    )[0]
+    evidence = ExternalEvidence(
+        evidence_id=uuid4().hex,
+        task_id=task_id,
+        candidate_id=candidate.candidate_id,
+        source_type="official_docs",
+        evidence_level="E1",
+        title="Pydantic models",
+        url=candidate.url,
+        query=candidate.query,
+        relevant_excerpt=excerpt,
+        retrieved_at="2026-08-22T00:00:00+00:00",
+        dependency_name="pydantic",
+        documented_version="2.8",
+        project_version="2.8.4",
+        local_verification="unverified",
+        local_evidence=[],
+        linked_test_tool_call_ids=[],
+        verification_explanation=None,
+        artifact_path=f"/.deepfix-artifacts/research/{task_id}/evidence.md",
+    )
+    store.save_evidence(evidence)
+    return evidence
 
 
 def test_start_passes_problem_and_stable_thread_id(app_config):
@@ -127,6 +174,82 @@ def test_start_passes_problem_and_stable_thread_id(app_config):
     assert value == {"messages": [{"role": "user", "content": "除法结果错误"}]}
     assert config["configurable"]["thread_id"] == task.task_id
     assert task.agent_invocations == 1
+    assert task.project_python == str(app_config.project_python)
+
+
+def test_service_syncs_only_current_task_research_summary_on_every_save(app_config):
+    research_store = ResearchEvidenceStore(app_config.database_path)
+    fake_agent = FakeAgent(outcome(), outcome(question="继续"))
+    service, repository = make_service(
+        app_config,
+        fake_agent,
+        research_store=research_store,
+    )
+    task = service.start("模型复制失败")
+    current = save_external_evidence(research_store, task.task_id)
+    save_external_evidence(research_store, "other-task", excerpt="OTHER TASK SECRET")
+    for index in range(12):
+        research_store.save_query(
+            task.task_id,
+            f"query-{index}",
+            ["github"],
+            [f"provider-{index}-" + "x" * 400],
+        )
+
+    continued = service.continue_task(task.task_id, "继续")
+    persisted = repository.get(task.task_id)
+
+    assert continued.external_evidence_ids == [current.evidence_id]
+    assert persisted.external_evidence_ids == [current.evidence_id]
+    assert continued.research_query_count == 12
+    assert len(continued.research_provider_errors) == 10
+    assert all(len(error) <= 300 for error in continued.research_provider_errors)
+    assert all("OTHER TASK SECRET" not in error for error in continued.research_provider_errors)
+
+
+def test_external_excerpt_never_enters_local_task_evidence(app_config):
+    research_store = ResearchEvidenceStore(app_config.database_path)
+    fake_agent = FakeAgent(outcome(), outcome(question="继续"))
+    service, _ = make_service(
+        app_config,
+        fake_agent,
+        research_store=research_store,
+    )
+    task = service.start("模型复制失败")
+    save_external_evidence(
+        research_store,
+        task.task_id,
+        excerpt="EXTERNAL EXCERPT MUST STAY OUT",
+    )
+
+    continued = service.continue_task(task.task_id, "继续")
+
+    assert all(
+        "EXTERNAL EXCERPT MUST STAY OUT" not in item.observation
+        for item in continued.evidence
+    )
+
+
+def test_provider_failure_is_synchronized_without_failing_task(app_config):
+    research_store = ResearchEvidenceStore(app_config.database_path)
+    fake_agent = FakeAgent(outcome(), outcome(question="继续"))
+    service, _ = make_service(
+        app_config,
+        fake_agent,
+        research_store=research_store,
+    )
+    task = service.start("依赖行为未知")
+    research_store.save_query(
+        task.task_id,
+        "pydantic validation",
+        ["github"],
+        ["github: rate limited"],
+    )
+
+    continued = service.continue_task(task.task_id, "继续")
+
+    assert continued.status is TaskStatus.CLARIFYING
+    assert continued.research_provider_errors == ["github: rate limited"]
 
 
 def test_interrupt_is_persisted_as_waiting_approval(app_config):
