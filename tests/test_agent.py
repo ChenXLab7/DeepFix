@@ -1,13 +1,18 @@
 import pytest
-from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain_core.tools import StructuredTool
 from langchain_deepseek import ChatDeepSeek
 from langgraph.checkpoint.memory import InMemorySaver
 
 from deepfix.agent import build_agent, build_model
+from deepfix.compaction.middleware import (
+    DeepFixCompactionMiddleware,
+    MessageIdentityMiddleware,
+)
 from deepfix.config import ApprovalMode, load_config
 from deepfix.extensions import build_research_extensions
 from deepfix.memory import WorkingMemoryStore
+from deepfix.prompting import PromptPolicyMiddleware
+from deepfix.protected_context import ProtectedContextMiddleware
 
 
 @pytest.fixture
@@ -85,12 +90,21 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     monkeypatch,
 ):
     captured = {}
+    registered = {}
 
     def fake_create_deep_agent(**kwargs):
         captured.update(kwargs)
         return "compiled-agent"
 
+    def fake_register_harness_profile(key, profile):
+        registered["key"] = key
+        registered["profile"] = profile
+
     monkeypatch.setattr("deepfix.agent.create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        "deepfix.agent.register_harness_profile",
+        fake_register_harness_profile,
+    )
     extensions = build_research_extensions(
         inspect_dependency=_extension_tool("inspect_dependency"),
         search_technical_sources=_extension_tool("search_technical_sources"),
@@ -114,9 +128,25 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert tool_names.count("search_technical_sources") == 1
     assert tool_names.count("fetch_external_evidence") == 1
     assert tool_names.count("link_external_evidence") == 1
-    assert any(isinstance(item, SummarizationMiddleware) for item in middleware)
-    assert "SummarizationToolMiddleware" in middleware_names
-    assert "ContextMemoryMiddleware" in middleware_names
+    assert middleware_names[:4] == [
+        "MessageIdentityMiddleware",
+        "PromptPolicyMiddleware",
+        "ProtectedContextMiddleware",
+        "DeepFixCompactionMiddleware",
+    ]
+    assert not {
+        "SummarizationMiddleware",
+        "SummarizationToolMiddleware",
+        "ContextMemoryMiddleware",
+        "ResearchEvidenceMiddleware",
+    } & set(middleware_names)
+    identity, prompt, protected, compaction = middleware[:4]
+    assert isinstance(identity, MessageIdentityMiddleware)
+    assert isinstance(prompt, PromptPolicyMiddleware)
+    assert isinstance(protected, ProtectedContextMiddleware)
+    assert isinstance(compaction, DeepFixCompactionMiddleware)
+    assert compaction.coordinator.model is captured["model"]
+    assert tool_names.count("compact_conversation") == 1
     assert captured["subagents"] == []
     assert captured["skills"] == []
     assert captured["interrupt_on"] == {
@@ -125,3 +155,7 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
         "delete": True,
         "execute": True,
     }
+    assert registered["key"] == f"deepseek:{config.model_name}"
+    assert registered["profile"].excluded_middleware == frozenset(
+        {"SummarizationMiddleware"}
+    )

@@ -8,6 +8,15 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command, Interrupt
 
 from deepfix.approval import ApprovalPolicy
+from deepfix.compaction.errors import (
+    ArtifactPersistenceError,
+    ContextRecoveryRequired,
+    ProtectedContextLoadError,
+)
+from deepfix.compaction.models import (
+    CompactionFailureRecord,
+    ContextRecoveryMetadata,
+)
 from deepfix.config import ApprovalMode, load_config
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
 from deepfix.models import Evidence, RepairOutcome, TaskState, TaskStatus
@@ -506,7 +515,7 @@ def test_service_syncs_latest_memory_without_promoting_hypothesis_to_diagnosis(
     assert continued.diagnosis is None
 
 
-def test_successful_compaction_is_counted_once_for_repeated_graph_history(
+def test_tool_message_wording_cannot_increment_compaction_metric(
     app_config,
     memory_store,
 ):
@@ -523,7 +532,7 @@ def test_successful_compaction_is_counted_once_for_repeated_graph_history(
             ],
         ),
         ToolMessage(
-            content="Conversation compacted.",
+            content="对话已经安全压缩完成。",
             tool_call_id="compact-1",
         ),
     ]
@@ -540,8 +549,8 @@ def test_successful_compaction_is_counted_once_for_repeated_graph_history(
 
     continued = service.continue_task(task.task_id, "继续")
 
-    assert continued.context_metrics.active_compaction_count == 1
-    assert memory_store.metrics(task.task_id).active_compaction_count == 1
+    assert continued.context_metrics.active_compaction_count == 0
+    assert memory_store.metrics(task.task_id).active_compaction_count == 0
 
 
 def test_nothing_to_compact_does_not_increment_success_metric(
@@ -578,7 +587,9 @@ def test_nothing_to_compact_does_not_increment_success_metric(
     assert memory_store.metrics(task.task_id).active_compaction_count == 0
 
 
-def test_context_overflow_pauses_and_persists_task(app_config, memory_store):
+def test_uncoordinated_context_overflow_is_an_ordinary_agent_failure(
+    app_config, memory_store
+):
     service, repository = make_service(
         app_config,
         FakeAgent(ContextOverflowError("context exceeded")),
@@ -587,10 +598,74 @@ def test_context_overflow_pauses_and_persists_task(app_config, memory_store):
 
     task = service.start("超长任务")
 
+    assert task.status is TaskStatus.FAILED
+    assert task.context_metrics.context_overflow_count == 0
+    assert repository.get(task.task_id).status is TaskStatus.FAILED
+
+
+class RecoveryAgent:
+    def __init__(self, error_type):
+        self.error_type = error_type
+
+    def invoke(self, value, config):
+        task_id = config["configurable"]["thread_id"]
+        recovery = ContextRecoveryMetadata(
+            task_id=task_id,
+            stage="protected_context",
+            error_code="protected_context_read_failed",
+            original_messages_preserved=True,
+        )
+        raise self.error_type(recovery)
+
+
+@pytest.mark.parametrize(
+    "error_type", [ProtectedContextLoadError, ContextRecoveryRequired]
+)
+def test_context_recovery_error_pauses_and_persists_metadata(
+    app_config,
+    error_type,
+):
+    service, repository = make_service(app_config, RecoveryAgent(error_type))
+
+    task = service.start("long bug")
+
     assert task.status is TaskStatus.PAUSED
-    assert task.context_metrics.context_overflow_count == 1
-    assert "上下文" in task.final_summary
-    assert repository.get(task.task_id).status is TaskStatus.PAUSED
+    assert task.context_recovery.error_code == "protected_context_read_failed"
+    assert repository.get(task.task_id).context_recovery == task.context_recovery
+
+
+def test_preparation_error_leak_remains_an_ordinary_failure(app_config):
+    failure = CompactionFailureRecord(
+        attempt_id="attempt-1",
+        task_id="task-a",
+        entrypoint="automatic",
+        budget_zone="normal_compaction",
+        stage="artifact_write",
+        error_code="artifact_write_failed",
+        input_hash="f" * 64,
+        original_messages_preserved=True,
+        recorded_at="2026-08-22T00:00:00+00:00",
+    )
+    service, _ = make_service(
+        app_config,
+        FakeAgent(ArtifactPersistenceError(failure)),
+    )
+
+    assert service.start("bug").status is TaskStatus.FAILED
+
+
+def test_recovery_metadata_clears_only_after_successful_resumed_invoke(app_config):
+    service, _ = make_service(
+        app_config,
+        RecoveryAgent(ContextRecoveryRequired),
+    )
+    paused = service.start("long bug")
+    assert paused.context_recovery is not None
+    service.agent = FakeAgent(outcome(question="continue"))
+
+    resumed = service.continue_task(paused.task_id, "more detail")
+
+    assert resumed.context_recovery is None
 
 
 def test_service_records_existing_context_artifacts(app_config, memory_store):

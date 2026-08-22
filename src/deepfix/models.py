@@ -235,6 +235,11 @@ class TaskState:
         payload = asdict(self)
         payload["status"] = self.status.value
         payload["paused_from"] = self.paused_from.value if self.paused_from else None
+        payload["context_recovery"] = (
+            self.context_recovery.model_dump(mode="json")
+            if self.context_recovery
+            else None
+        )
         return payload
 
     @classmethod

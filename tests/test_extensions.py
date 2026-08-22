@@ -94,6 +94,9 @@ def test_policy_action_must_use_the_declared_enum():
         "SummarizationMiddleware",
         "SummarizationToolMiddleware",
         "ContextMemoryMiddleware",
+        "MessageIdentityMiddleware",
+        "ProtectedContextMiddleware",
+        "DeepFixCompactionMiddleware",
         "HumanInTheLoopMiddleware",
     ],
 )

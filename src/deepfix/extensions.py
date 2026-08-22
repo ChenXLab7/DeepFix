@@ -14,6 +14,9 @@ _PROTECTED_MIDDLEWARE_NAMES = frozenset(
         "SummarizationMiddleware",
         "SummarizationToolMiddleware",
         "ContextMemoryMiddleware",
+        "MessageIdentityMiddleware",
+        "ProtectedContextMiddleware",
+        "DeepFixCompactionMiddleware",
         "HumanInTheLoopMiddleware",
     }
 )

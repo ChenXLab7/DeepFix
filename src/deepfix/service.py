@@ -4,15 +4,16 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
-from langchain_core.exceptions import ContextOverflowError
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 
 from deepfix.approval import ApprovalPolicy, PolicyAction
+from deepfix.compaction.errors import ContextCoordinationError
 from deepfix.compaction.identity import (
     ensure_message_ids,
     stable_conversation_message_id,
 )
+from deepfix.compaction.store import CompactionStore
 from deepfix.config import AppConfig
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus, TestResult
@@ -29,6 +30,7 @@ class BugfixService:
         config: AppConfig,
         working_memory_store: WorkingMemoryStore,
         research_evidence_store: ResearchEvidenceStore,
+        compaction_store: CompactionStore | None = None,
     ) -> None:
         self.agent = agent
         self.repository = repository
@@ -36,6 +38,9 @@ class BugfixService:
         self.config = config
         self.working_memory_store = working_memory_store
         self.research_evidence_store = research_evidence_store
+        self.compaction_store = compaction_store or CompactionStore(
+            config.database_path
+        )
 
     def start(self, problem: str) -> TaskState:
         task = TaskState.create(
@@ -121,11 +126,16 @@ class BugfixService:
         graph_config = {"configurable": {"thread_id": task.task_id}}
         try:
             result = self.agent.invoke(value, graph_config)
-        except ContextOverflowError as exc:
-            self.working_memory_store.record_overflow(task.task_id)
+        except ContextCoordinationError as exc:
+            if exc.recovery.task_id != task.task_id:
+                task.final_summary = "Agent 返回了其他任务的上下文恢复信息"
+                task.transition_to(TaskStatus.FAILED)
+                self._save(task)
+                return task
+            task.context_recovery = exc.recovery
             return self._pause(
                 task,
-                f"上下文压缩后仍超出模型限制，任务已暂停: {exc}",
+                f"上下文协调需要恢复：{exc.recovery.error_code}",
             )
         except Exception as exc:  # noqa: BLE001 - persist every Agent boundary failure
             task.final_summary = f"Agent 执行失败: {exc}"
@@ -133,6 +143,7 @@ class BugfixService:
             self._save(task)
             return task
 
+        task.context_recovery = None
         self._record_tool_results(task, result)
         if task.consecutive_test_failures >= self.config.max_consecutive_test_failures:
             return self._pause(task, "已达到最大连续测试失败次数")
@@ -280,10 +291,6 @@ class BugfixService:
                 continue
             task.processed_tool_call_ids.append(call_id)
             name, args = calls.get(call_id, (str(message.name or ""), {}))
-            if name == "compact_conversation":
-                if message.text.startswith("Conversation compacted."):
-                    self.working_memory_store.record_compaction(task.task_id)
-                continue
             command = str(args.get("command", ""))
             if name != "execute" or not self._is_pytest(command):
                 continue
