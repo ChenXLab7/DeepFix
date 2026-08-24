@@ -36,6 +36,7 @@ from deepfix.investigation.models import (
     InvestigationRecoveryMetadata,
     InvestigationState,
     NewInvestigationEvent,
+    ProgressKind,
     RecordHypothesisInput,
     ToolObservation,
 )
@@ -425,16 +426,107 @@ class InvestigationCoordinator:
         task_id: str,
         source_message_id: str,
     ) -> InvestigationState:
-        return self.record_observation(
-            task_id,
-            ToolObservation(
-                event_type=InvestigationEventType.USER_INFORMATION_RECEIVED,
-                source_message_id=source_message_id,
-                result_fingerprint=stable_investigation_id(
-                    "result", task_id, "user-information", source_message_id
-                ),
-            ),
+        state = self.state(task_id)
+        restored_phase = state.agent_phase
+        if state.agent_phase is AgentPhase.CLARIFYING:
+            restored_phase = state.paused_agent_phase or AgentPhase.INVESTIGATING
+        if restored_phase is AgentPhase.REVIEWING:
+            restored_phase = AgentPhase.INVESTIGATING
+        updated = state.model_copy(
+            update={
+                "agent_phase": restored_phase,
+                "paused_agent_phase": None,
+                "progress_generation": state.progress_generation + 1,
+                "no_progress_count": 0,
+                "exploratory_without_progress": 0,
+                "reevaluation_required": False,
+                "stagnation_level": 0,
+                "permit": None,
+            }
         )
+        return self._record_lifecycle(
+            state,
+            updated,
+            InvestigationEventType.USER_INFORMATION_RECEIVED,
+            source_message_id,
+            progress_kind=ProgressKind.USER_INFORMATION,
+        )
+
+    def record_needs_input(self, task_id: str, source_id: str) -> InvestigationState:
+        state = self.state(task_id)
+        paused_phase = (
+            state.paused_agent_phase
+            if state.agent_phase is AgentPhase.CLARIFYING
+            else state.agent_phase
+        )
+        updated = state.model_copy(
+            update={
+                "agent_phase": AgentPhase.CLARIFYING,
+                "paused_agent_phase": paused_phase,
+            }
+        )
+        return self._record_lifecycle(
+            state,
+            updated,
+            InvestigationEventType.NEEDS_INPUT,
+            source_id,
+        )
+
+    def record_paused(self, task_id: str, reason: str) -> InvestigationState:
+        state = self.state(task_id)
+        return self._record_lifecycle(
+            state,
+            state,
+            InvestigationEventType.TASK_PAUSED,
+            reason,
+        )
+
+    def record_resumed(self, task_id: str, source_id: str) -> InvestigationState:
+        state = self.state(task_id)
+        return self._record_lifecycle(
+            state,
+            state,
+            InvestigationEventType.TASK_RESUMED,
+            source_id,
+        )
+
+    def _record_lifecycle(
+        self,
+        state: InvestigationState,
+        updated: InvestigationState,
+        event_type: InvestigationEventType,
+        source_id: str,
+        *,
+        progress_kind: ProgressKind | None = None,
+    ) -> InvestigationState:
+        event = NewInvestigationEvent(
+            event_id=stable_investigation_id(
+                "event",
+                state.task_id,
+                "lifecycle",
+                event_type.value,
+                source_id,
+                str(state.version),
+            ),
+            task_id=state.task_id,
+            event_type=event_type,
+            source_message_id=source_id,
+            phase_before=state.agent_phase,
+            phase_after=updated.agent_phase,
+            progress_kind=progress_kind,
+        )
+        try:
+            return self.store.commit(state.version, [event], updated)
+        except Exception as exc:
+            raise InvestigationStateError(
+                self.recovery(
+                    state.task_id,
+                    "investigation_lifecycle_commit_failed",
+                    state=state,
+                    checkpoint_available=True,
+                    recovery_action="retry_lifecycle_commit_without_model_call",
+                )
+            ) from exc
 
     def grant_investigation_permit(
         self,

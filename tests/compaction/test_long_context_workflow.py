@@ -37,6 +37,8 @@ from deepfix.compaction.snapshot import CompactionSnapshotBuilder
 from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.work_units import partition_work_units
 from deepfix.config import AppConfig, ApprovalMode, ModelRoleConfig
+from deepfix.investigation.coordinator import InvestigationCoordinator
+from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, TaskState, TaskStatus
 from deepfix.models import TestResult as RepairTestResult
@@ -493,6 +495,12 @@ def _service(tmp_path, agent):
     memory = WorkingMemoryStore(database)
     research = ResearchEvidenceStore(database)
     compaction = CompactionStore(database)
+    investigation = InvestigationCoordinator(
+        store=InvestigationStore(database),
+        tasks=repository,
+        compaction_store=compaction,
+        evidence_collector=EvidenceCollector(compaction, research),
+    )
     return BugfixService(
         agent,
         repository,
@@ -501,6 +509,7 @@ def _service(tmp_path, agent):
         memory,
         research,
         compaction,
+        investigation,
     )
 
 

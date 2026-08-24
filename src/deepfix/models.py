@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from deepfix.compaction.identity import stable_conversation_message_id
 from deepfix.compaction.models import ContextRecoveryMetadata
 from deepfix.config import ApprovalMode
+from deepfix.investigation.models import InvestigationRecoveryMetadata
 
 
 class TaskStatus(StrEnum):
@@ -196,6 +197,7 @@ class TaskState:
     research_query_count: int = 0
     research_provider_errors: list[str] = field(default_factory=list)
     context_recovery: ContextRecoveryMetadata | None = None
+    investigation_recovery: InvestigationRecoveryMetadata | None = None
 
     @classmethod
     def create(
@@ -240,6 +242,11 @@ class TaskState:
             if self.context_recovery
             else None
         )
+        payload["investigation_recovery"] = (
+            self.investigation_recovery.model_dump(mode="json")
+            if self.investigation_recovery
+            else None
+        )
         return payload
 
     @classmethod
@@ -282,5 +289,14 @@ class TaskState:
         ):
             payload["context_recovery"] = ContextRecoveryMetadata.model_validate(
                 context_recovery
+            )
+        investigation_recovery = payload.get("investigation_recovery")
+        if investigation_recovery is not None and not isinstance(
+            investigation_recovery, InvestigationRecoveryMetadata
+        ):
+            payload["investigation_recovery"] = (
+                InvestigationRecoveryMetadata.model_validate(
+                    investigation_recovery
+                )
             )
         return cls(**payload)

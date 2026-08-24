@@ -13,11 +13,20 @@ from deepfix.compaction.errors import (
     ContextRecoveryRequired,
     ProtectedContextLoadError,
 )
+from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.models import (
     CompactionFailureRecord,
     ContextRecoveryMetadata,
 )
+from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config
+from deepfix.investigation.coordinator import InvestigationCoordinator
+from deepfix.investigation.errors import InvestigationStagnationError
+from deepfix.investigation.models import (
+    AgentPhase,
+    InvestigationRecoveryMetadata,
+)
+from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
 from deepfix.models import Evidence, RepairOutcome, TaskState, TaskStatus
 from deepfix.persistence import TaskRepository
@@ -127,7 +136,13 @@ def memory_store(app_config):
     return WorkingMemoryStore(app_config.database_path)
 
 
-def make_service(config, fake_agent, memory_store=None, research_store=None):
+def make_service(
+    config,
+    fake_agent,
+    memory_store=None,
+    research_store=None,
+    investigation=None,
+):
     repository = TaskRepository(config.database_path)
     memory_store = memory_store or WorkingMemoryStore(config.database_path)
     research_store = research_store or ResearchEvidenceStore(config.database_path)
@@ -139,8 +154,20 @@ def make_service(config, fake_agent, memory_store=None, research_store=None):
             config,
             memory_store,
             research_store,
+            investigation=investigation,
         ),
         repository,
+    )
+
+
+def service_coordinator(config):
+    compaction = CompactionStore(config.database_path)
+    research = ResearchEvidenceStore(config.database_path)
+    return InvestigationCoordinator(
+        store=InvestigationStore(config.database_path),
+        tasks=TaskRepository(config.database_path),
+        compaction_store=compaction,
+        evidence_collector=EvidenceCollector(compaction, research),
     )
 
 
@@ -642,6 +669,104 @@ class RecoveryAgent:
             original_messages_preserved=True,
         )
         raise self.error_type(recovery)
+
+
+def investigation_recovery(task_id):
+    return InvestigationRecoveryMetadata(
+        task_id=task_id,
+        error_code="investigation_stagnated",
+        agent_phase=AgentPhase.DIAGNOSING,
+        state_version=3,
+        last_event_sequence=7,
+        checkpoint_available=True,
+        recovery_action="request_user_direction",
+    )
+
+
+class InvestigationErrorAgent:
+    def invoke(self, value, config):
+        task_id = config["configurable"]["thread_id"]
+        raise InvestigationStagnationError(investigation_recovery(task_id))
+
+
+class ForeignInvestigationErrorAgent:
+    def invoke(self, value, config):
+        raise InvestigationStagnationError(investigation_recovery("other-task"))
+
+
+def test_investigation_error_pauses_and_persists_metadata(app_config):
+    coordinator = service_coordinator(app_config)
+    service, repository = make_service(
+        app_config,
+        InvestigationErrorAgent(),
+        investigation=coordinator,
+    )
+
+    task = service.start("repository scan loops")
+
+    assert task.status is TaskStatus.PAUSED
+    assert task.investigation_recovery.error_code == "investigation_stagnated"
+    assert (
+        repository.get(task.task_id).investigation_recovery
+        == task.investigation_recovery
+    )
+
+
+def test_foreign_investigation_recovery_task_id_fails_closed(app_config):
+    service, _ = make_service(app_config, ForeignInvestigationErrorAgent())
+
+    task = service.start("bug")
+
+    assert task.status is TaskStatus.FAILED
+    assert "其他任务" in task.final_summary
+
+
+def test_needs_input_synchronizes_agent_phase_to_clarifying(app_config):
+    coordinator = service_coordinator(app_config)
+    service, _ = make_service(
+        app_config,
+        FakeAgent(outcome(question="which Python version?")),
+        investigation=coordinator,
+    )
+
+    task = service.start("version-sensitive bug")
+    state = coordinator.state(task.task_id)
+
+    assert task.status is TaskStatus.CLARIFYING
+    assert state.agent_phase is AgentPhase.CLARIFYING
+    assert state.paused_agent_phase is AgentPhase.INVESTIGATING
+
+
+def test_user_information_records_lifecycle_and_clears_recovery(app_config):
+    coordinator = service_coordinator(app_config)
+    service, _ = make_service(
+        app_config,
+        FakeAgent(
+            InvestigationStagnationError(investigation_recovery("placeholder")),
+        ),
+        investigation=coordinator,
+    )
+    task = TaskState.create(
+        app_config.project_root,
+        "bug",
+        app_config.approval_mode,
+        app_config.project_python,
+    )
+    task.status = TaskStatus.PAUSED
+    task.paused_from = TaskStatus.INVESTIGATING
+    task.investigation_recovery = investigation_recovery(task.task_id)
+    service.repository.save(task)
+    coordinator.ensure_started(task.task_id)
+    service.agent = FakeAgent(outcome(question="continue"))
+
+    resumed = service.continue_task(task.task_id, "Python 3.12")
+    event_types = [
+        event.event_type
+        for event in coordinator.store.list_events(task.task_id)
+    ]
+
+    assert resumed.investigation_recovery is None
+    assert "user_information_received" in event_types
 
 
 @pytest.mark.parametrize(

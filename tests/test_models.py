@@ -1,6 +1,10 @@
 import pytest
 
 from deepfix.config import ApprovalMode
+from deepfix.investigation.models import (
+    AgentPhase,
+    InvestigationRecoveryMetadata,
+)
 from deepfix.models import (
     ApprovalRecord,
     ContextMetrics,
@@ -78,6 +82,23 @@ def test_task_round_trip_preserves_context_state(tmp_path):
     assert restored.context_metrics.context_peak_tokens == 4200
     assert restored.offloaded_artifacts == ["conversation_history/a.md"]
     assert isinstance(restored.context_metrics, ContextMetrics)
+
+
+def test_task_round_trip_preserves_investigation_recovery(tmp_path):
+    task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
+    task.investigation_recovery = InvestigationRecoveryMetadata(
+        task_id=task.task_id,
+        error_code="investigation_stagnated",
+        agent_phase=AgentPhase.DIAGNOSING,
+        state_version=3,
+        last_event_sequence=7,
+        checkpoint_available=True,
+        recovery_action="request_user_direction",
+    )
+
+    restored = TaskState.from_dict(task.to_dict())
+
+    assert restored.investigation_recovery == task.investigation_recovery
 
 
 def test_task_from_old_payload_uses_context_defaults(tmp_path):

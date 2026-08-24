@@ -15,6 +15,8 @@ from deepfix.compaction.identity import (
 )
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import AppConfig, redact_config_secrets
+from deepfix.investigation.coordinator import InvestigationCoordinator
+from deepfix.investigation.errors import InvestigationCoordinationError
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus, TestResult
 from deepfix.persistence import TaskRepository
@@ -31,6 +33,7 @@ class BugfixService:
         working_memory_store: WorkingMemoryStore,
         research_evidence_store: ResearchEvidenceStore,
         compaction_store: CompactionStore | None = None,
+        investigation: InvestigationCoordinator | None = None,
     ) -> None:
         self.agent = agent
         self.repository = repository
@@ -41,6 +44,7 @@ class BugfixService:
         self.compaction_store = compaction_store or CompactionStore(
             config.database_path
         )
+        self.investigation = investigation
 
     def start(self, problem: str) -> TaskState:
         task = TaskState.create(
@@ -70,7 +74,8 @@ class BugfixService:
         user_message: str | None = None,
     ) -> TaskState:
         task = self.repository.get(task_id)
-        if task.status is TaskStatus.PAUSED:
+        resumed_from_pause = task.status is TaskStatus.PAUSED
+        if resumed_from_pause:
             task.resume()
         if task.status is TaskStatus.WAITING_APPROVAL and task.pending_actions:
             self._save(task)
@@ -93,6 +98,18 @@ class BugfixService:
         message = {"id": message_id, "role": "user", "content": content}
         task.conversation.append(message)
         self._save(task)
+        if resumed_from_pause and not self._record_lifecycle(
+            task,
+            lambda: self.investigation.record_resumed(task.task_id, message_id),
+        ):
+            return task
+        if not self._record_lifecycle(
+            task,
+            lambda: self.investigation.record_user_information(
+                task.task_id, message_id
+            ),
+        ):
+            return task
         return self._invoke(
             task,
             {"messages": [HumanMessage(id=message_id, content=content)]},
@@ -126,6 +143,17 @@ class BugfixService:
         graph_config = {"configurable": {"thread_id": task.task_id}}
         try:
             result = self.agent.invoke(value, graph_config)
+        except InvestigationCoordinationError as exc:
+            if exc.recovery.task_id != task.task_id:
+                task.final_summary = "Agent 返回了其他任务的调查恢复信息"
+                task.transition_to(TaskStatus.FAILED)
+                self._save(task)
+                return task
+            task.investigation_recovery = exc.recovery
+            return self._pause(
+                task,
+                f"调查协调需要恢复：{exc.recovery.error_code}",
+            )
         except ContextCoordinationError as exc:
             if exc.recovery.task_id != task.task_id:
                 task.final_summary = "Agent 返回了其他任务的上下文恢复信息"
@@ -145,6 +173,7 @@ class BugfixService:
             return task
 
         task.context_recovery = None
+        task.investigation_recovery = None
         self._record_tool_results(task, result)
         if task.consecutive_test_failures >= self.config.max_consecutive_test_failures:
             return self._pause(task, "已达到最大连续测试失败次数")
@@ -327,6 +356,15 @@ class BugfixService:
             self._return_to_investigating(task)
             task.pending_question = outcome.question
             task.transition_to(TaskStatus.CLARIFYING)
+            self._save(task)
+            self._record_lifecycle(
+                task,
+                lambda: self.investigation.record_needs_input(
+                    task.task_id,
+                    f"agent-invocation-{task.agent_invocations}",
+                ),
+            )
+            return task
         elif outcome.status == "blocked":
             return self._pause(task, outcome.summary)
         elif not any(result.exit_code == 0 for result in task.test_results):
@@ -347,7 +385,38 @@ class BugfixService:
         if task.status is not TaskStatus.PAUSED:
             task.transition_to(TaskStatus.PAUSED)
         self._save(task)
+        if self.investigation is not None:
+            try:
+                self.investigation.record_paused(task.task_id, reason)
+            except InvestigationCoordinationError as exc:
+                if exc.recovery.task_id == task.task_id:
+                    task.investigation_recovery = exc.recovery
+                task.final_summary = (
+                    f"{reason}；调查生命周期记录失败：{exc.recovery.error_code}"
+                )
+                self._save(task)
         return task
+
+    def _record_lifecycle(self, task: TaskState, operation) -> bool:
+        if self.investigation is None:
+            return True
+        try:
+            operation()
+            return True
+        except InvestigationCoordinationError as exc:
+            if exc.recovery.task_id != task.task_id:
+                task.final_summary = "调查生命周期返回了其他任务的恢复信息"
+                task.transition_to(TaskStatus.FAILED)
+                self._save(task)
+                return False
+            task.investigation_recovery = exc.recovery
+            task.final_summary = (
+                f"调查生命周期需要恢复：{exc.recovery.error_code}"
+            )
+            if task.status is not TaskStatus.PAUSED:
+                task.transition_to(TaskStatus.PAUSED)
+            self._save(task)
+            return False
 
     def _save(self, task: TaskState) -> None:
         self._sync_context(task)

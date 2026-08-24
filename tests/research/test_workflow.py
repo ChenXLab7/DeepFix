@@ -12,7 +12,11 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from deepfix.approval import ApprovalPolicy
 from deepfix.backend import build_backend
+from deepfix.compaction.evidence import EvidenceCollector
+from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config
+from deepfix.investigation.coordinator import InvestigationCoordinator
+from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import Evidence, RepairOutcome, TaskStatus
 from deepfix.persistence import TaskRepository
@@ -130,6 +134,13 @@ def test_offline_research_evidence_workflow_is_task_local_and_cannot_bypass_test
     )
     repository = TaskRepository(config.database_path)
     research_store = ResearchEvidenceStore(config.database_path)
+    compaction_store = CompactionStore(config.database_path)
+    investigation = InvestigationCoordinator(
+        store=InvestigationStore(config.database_path),
+        tasks=repository,
+        compaction_store=compaction_store,
+        evidence_collector=EvidenceCollector(compaction_store, research_store),
+    )
     working_memory = WorkingMemoryStore(config.database_path)
     backend = build_backend(config)
     service = BugfixService(
@@ -139,6 +150,8 @@ def test_offline_research_evidence_workflow_is_task_local_and_cannot_bypass_test
         config,
         working_memory,
         research_store,
+        compaction_store,
+        investigation,
     )
     task = service.start("验证 pydantic 版本相关问题")
     assert task.status is TaskStatus.CLARIFYING
