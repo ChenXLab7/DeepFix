@@ -344,11 +344,19 @@ class InvestigationCoordinator:
         task_id: str,
         observation: ToolObservation,
     ) -> InvestigationState:
+        event_id = self._observation_event_id(task_id, observation)
+        recovery_state: InvestigationState | None = None
         for attempt in range(_STATE_COMMIT_MAX_ATTEMPTS):
             state = self.state(task_id)
-            event_id = self._observation_event_id(task_id, observation)
-            if self.store.has_event(task_id, event_id):
-                return state
+            try:
+                if self.store.has_event(task_id, event_id):
+                    return self.state(task_id)
+            except InvestigationStateError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - preserve recovery boundary
+                failure = exc
+                recovery_state = state
+                break
             events, updated = self._prepare_observation_commit(
                 task_id,
                 state,
@@ -361,15 +369,20 @@ class InvestigationCoordinator:
                 if attempt + 1 < _STATE_COMMIT_MAX_ATTEMPTS:
                     continue
                 failure = exc
+                try:
+                    recovery_state = self.state(task_id)
+                except Exception:  # noqa: BLE001 - preserve the commit failure
+                    recovery_state = state
                 break
             except Exception as exc:  # noqa: BLE001 - preserve recovery boundary
                 failure = exc
+                recovery_state = state
                 break
         raise InvestigationStateError(
             self.recovery(
                 task_id,
                 "investigation_state_commit_failed",
-                state=state,
+                state=recovery_state,
                 tool_call_id=observation.tool_call_id,
                 checkpoint_available=True,
                 recovery_action="replay_event_commit_without_model_call",

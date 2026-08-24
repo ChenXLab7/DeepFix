@@ -11,6 +11,7 @@ from deepfix.investigation.models import (
     RecordHypothesisInput,
     ToolObservation,
 )
+from deepfix.investigation.store import InvestigationStateConflict
 from investigation.helpers import (
     coordinator_fixture,
     seed_checked_location,
@@ -198,6 +199,129 @@ def test_parallel_file_observations_retry_state_conflict_without_losing_updates(
         ]
     ) == 2
     assert max(result.version for result in results) == final_state.version
+
+
+def test_concurrent_replay_returns_state_containing_committed_observation(
+    tmp_path,
+    monkeypatch,
+):
+    coordinator = coordinator_fixture(tmp_path)
+    initial = coordinator.state("task-a")
+    original_state = coordinator.state
+    replay_loaded = threading.Event()
+    first_committed = threading.Event()
+
+    def pause_replay_after_state_load(task_id):
+        state = original_state(task_id)
+        if threading.current_thread().name.startswith("replay"):
+            replay_loaded.set()
+            assert first_committed.wait(timeout=5)
+        return state
+
+    monkeypatch.setattr(coordinator, "state", pause_replay_after_state_load)
+    observation = ToolObservation(
+        event_type="file_checked",
+        tool_call_id="read-source",
+        source_message_id="msg-read-source",
+        signature="read:source",
+        result_fingerprint="result:source",
+        path="python_programs/mergesort.py",
+        payload={
+            "path": "python_programs/mergesort.py",
+            "start_line": 1,
+            "end_line": 20,
+            "content_fingerprint": "content:source",
+        },
+    )
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="replay") as executor:
+        replay = executor.submit(
+            coordinator.record_observation,
+            "task-a",
+            observation,
+        )
+        assert replay_loaded.wait(timeout=5)
+        committed = coordinator.record_observation("task-a", observation)
+        first_committed.set()
+        replayed = replay.result(timeout=5)
+
+    assert committed.version == initial.version + 1
+    assert replayed.version == committed.version
+    assert replayed.checked_files == committed.checked_files
+
+
+def test_event_precheck_failure_becomes_typed_recovery_error(
+    tmp_path,
+    monkeypatch,
+):
+    coordinator = coordinator_fixture(tmp_path)
+
+    def fail_has_event(task_id, event_id):
+        raise OSError("disk")
+
+    monkeypatch.setattr(coordinator.store, "has_event", fail_has_event)
+
+    with pytest.raises(InvestigationStateError) as caught:
+        coordinator.record_observation(
+            "task-a",
+            ToolObservation(
+                event_type="file_checked",
+                tool_call_id="read-source",
+                source_message_id="msg-read-source",
+                signature="read:source",
+                result_fingerprint="result:source",
+                path="python_programs/mergesort.py",
+                payload={
+                    "path": "python_programs/mergesort.py",
+                    "start_line": 1,
+                    "end_line": 20,
+                    "content_fingerprint": "content:source",
+                },
+            ),
+        )
+
+    assert caught.value.recovery.error_code == "investigation_state_commit_failed"
+
+
+def test_conflict_retry_exhaustion_reports_fresh_recovery_state(
+    tmp_path,
+    monkeypatch,
+):
+    coordinator = coordinator_fixture(tmp_path)
+    initial = coordinator.state("task-a")
+    stale = initial.model_copy(update={"version": 1})
+    fresh = initial.model_copy(update={"version": 9})
+    reads = iter([stale, stale, stale, stale, fresh])
+
+    monkeypatch.setattr(coordinator, "state", lambda task_id: next(reads))
+    monkeypatch.setattr(
+        coordinator.store,
+        "commit",
+        lambda expected_version, events, next_state: (_ for _ in ()).throw(
+            InvestigationStateConflict("conflict")
+        ),
+    )
+
+    with pytest.raises(InvestigationStateError) as caught:
+        coordinator.record_observation(
+            "task-a",
+            ToolObservation(
+                event_type="file_checked",
+                tool_call_id="read-source",
+                source_message_id="msg-read-source",
+                signature="read:source",
+                result_fingerprint="result:source",
+                path="python_programs/mergesort.py",
+                payload={
+                    "path": "python_programs/mergesort.py",
+                    "start_line": 1,
+                    "end_line": 20,
+                    "content_fingerprint": "content:source",
+                },
+            ),
+        )
+
+    assert caught.value.recovery.state_version == fresh.version
 
 
 def test_non_conflict_commit_failure_is_not_retried(tmp_path, monkeypatch):
