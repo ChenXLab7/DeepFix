@@ -52,6 +52,8 @@ class InvestigationEventType(StrEnum):
     USER_INFORMATION_RECEIVED = "user_information_received"
     NEEDS_INPUT = "needs_input"
     TOOL_COMPLETED = "tool_completed"
+    ARTIFACT_SEARCHED = "artifact_searched"
+    ARTIFACT_READ = "artifact_read"
     TEST_OBSERVED = "test_observed"
     FILE_CHECKED = "file_checked"
     FILE_CHANGED = "file_changed"
@@ -245,4 +247,3 @@ class InvestigationRecoveryMetadata(StrictModel):
     permit_id: str | None = None
     checkpoint_available: bool
     recovery_action: str = Field(min_length=1)
-

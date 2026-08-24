@@ -101,6 +101,25 @@ def test_phase_change_and_new_file_do_not_reset_stagnation():
     assert state.stagnation_level == 1
 
 
+def test_artifact_retrieval_counts_as_ordinary_no_progress_activity():
+    detector = StagnationDetector()
+    state = InvestigationState.new("task-a")
+
+    for index in range(6):
+        state = detector.after_tool(
+            state,
+            ToolObservation(
+                event_type="artifact_searched",
+                signature=f"artifact-query-{index}",
+                result_fingerprint=f"artifact-result-{index}",
+            ),
+        )
+
+    assert state.no_progress_count == 6
+    assert state.progress_generation == 0
+    assert state.stagnation_level == 1
+
+
 def test_strong_progress_resets_generation_and_counters():
     detector = StagnationDetector()
     state = state_with_no_progress_count(5)

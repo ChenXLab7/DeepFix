@@ -119,6 +119,36 @@ _PHASE_CAPABILITIES: dict[AgentPhase, frozenset[InvestigationCapability]] = {
 _REEVALUATION_TOOL_NAMES = frozenset(
     {"record_hypothesis", "continue_investigation", "save_progress"}
 )
+_DIAGNOSTIC_RESULT_EVENTS = {
+    (
+        "search_diagnostic_artifacts",
+        "diagnostic_artifact_search",
+    ): InvestigationEventType.ARTIFACT_SEARCHED,
+    (
+        "read_diagnostic_artifact",
+        "diagnostic_artifact_read",
+    ): InvestigationEventType.ARTIFACT_READ,
+}
+_DIAGNOSTIC_PAYLOAD_FIELDS = {
+    "diagnostic_artifact_search": (
+        "artifact_ids",
+        "match_count",
+        "searched_artifact_count",
+        "omitted_artifact_count",
+        "truncated",
+        "content_hashes",
+        "query_terms_hash",
+    ),
+    "diagnostic_artifact_read": (
+        "artifact_id",
+        "kind",
+        "start_line",
+        "end_line",
+        "total_lines",
+        "content_hash",
+        "truncated",
+    ),
+}
 
 
 class InvestigationCoordinator:
@@ -191,6 +221,15 @@ class InvestigationCoordinator:
         args = args_value if isinstance(args_value, Mapping) else {}
         signature = tool_signature(name, args)
         fingerprint = result_fingerprint(result)
+        diagnostic = _diagnostic_artifact_observation(
+            name,
+            call_id,
+            result,
+            signature,
+            fingerprint,
+        )
+        if diagnostic is not None:
+            return self.record_observation(task_id, diagnostic)
         evidence = self.evidence_collector.collect_pair(task_id, call, result, task)
 
         if name == "execute" and is_pytest_verification(
@@ -773,6 +812,11 @@ class InvestigationCoordinator:
     @staticmethod
     def _event_payload(observation: ToolObservation) -> dict[str, Any]:
         payload = dict(observation.payload)
+        if observation.event_type in {
+            InvestigationEventType.ARTIFACT_SEARCHED,
+            InvestigationEventType.ARTIFACT_READ,
+        }:
+            return payload
         for key, value in {
             "signature": observation.signature or None,
             "result_fingerprint": observation.result_fingerprint or None,
@@ -869,6 +913,33 @@ def _merge_checked_file(
     return [
         replacement if item is existing else item for item in state.checked_files
     ]
+
+
+def _diagnostic_artifact_observation(
+    tool_name: str,
+    call_id: str,
+    result: ToolMessage,
+    signature: str,
+    fingerprint: str,
+) -> ToolObservation | None:
+    artifact = result.artifact if isinstance(result.artifact, Mapping) else {}
+    result_type = str(artifact.get("result_type", ""))
+    event_type = _DIAGNOSTIC_RESULT_EVENTS.get((tool_name, result_type))
+    if result.status != "success" or event_type is None:
+        return None
+    payload = {
+        key: artifact[key]
+        for key in _DIAGNOSTIC_PAYLOAD_FIELDS[result_type]
+        if key in artifact
+    }
+    return ToolObservation(
+        event_type=event_type,
+        tool_call_id=call_id or None,
+        source_message_id=str(result.id or "") or None,
+        signature=signature,
+        result_fingerprint=fingerprint,
+        payload=payload,
+    )
 
 
 def _normalized_path(value: str) -> str:

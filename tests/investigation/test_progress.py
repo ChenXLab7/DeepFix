@@ -88,3 +88,10 @@ def test_failed_file_change_is_not_strong_progress():
     evaluator = ProgressEvaluator()
 
     assert evaluator.evaluate(observation("file_change_failed")) is None
+
+
+def test_diagnostic_artifact_retrieval_is_not_strong_progress():
+    evaluator = ProgressEvaluator()
+
+    assert evaluator.evaluate(observation("artifact_searched")) is None
+    assert evaluator.evaluate(observation("artifact_read")) is None
