@@ -109,6 +109,17 @@ class InvestigationStore:
             ).fetchone()
         return int(row[0])
 
+    def has_event(self, task_id: str, event_id: str) -> bool:
+        with open_sqlite_connection(self.database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM investigation_events
+                WHERE task_id = ? AND event_id = ?
+                """,
+                (task_id, event_id),
+            ).fetchone()
+        return row is not None
+
     def _initialize(self) -> None:
         with open_sqlite_connection(self.database_path) as connection:
             connection.execute(

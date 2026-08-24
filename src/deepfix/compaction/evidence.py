@@ -114,6 +114,28 @@ class EvidenceCollector:
             self.store.save_evidence(task_id, evidence)
         return _as_block(self.store.list_evidence(task_id))
 
+    def collect_pair(
+        self,
+        task_id: str,
+        call: Mapping[str, object],
+        result: ToolMessage,
+        task_state: TaskState,
+    ) -> DeterministicEvidence | None:
+        block = self.collect(
+            task_id,
+            [AIMessage(content="", tool_calls=[dict(call)]), result],
+            task_state,
+        )
+        call_id = str(call.get("id", ""))
+        return next(
+            (
+                item
+                for item in [*block.tests, *block.files]
+                if item.tool_call_id == call_id
+            ),
+            None,
+        )
+
 
 def _unique_pairs(
     messages: Sequence[AnyMessage],

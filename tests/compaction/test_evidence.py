@@ -196,3 +196,17 @@ def test_ambiguous_duplicate_tool_call_is_not_deterministic_evidence(tmp_path):
     block = collector.collect(task.task_id, messages, task)
 
     assert block.tests == []
+
+
+def test_collect_pair_uses_the_same_evidence_identity_as_history_collection(tmp_path):
+    collector = _collector(tmp_path)
+    task = _task(tmp_path)
+    history = _execute_history(exit_code=1)
+    call = history[0].tool_calls[0]
+    result = history[1]
+
+    paired = collector.collect_pair(task.task_id, call, result, task)
+    block = collector.collect(task.task_id, history, task)
+
+    assert paired is not None
+    assert paired.evidence_id == block.tests[0].evidence_id
