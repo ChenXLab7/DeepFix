@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 from langchain_core.messages import AnyMessage
@@ -65,37 +65,52 @@ class DiagnosticArtifactService:
         omitted = len(selected_by_kind) - len(selected)
 
         matches: list[DiagnosticMatch] = []
-        for descriptor in selected:
+        searched_count = 0
+        remaining_characters = _MAX_RESULT_CHARACTERS
+        truncated = omitted > 0
+        for descriptor_index, descriptor in enumerate(selected):
+            searched_count += 1
             text, content_hash = self._download_text(descriptor)
             lines = text.splitlines()
-            for start, end in _matching_ranges(lines, terms):
+            ranges = _matching_ranges(lines, terms)
+            for start, end in ranges:
+                excerpt = _numbered_lines(lines, start, end)
+                bounded_excerpt = excerpt[:remaining_characters]
                 matches.append(
                     DiagnosticMatch(
                         artifact_id=descriptor.artifact_id,
                         kind=descriptor.kind,
                         start_line=start + 1,
                         end_line=end,
-                        excerpt=_numbered_lines(lines, start, end),
+                        excerpt=bounded_excerpt,
                         content_hash=content_hash,
                     )
                 )
+                remaining_characters -= len(bounded_excerpt)
+                if len(bounded_excerpt) < len(excerpt):
+                    truncated = True
+                    break
+                if len(matches) == limit or remaining_characters == 0:
+                    truncated = (
+                        truncated
+                        or next(ranges, None) is not None
+                        or descriptor_index < len(selected) - 1
+                    )
+                    break
+            if len(matches) == limit or remaining_characters == 0:
+                break
 
         if not matches:
             raise DiagnosticArtifactToolError(
                 "artifact_no_matches",
                 "当前任务的诊断 Artifact 中没有匹配内容",
             )
-        bounded, character_truncated = _bounded_matches(matches, limit)
         return DiagnosticSearchResult(
             query_terms=terms,
-            matches=bounded,
-            searched_artifact_count=len(selected),
+            matches=matches,
+            searched_artifact_count=searched_count,
             omitted_artifact_count=omitted,
-            truncated=(
-                character_truncated
-                or len(matches) > limit
-                or omitted > 0
-            ),
+            truncated=truncated,
         )
 
     def read(
@@ -295,59 +310,48 @@ def _select_kinds(
     return [item for item in catalog.artifacts if item.kind in allowed]
 
 
-def _matching_ranges(lines: Sequence[str], terms: Sequence[str]) -> list[tuple[int, int]]:
+def _matching_ranges(
+    lines: Sequence[str],
+    terms: Sequence[str],
+) -> Iterator[tuple[int, int]]:
     if not lines:
-        return []
+        return
     folded = [line.casefold() for line in lines]
-    candidates: list[tuple[int, int]] = []
     if len(terms) == 1:
         term = terms[0]
-        candidates = [
+        candidates = (
             (max(0, index - 2), min(len(lines), index + 3))
             for index, line in enumerate(folded)
             if term in line
-        ]
+        )
     else:
-        for start in range(len(lines)):
-            end = min(len(lines), start + 5)
-            window = "\n".join(folded[start:end])
-            if all(term in window for term in terms):
-                candidates.append((start, end))
-    return _merge_ranges(candidates)
+        candidates = (
+            (start, min(len(lines), start + 5))
+            for start in range(len(lines))
+            if all(
+                term in "\n".join(folded[start : min(len(lines), start + 5)])
+                for term in terms
+            )
+        )
+    yield from _merge_ranges(candidates)
 
 
-def _merge_ranges(ranges: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
+def _merge_ranges(
+    ranges: Iterator[tuple[int, int]],
+) -> Iterator[tuple[int, int]]:
+    pending: tuple[int, int] | None = None
     for start, end in ranges:
-        if merged and start < merged[-1][1]:
-            previous_start, previous_end = merged[-1]
-            merged[-1] = (previous_start, max(previous_end, end))
+        if pending is not None and start < pending[1]:
+            pending = (pending[0], max(pending[1], end))
         else:
-            merged.append((start, end))
-    return merged
+            if pending is not None:
+                yield pending
+            pending = (start, end)
+    if pending is not None:
+        yield pending
 
 
 def _numbered_lines(lines: Sequence[str], start: int, end: int) -> str:
     return "\n".join(
         f"{index + 1}: {lines[index]}" for index in range(start, end)
     )
-
-
-def _bounded_matches(
-    matches: Sequence[DiagnosticMatch],
-    limit: int,
-) -> tuple[list[DiagnosticMatch], bool]:
-    bounded: list[DiagnosticMatch] = []
-    remaining = _MAX_RESULT_CHARACTERS
-    character_truncated = False
-    for match in matches[:limit]:
-        if remaining <= 0:
-            character_truncated = True
-            break
-        excerpt = match.excerpt[:remaining]
-        bounded.append(match.model_copy(update={"excerpt": excerpt}))
-        remaining -= len(excerpt)
-        if len(excerpt) < len(match.excerpt):
-            character_truncated = True
-            break
-    return bounded, character_truncated

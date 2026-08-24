@@ -180,9 +180,60 @@ def test_search_processes_only_first_32_selected_artifacts(tmp_path):
 
     result = service.search("task-a", messages(), "failure", None, 20)
 
-    assert result.searched_artifact_count == 32
+    assert result.searched_artifact_count == 20
     assert result.omitted_artifact_count == 1
     assert len(result.matches) == 20
+    assert result.truncated is True
+
+
+def test_search_stops_downloading_after_match_limit(tmp_path):
+    first = "/.deepfix-artifacts/large_tool_results/first"
+    second = "/.deepfix-artifacts/large_tool_results/second"
+    service, _, backend = service_fixture(
+        tmp_path,
+        {first: b"failure one", second: b"failure two"},
+        [descriptor(first), descriptor(second)],
+    )
+    downloaded = []
+    original_download = backend.download_files
+
+    def record_download(paths):
+        downloaded.extend(paths)
+        return original_download(paths)
+
+    backend.download_files = record_download
+
+    result = service.search("task-a", messages(), "failure", None, 1)
+
+    assert downloaded == [first]
+    assert result.searched_artifact_count == 1
+    assert len(result.matches) == 1
+    assert result.truncated is True
+
+
+def test_search_stops_building_matches_after_limit(tmp_path, monkeypatch):
+    path = "/.deepfix-artifacts/large_tool_results/many"
+    content = "\n".join(["failure", "1", "2", "3", "4", "5"] * 100)
+    service, _, _ = service_fixture(tmp_path, {path: content.encode()})
+    calls = 0
+
+    from deepfix.artifact_retrieval import service as service_module
+
+    original_numbered_lines = service_module._numbered_lines
+
+    def bounded_numbered_lines(lines, start, end):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise AssertionError("match construction exceeded max_matches")
+        return original_numbered_lines(lines, start, end)
+
+    monkeypatch.setattr(service_module, "_numbered_lines", bounded_numbered_lines)
+
+    result = service.search("task-a", messages(), "failure", None, 1)
+
+    assert len(result.matches) == 1
+    assert calls == 1
     assert result.truncated is True
 
 

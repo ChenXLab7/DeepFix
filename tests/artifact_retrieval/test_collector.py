@@ -58,6 +58,39 @@ def test_only_tool_message_with_matching_call_id_authorizes_large_result():
     assert result.backend_path.endswith("/call_1")
 
 
+@pytest.mark.parametrize("call_id", ["call+123", "call%123", "call:123"])
+def test_complete_deep_agents_sanitized_basename_is_authorized(call_id):
+    path = f"/.deepfix-artifacts/large_tool_results/{call_id}"
+    message = ToolMessage(
+        content=f"完整结果已写入 {path}\n请按需读取。",
+        tool_call_id=call_id,
+    )
+
+    catalog = collector().collect(
+        "task-a",
+        [HumanMessage(content="problem"), message],
+        expand_history=False,
+    )
+
+    assert [item.backend_path for item in catalog.artifacts] == [path]
+
+
+@pytest.mark.parametrize("suffix", ["%2Fother", "+other", ":other"])
+def test_path_suffix_cannot_be_truncated_into_authorized_basename(suffix):
+    message = ToolMessage(
+        content=f"/.deepfix-artifacts/large_tool_results/call{suffix}",
+        tool_call_id="call",
+    )
+
+    catalog = collector().collect(
+        "task-a",
+        [HumanMessage(content="problem"), message],
+        expand_history=False,
+    )
+
+    assert catalog.artifacts == []
+
+
 @pytest.mark.parametrize(
     ("message", "expected"),
     [

@@ -20,8 +20,8 @@ from deepfix.compaction.store import CompactionStore
 _LARGE_ROOT = "/.deepfix-artifacts/large_tool_results/"
 _HISTORY_ROOT = "/.deepfix-artifacts/conversation_history/"
 _MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
-_LARGE_PATH = re.compile(
-    re.escape(_LARGE_ROOT) + r"(?P<basename>[A-Za-z0-9_-]+)(?![A-Za-z0-9_./\\?#*])"
+_LARGE_PATH_TOKEN = re.compile(
+    re.escape(_LARGE_ROOT) + r"(?P<basename>[^\s<>\"'`]+)"
 )
 
 
@@ -255,7 +255,13 @@ def _sanitize_tool_call_id(value: str) -> str:
 
 
 def _strict_large_result_paths(text: str) -> list[str]:
-    return [match.group(0) for match in _LARGE_PATH.finditer(text)]
+    paths: list[str] = []
+    for match in _LARGE_PATH_TOKEN.finditer(text):
+        basename = match.group("basename")
+        if "/" in basename or "\\" in basename or basename in {".", ".."}:
+            continue
+        paths.append(f"{_LARGE_ROOT}{basename}")
+    return paths
 
 
 def _history_large_result_pairs(content: str) -> list[tuple[str, str]]:
