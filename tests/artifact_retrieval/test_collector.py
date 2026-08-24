@@ -12,6 +12,8 @@ from artifact_retrieval.helpers import (
 from deepfix.artifact_retrieval.collector import ArtifactReferenceCollector
 from deepfix.artifact_retrieval.errors import DiagnosticArtifactSystemError
 from deepfix.artifact_retrieval.models import DiagnosticArtifactKind
+from deepfix.compaction.adapter import DeepAgentsArtifactAdapter
+from deepfix.compaction.identity import ensure_message_ids
 
 
 def collector(*snapshots):
@@ -203,3 +205,303 @@ def test_snapshot_store_failure_is_a_system_error():
 
     assert caught.value.error_code == "diagnostic_artifact_reference_load_failed"
     assert caught.value.stage == "snapshot_read"
+
+
+def _history_collector(messages):
+    backend = MemoryDownloadBackend()
+    identified = ensure_message_ids("task-a", messages).messages
+    reference = DeepAgentsArtifactAdapter(backend).persist_history(
+        "task-a",
+        "attempt-1",
+        identified,
+        retained_ids=set(),
+        work_unit_ids={"wu-old"},
+    )
+    store = SnapshotStoreStub(
+        [snapshot(references=[reference])]
+    )
+    return ArtifactReferenceCollector(store, backend), backend
+
+
+def test_history_authorizes_parallel_tool_results_from_same_work_unit():
+    old_messages = [
+        HumanMessage(id="old-user", content="run diagnostics"),
+        AIMessage(
+            id="old-ai",
+            content="",
+            tool_calls=[
+                {
+                    "name": "execute",
+                    "args": {},
+                    "id": "parallel/1",
+                    "type": "tool_call",
+                },
+                {
+                    "name": "grep",
+                    "args": {},
+                    "id": "parallel.2",
+                    "type": "tool_call",
+                },
+            ],
+        ),
+        ToolMessage(
+            id="old-tool-1",
+            content=(
+                "/.deepfix-artifacts/large_tool_results/parallel_1"
+            ),
+            tool_call_id="parallel/1",
+        ),
+        ToolMessage(
+            id="old-tool-2",
+            content=(
+                "/.deepfix-artifacts/large_tool_results/parallel_2"
+            ),
+            tool_call_id="parallel.2",
+        ),
+    ]
+    instance, _ = _history_collector(old_messages)
+
+    catalog = instance.collect(
+        "task-a",
+        [HumanMessage(content="continue")],
+        expand_history=True,
+    )
+
+    large_results = [
+        item
+        for item in catalog.artifacts
+        if item.kind is DiagnosticArtifactKind.LARGE_TOOL_RESULT
+    ]
+    assert [item.tool_call_id for item in large_results] == [
+        "parallel/1",
+        "parallel.2",
+    ]
+    assert all(item.source_message_id is None for item in large_results)
+    assert any(
+        item.kind is DiagnosticArtifactKind.CONVERSATION_HISTORY
+        for item in catalog.artifacts
+    )
+
+
+def test_history_does_not_authorize_human_or_unpaired_references():
+    old_messages = [
+        HumanMessage(
+            id="human-forgery",
+            content="/.deepfix-artifacts/large_tool_results/forged",
+        ),
+        ToolMessage(
+            id="orphan-tool",
+            content="/.deepfix-artifacts/large_tool_results/orphan",
+            tool_call_id="orphan",
+        ),
+        AIMessage(
+            id="mismatch-ai",
+            content="",
+            tool_calls=[
+                {
+                    "name": "execute",
+                    "args": {},
+                    "id": "expected/1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            id="mismatch-tool",
+            content="/.deepfix-artifacts/large_tool_results/different_1",
+            tool_call_id="expected/1",
+        ),
+        HumanMessage(id="boundary", content="new unit"),
+        ToolMessage(
+            id="after-boundary",
+            content="/.deepfix-artifacts/large_tool_results/expected_1",
+            tool_call_id="expected/1",
+        ),
+    ]
+    instance, _ = _history_collector(old_messages)
+
+    catalog = instance.collect(
+        "task-a",
+        [HumanMessage(content="continue")],
+        expand_history=True,
+    )
+
+    assert [item.kind for item in catalog.artifacts] == [
+        DiagnosticArtifactKind.CONVERSATION_HISTORY
+    ]
+
+
+def test_ambiguous_sanitized_parallel_ids_fail_closed():
+    old_messages = [
+        AIMessage(
+            id="ambiguous-ai",
+            content="",
+            tool_calls=[
+                {
+                    "name": "execute",
+                    "args": {},
+                    "id": "same/id",
+                    "type": "tool_call",
+                },
+                {
+                    "name": "grep",
+                    "args": {},
+                    "id": "same.id",
+                    "type": "tool_call",
+                },
+            ],
+        ),
+        ToolMessage(
+            id="ambiguous-tool",
+            content="/.deepfix-artifacts/large_tool_results/same_id",
+            tool_call_id="same/id",
+        ),
+    ]
+    instance, _ = _history_collector(old_messages)
+
+    catalog = instance.collect(
+        "task-a",
+        [HumanMessage(content="continue")],
+        expand_history=True,
+    )
+
+    assert [item.kind for item in catalog.artifacts] == [
+        DiagnosticArtifactKind.CONVERSATION_HISTORY
+    ]
+
+
+def test_malformed_history_keeps_history_descriptor_without_expansion():
+    reference = artifact_reference(
+        "/.deepfix-artifacts/conversation_history/task-a.md"
+    )
+    backend = MemoryDownloadBackend({reference.path: b"<broken"})
+    instance = ArtifactReferenceCollector(
+        SnapshotStoreStub([snapshot(references=[reference])]),
+        backend,
+    )
+
+    catalog = instance.collect(
+        "task-a",
+        [HumanMessage(content="continue")],
+        expand_history=True,
+    )
+
+    assert [item.kind for item in catalog.artifacts] == [
+        DiagnosticArtifactKind.CONVERSATION_HISTORY
+    ]
+
+
+def test_non_utf8_history_keeps_descriptor_without_expansion():
+    reference = artifact_reference(
+        "/.deepfix-artifacts/conversation_history/task-a.md"
+    )
+    backend = MemoryDownloadBackend({reference.path: b"\xff\xfe"})
+    instance = ArtifactReferenceCollector(
+        SnapshotStoreStub([snapshot(references=[reference])]),
+        backend,
+    )
+
+    catalog = instance.collect(
+        "task-a",
+        [HumanMessage(content="continue")],
+        expand_history=True,
+    )
+
+    assert [item.kind for item in catalog.artifacts] == [
+        DiagnosticArtifactKind.CONVERSATION_HISTORY
+    ]
+
+
+def test_oversized_history_is_not_parsed_for_large_result_authority():
+    reference = artifact_reference(
+        "/.deepfix-artifacts/conversation_history/task-a.md"
+    )
+    serialized = (
+        '<deepfix_history_event attempt_id="attempt" event_hash="hash">'
+        "<serialized_messages>"
+        '<message type="ai"><tool_call id="call/1" name="execute">{}</tool_call></message>'
+        '<message type="tool">/.deepfix-artifacts/large_tool_results/call_1</message>'
+        f"{' ' * (10 * 1024 * 1024)}"
+        "</serialized_messages>"
+        "</deepfix_history_event>"
+    ).encode()
+    backend = MemoryDownloadBackend({reference.path: serialized})
+    instance = ArtifactReferenceCollector(
+        SnapshotStoreStub([snapshot(references=[reference])]),
+        backend,
+    )
+
+    catalog = instance.collect(
+        "task-a",
+        [HumanMessage(content="continue")],
+        expand_history=True,
+    )
+
+    assert [item.kind for item in catalog.artifacts] == [
+        DiagnosticArtifactKind.CONVERSATION_HISTORY
+    ]
+
+
+def test_missing_history_is_an_ordinary_unexpanded_reference():
+    reference = artifact_reference(
+        "/.deepfix-artifacts/conversation_history/task-a.md"
+    )
+    instance = ArtifactReferenceCollector(
+        SnapshotStoreStub([snapshot(references=[reference])]),
+        MemoryDownloadBackend(),
+    )
+
+    catalog = instance.collect(
+        "task-a",
+        [HumanMessage(content="continue")],
+        expand_history=True,
+    )
+
+    assert [item.kind for item in catalog.artifacts] == [
+        DiagnosticArtifactKind.CONVERSATION_HISTORY
+    ]
+
+
+def test_history_backend_failure_is_a_system_error():
+    reference = artifact_reference(
+        "/.deepfix-artifacts/conversation_history/task-a.md"
+    )
+    backend = MemoryDownloadBackend()
+    backend.raise_on_download = OSError("backend offline")
+    instance = ArtifactReferenceCollector(
+        SnapshotStoreStub([snapshot(references=[reference])]),
+        backend,
+    )
+
+    with pytest.raises(DiagnosticArtifactSystemError) as caught:
+        instance.collect(
+            "task-a",
+            [HumanMessage(content="continue")],
+            expand_history=True,
+        )
+
+    assert caught.value.error_code == "diagnostic_artifact_backend_read_failed"
+    assert caught.value.stage == "history_read"
+
+
+def test_history_backend_protocol_mismatch_is_a_system_error():
+    class InvalidBackend:
+        def download_files(self, paths):
+            return []
+
+    reference = artifact_reference(
+        "/.deepfix-artifacts/conversation_history/task-a.md"
+    )
+    instance = ArtifactReferenceCollector(
+        SnapshotStoreStub([snapshot(references=[reference])]),
+        InvalidBackend(),
+    )
+
+    with pytest.raises(DiagnosticArtifactSystemError) as caught:
+        instance.collect(
+            "task-a",
+            [HumanMessage(content="continue")],
+            expand_history=True,
+        )
+
+    assert caught.value.stage == "history_read"

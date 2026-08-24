@@ -37,6 +37,17 @@ class MemoryDownloadBackend:
             for path in paths
         ]
 
+    def write(self, path: str, content: str):
+        self.files[path] = content.encode("utf-8")
+        return SimpleNamespace(error=None)
+
+    def edit(self, path: str, old_content: str, new_content: str):
+        existing = self.files.get(path)
+        if existing is None or existing.decode("utf-8") != old_content:
+            return SimpleNamespace(error="content_mismatch")
+        self.files[path] = new_content.encode("utf-8")
+        return SimpleNamespace(error=None)
+
 
 def artifact_reference(
     path: str,
