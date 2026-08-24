@@ -44,7 +44,8 @@ QuixBugs 调试记录已经出现了这种失效模式：Agent 能获得 pytest 
 - 本设计不以任意 Tool Call 数量代替进展，也不把所有新文件读取都视为有效调查。
 
 上述能力分别属于后续的 “Diagnostic Artifact Retrieval” 和 “Progress Events + CLI Renderer”
-子项目。本设计只提供它们可以订阅的结构化调查事件。
+子项目。本设计只提供它们可以订阅的结构化调查事件，但两项都是整体 reliability 修复的必交付项，
+不是可选预留。只有三个子项目全部实施并通过联合端到端测试后，才能宣称 DeepFix reliability 修复完成。
 
 ## 4. 方案比较
 
@@ -239,7 +240,8 @@ class InvestigationState(BaseModel):
 规范化 tool name、关键参数哈希和结果指纹，不保存大结果正文。
 
 `CheckedFile` 至少记录规范路径、内容指纹、已检查行范围、scope 分类、首次/最近事件 ID。相同内容和
-重叠范围幂等合并；文件内容变化后重新读取可形成新进展。
+重叠范围幂等合并。文件内容变化只允许重新评估该范围；只有变化内容产生 decision-relevant evidence
+时才形成强进展，指纹变化本身仍只是活动。
 
 ### 7.3 假设身份与状态
 
@@ -287,7 +289,7 @@ Working Memory 的 confirmed 只表示模型语义总结，不能反向生成 su
 | `INVESTIGATING` | 没有基线测试、但有效证据指向具体位置 | 仍为 `INVESTIGATING` |
 | `DIAGNOSING` | `hypothesis_supported` | `PLANNING` |
 | `PLANNING` | 成功的 write/edit/delete Tool Result | `EDITING` |
-| `EDITING` | 发起或批准验证命令 | `TESTING` |
+| `EDITING` | 审批后真实开始执行、且被系统分类为 verification/test 的命令 | `TESTING` |
 | `TESTING` | 修改后 pytest 失败 | `DIAGNOSING` |
 | `TESTING` | 修改后 pytest 通过 | `REVIEWING` |
 | `REVIEWING` | 新失败证据或用户要求继续 | `DIAGNOSING` 或 `INVESTIGATING` |
@@ -297,6 +299,12 @@ pytest 失败自动进入 `DIAGNOSING`，但绝不自动进入 `EDITING`。测�
 
 写操作执行失败不进入 `EDITING`，而是回到 `PLANNING` 并保留失败证据。审批只代表允许执行，不代表
 工具成功；`TaskStatus` 可因审批暂时成为 `EDITING`/`TESTING`，`AgentPhase` 仍以实际事件推进。
+
+`EDITING → TESTING` 不能由模型生成 execute Tool Call、Service 批准 execute 或任意 Shell 命令触发。
+系统必须在审批恢复后观察到工具执行真正开始，并用确定性命令分类器确认它是当前项目的测试或验证命令。
+安装依赖、查看版本、打印文件、启动交互 Shell 等普通 execute 保持 `EDITING`。如果执行开始后发生
+异常，阶段仍可保留 `TESTING`，并记录 verification execution failure；只有配对 Tool Result 才能决定
+随后进入 `DIAGNOSING`、`REVIEWING` 或继续 `TESTING`。
 
 ### 8.2 动态工具可见性
 
@@ -341,16 +349,21 @@ ID、状态和门禁关系，不重复正文。完整历史通过 Investigation 
 `progress_generation`。以下属于强进展：
 
 - 新的有效测试证据，或同一测试在文件修改后产生新结果；
-- 新的异常类型、失败断言、堆栈位置或直接相关代码位置；
+- 新的异常类型、失败断言或 traceback 位置，并且改变了待验证假设、调查范围或下一步决策；
+- 从源码或搜索结果提取出的 decision-relevant evidence，例如支持/反驳现有假设、定位实际失败路径，
+  或证明某个符号/分支与失败测试存在可验证关系；
 - 假设从 candidate 变为 supported/rejected，或出现有新证据的重新开启；
 - 成功的文件修改；
 - 修改后的测试结果；
-- 合法阶段迁移；
 - 用户补充信息。
+
+`phase_changed` 是上述原始进展事件的派生结果，始终设置 `progress_kind=None`，自身不能增加
+`progress_generation` 或清除停滞门禁。一次原始事件即使同时引起阶段变化，也只能计一次强进展。
 
 以下活动本身不增加进展代次：
 
 - 对相同内容和相同行范围重复 `read_file`；
+- 仅仅首次读取一个新文件、首次看到一个新行范围或发现一个尚未证明相关的新代码位置；
 - 相同 grep/glob/ls 查询得到相同结果；
 - 未修改代码时重复相同 pytest 并得到相同失败；
 - 只改变分页 offset，但没有获得新的相关位置或证据；
@@ -362,11 +375,16 @@ ID、状态和门禁关系，不重复正文。完整历史通过 Investigation 
 文件/查询目标分为：
 
 - `direct`：用户明确路径、失败测试文件、traceback 位置、被测符号定义、已支持假设的修改目标；
-- `dependency`：从 direct 文件 import/call、grep 引用或假设来源确定关联的文件；
+- `dependency`：通过可验证的 import/call/traceback/grep/符号引用等来源边关联到 direct 目标的文件；
 - `exploratory`：没有上述可复核关联的其他目标。
 
-分类由来源边生成，不由模型自由声明。模型可以在 `continue_investigation` 中说明关联理由，系统只在
-该理由引用现有 hypothesis/evidence/checked location 时将下一目标提升为 dependency。
+分类由系统验证的来源边生成，不由模型自由声明。有效来源边至少包括：解析出的 import、静态或运行时
+call 关系、traceback frame、grep/符号引用命中、测试收集关系，以及确定性证据直接指向的定义位置。
+每条边必须保存 source、target、relation type 和产生它的 Tool Result/message ID。
+
+`continue_investigation.reason` 只表达调查意图和 permit 理由。即使它引用现有 hypothesis、evidence 或
+checked location，也不能单独把 exploratory 目标提升为 dependency。只有 Tool Result 或既有系统记录
+提供上述可验证关系边后，Scope Classifier 才能改变分类；验证失败时仍按 exploratory 计数。
 
 ## 10. 停滞检测与恢复
 
@@ -412,7 +430,8 @@ class ContinueInvestigationInput(BaseModel):
 ### 10.3 重置规则与误报保护
 
 - 强进展增加 `progress_generation`，清空当前代次的重复/周期/无进展计数和 level 1 门禁。
-- 文件内容指纹变化后重新读取相同范围可以是新进展；未变化则仍是重复。
+- 文件内容指纹变化后允许重新读取相同范围且不算精确重复，但只有提取出 decision-relevant evidence
+  才能成为强进展；指纹未变化则仍是重复。
 - 成功编辑后允许重新运行此前失败测试，不计为重复测试。
 - pytest 偶发失败只有在结果指纹变化时作为新证据；相同失败不能无限重置。
 - 用户补充信息清除一次重评门禁，但不删除既有事件历史。
@@ -488,7 +507,8 @@ Service 在成功修改 TaskStatus 后，通过 Coordinator 的公开 lifecycle 
 
 - 无工具证据：`INVESTIGATING`；
 - 最近有效 pytest 失败，之后无成功修改：`DIAGNOSING`；
-- 失败后存在成功修改，但没有修改后测试：`TESTING`；
+- 失败后存在成功修改，但没有修改后真实 verification/test execution：`EDITING`；
+- 修改后存在已开始但尚无配对结果的 verification/test execution：`TESTING`；
 - 最近修改后 pytest pass：`REVIEWING`；
 - 当前业务状态是 `CLARIFYING`：`CLARIFYING`，并保存推导出的前一阶段。
 
@@ -506,6 +526,7 @@ checked location 时可以导入 candidate；只有同时满足第 7.3 节全部
 
 - 没有 Working Memory 时，新任务从 `INVESTIGATING` 开始。
 - pytest 失败把 AgentPhase 切到 `DIAGNOSING`，Prompt 使用诊断提示。
+- phase_changed 事件自身不增加 progress_generation，也不重置停滞。
 - Working Memory phase 过旧或冲突时不能覆盖 AgentPhase。
 - TaskStatus 与 AgentPhase 不一致时，各自消费者读取正确权威源。
 - 暂停/恢复保留推理阶段；用户补充形成强进展。
@@ -523,7 +544,9 @@ checked location 时可以导入 candidate；只有同时满足第 7.3 节全部
 - read_file/grep/glob/ls/execute 的结果在 Agent 内部循环中被自动记录。
 - 相同 tool_call/result replay 只生成一个事件，不重复 progress_generation。
 - 并行 Tool Calls 生成独立结果事件和规范化批次签名。
-- checked ranges 合并正确；内容改变后的重读可产生新进展。
+- checked ranges 合并正确；内容改变后的重读不会因指纹变化自动产生进展，只有新决策证据才产生。
+- 首次读取新文件/新位置只记录活动；只有提取 decision-relevant evidence 才增加进展代次。
+- dependency 只由带来源 ID 的 import/call/traceback/grep 等可验证关系边产生，模型 reason 不能提升。
 - Store 不保存大 stdout、源码正文或 secret。
 
 ### 14.4 停滞检测
@@ -534,7 +557,8 @@ checked location 时可以导入 candidate；只有同时满足第 7.3 节全部
 - gcd 式重复测试/读文件和 BFS 式全库扫描在达到大上下文前被重评门禁截断。
 - 有效 `continue_investigation` 只放行绑定的一次工具；错误目标不能消费许可。
 - 许可后有强进展恢复正常；无进展后再次调查抛类型化异常。
-- direct/dependency 的合理多文件调查、修改后重测和内容变化重读不产生误报。
+- direct/dependency 的合理多文件调查、修改后重测和有新决策证据的内容变化重读不产生误报。
+- 反复切换 phase 不能重置重复、周期或无进展计数。
 
 ### 14.5 正常端到端流程
 
@@ -548,7 +572,8 @@ checked location 时可以导入 candidate；只有同时满足第 7.3 节全部
 → record_hypothesis(supported)
 → planning
 → 审批并最小修改
-→ testing
+→ 审批验证命令但 phase 仍为 editing
+→ verification/test 真实开始执行后进入 testing
 → pytest pass
 → reviewing / completed
 ```
@@ -575,12 +600,26 @@ checked location 时可以导入 candidate；只有同时满足第 7.3 节全部
 7. 模型只有一次结构化继续调查许可；持续无进展会以可恢复方式暂停，而不是无限增长上下文。
 8. 正常的基线失败、调查、最小修改、修改后验证流程不被误阻断。
 9. 事件提交和旧任务迁移可重放、幂等、任务隔离，Store 不持久化大结果或敏感正文。
-10. 新增定向测试、现有完整离线测试和 Ruff 全部通过。
+10. phase_changed、新文件和新代码位置不会自行重置停滞；dependency 只能来自系统可验证关系边。
+11. `EDITING → TESTING` 只由真实开始的 verification/test execution 触发，审批和普通 execute 均无效。
+12. 新增定向测试、现有完整离线测试和 Ruff 全部通过。
 
-## 16. 后续子项目接口
+## 16. Reliability 项目交付门禁与后续接口
 
-本核心只承诺稳定输出：`InvestigationEvent`、`InvestigationState`、阶段变化、进展变化、停滞事件和
-Artifact/证据 ID。后续项目可以只读订阅这些接口：
+整体 reliability 修复由三个有顺序依赖的必交付子项目组成：
+
+1. **Investigation Reliability Core**：本设计，提供阶段权威、调查事件、进展判定和停滞门禁；
+2. **Diagnostic Artifact Retrieval**：消费测试事件和 Artifact ID，提供有界诊断摘要、按需定位和防止
+   大输出分页重新灌满上下文的读取策略；
+3. **Progress Events + CLI Renderer**：消费结构化进度事件，显示当前 phase、最近有效进展、正在执行的
+   工具、重评/暂停原因，并把 LLM trace 降为可选调试观测。
+
+每个子项目分别执行 spec → plan → implementation → review，不能在本核心实施计划中混合实现。第二项
+依赖第一项的 test/artifact 事件，第三项依赖第一项的 phase/progress/stagnation 事件；第一项可以先独立
+落地，但不能据此关闭整体 reliability 修复任务。
+
+本核心承诺稳定输出：`InvestigationEvent`、`InvestigationState`、阶段变化、进展变化、停滞事件和
+Artifact/证据 ID。后续项目只读订阅这些接口：
 
 - Diagnostic Artifact Retrieval 用 `test_observed` 和 Artifact ID 构造有界 pytest 诊断视图；
 - Progress Events + CLI Renderer 把 phase/progress/stagnation 事件渲染为终端进度；
@@ -588,3 +627,7 @@ Artifact/证据 ID。后续项目可以只读订阅这些接口：
 
 后续子项目不得反向修改 `AgentPhase`、progress_generation 或停滞门禁；它们需要改变调查状态时，必须
 通过 Coordinator 的公开命令生成事件。
+
+整体完成门禁为：三个子项目均已实施；跨子项目端到端测试证明大型 pytest 失败可被 Agent 定位读取、
+循环会被核心门禁阻止、终端能显示真实阶段和停滞原因；现有完整测试和 Ruff 通过。在此之前，报告只能
+声明某个子项目完成，不能声明 “DeepFix reliability 修复完成”。
