@@ -54,6 +54,7 @@ from deepfix.persistence import TaskRepository
 class ToolAuthorization:
     allowed: bool
     permit_id: str | None = None
+    correction_required: bool = False
 
 
 _PHASE_CAPABILITIES: dict[AgentPhase, frozenset[InvestigationCapability]] = {
@@ -186,6 +187,12 @@ class InvestigationCoordinator:
         state: InvestigationState,
         capabilities: Mapping[str, InvestigationCapability],
     ) -> set[str]:
+        if state.diagnostic_decision_required:
+            allowed = set(_REEVALUATION_TOOL_NAMES)
+            permit = state.permit
+            if permit is not None and not permit.consumed:
+                allowed.add(permit.tool_name)
+            return allowed & set(capabilities)
         if state.stagnation_level > 0 or state.reevaluation_required:
             allowed = set(_REEVALUATION_TOOL_NAMES)
             permit = state.permit
@@ -436,6 +443,35 @@ class InvestigationCoordinator:
                 effective_observation,
             )
         updated = updated.model_copy(update={"agent_phase": resolution.phase})
+        if observation.event_type is InvestigationEventType.ARTIFACT_READ:
+            updated = updated.model_copy(
+                update={
+                    "diagnostic_decision_required": True,
+                    "decision_correction_used": False,
+                    "reevaluation_required": False,
+                    "stagnation_level": 0,
+                    "permit": None,
+                    "post_permit_review_pending": False,
+                }
+            )
+        elif observation.event_type is InvestigationEventType.HYPOTHESIS_RECORDED:
+            if state.diagnostic_decision_required:
+                updated = updated.model_copy(
+                    update={
+                        "diagnostic_decision_required": True,
+                        "decision_correction_used": False,
+                    }
+                )
+        elif observation.event_type in {
+            InvestigationEventType.HYPOTHESIS_REJECTED,
+            InvestigationEventType.HYPOTHESIS_SUPPORTED,
+        }:
+            updated = updated.model_copy(
+                update={
+                    "diagnostic_decision_required": False,
+                    "decision_correction_used": False,
+                }
+            )
         events = [origin]
         if resolution.phase_event is not None:
             events.append(resolution.phase_event)
@@ -528,6 +564,8 @@ class InvestigationCoordinator:
                 "exploratory_without_progress": 0,
                 "reevaluation_required": False,
                 "stagnation_level": 0,
+                "diagnostic_decision_required": False,
+                "decision_correction_used": False,
                 "permit": None,
             }
         )
@@ -624,7 +662,9 @@ class InvestigationCoordinator:
         known_hypotheses = {item.hypothesis_id for item in state.hypotheses}
         if not command.hypothesis_ids or not set(command.hypothesis_ids) <= known_hypotheses:
             raise ValueError("continue_investigation 必须引用当前任务假设")
-        if state.stagnation_level != 1 or not state.reevaluation_required:
+        if not state.diagnostic_decision_required and (
+            state.stagnation_level != 1 or not state.reevaluation_required
+        ):
             raise ValueError("当前任务不需要额外调查许可")
         target_hash = _permit_target_hash(command.tool_name, command.target)
         permit_id = stable_investigation_id(
@@ -690,10 +730,16 @@ class InvestigationCoordinator:
         task_id: str,
         tool_name: str,
         arguments: Mapping[str, object],
+        *,
+        tool_call_id: str | None = None,
     ) -> ToolAuthorization:
         state = self.state(task_id)
         normalized_tool = tool_name.strip().lower()
-        if state.stagnation_level == 0 and not state.reevaluation_required:
+        if (
+            not state.diagnostic_decision_required
+            and state.stagnation_level == 0
+            and not state.reevaluation_required
+        ):
             return ToolAuthorization(allowed=True)
         if normalized_tool in {
             "record_hypothesis",
@@ -705,7 +751,7 @@ class InvestigationCoordinator:
         target = _target_from_arguments(normalized_tool, arguments)
         target_hash = _permit_target_hash(normalized_tool, target)
         if (
-            state.stagnation_level == 1
+            (state.diagnostic_decision_required or state.stagnation_level == 1)
             and permit is not None
             and not permit.consumed
             and permit.tool_name == normalized_tool
@@ -742,6 +788,34 @@ class InvestigationCoordinator:
                     )
                 ) from exc
             return ToolAuthorization(allowed=True, permit_id=permit.permit_id)
+        if state.diagnostic_decision_required:
+            if not state.decision_correction_used:
+                source_id = tool_call_id or stable_investigation_id(
+                    "decision-correction",
+                    task_id,
+                    normalized_tool,
+                    target,
+                )
+                self._record_lifecycle(
+                    state,
+                    state.model_copy(update={"decision_correction_used": True}),
+                    InvestigationEventType.REEVALUATION_REQUIRED,
+                    source_id,
+                )
+                return ToolAuthorization(
+                    allowed=False,
+                    correction_required=True,
+                )
+            raise InvestigationStagnationError(
+                self.recovery(
+                    task_id,
+                    "diagnostic_decision_ignored",
+                    state=state,
+                    tool_call_id=tool_call_id,
+                    checkpoint_available=True,
+                    recovery_action="pause_and_request_hypothesis_decision",
+                )
+            )
         raise InvestigationStagnationError(
             self.recovery(
                 task_id,

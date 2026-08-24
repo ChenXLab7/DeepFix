@@ -28,6 +28,7 @@ from deepfix.investigation.models import (
     InvestigationHypothesis,
     InvestigationRecoveryMetadata,
     NewInvestigationEvent,
+    ToolObservation,
 )
 from deepfix.investigation.receipts import ToolExecutionReceiptStore
 from investigation.helpers import coordinator_fixture, force_phase
@@ -321,6 +322,75 @@ def test_normal_investigation_exposes_diagnostic_artifact_tools(tmp_path):
         "search_diagnostic_artifacts",
         "read_diagnostic_artifact",
     } <= {tool.name for tool in captured.tools}
+
+
+def test_diagnostic_read_requires_hypothesis_decision_and_renders_instruction(
+    tmp_path,
+):
+    middleware = middleware_fixture(tmp_path, phase="diagnosing")
+    middleware.coordinator.record_observation(
+        "task-a",
+        ToolObservation(
+            event_type="artifact_read",
+            tool_call_id="artifact-read",
+            result_fingerprint="artifact-result",
+            payload={
+                "artifact_id": "artifact_" + "a" * 32,
+                "start_line": 10,
+                "end_line": 20,
+            },
+        ),
+    )
+
+    captured = capture_model_request(
+        middleware,
+        model_request(tools=all_test_tools()),
+    )
+
+    assert {tool.name for tool in captured.tools} == {
+        "record_hypothesis",
+        "continue_investigation",
+        "save_progress",
+    }
+    assert "<diagnostic_decision_checkpoint>" in captured.system_message.text
+    assert "record_hypothesis" in captured.system_message.text
+    assert "不要继续读取相邻" in captured.system_message.text
+
+
+def test_decision_checkpoint_returns_one_correction_then_pauses(tmp_path):
+    middleware = middleware_fixture(tmp_path, phase="diagnosing")
+    middleware.coordinator.record_observation(
+        "task-a",
+        ToolObservation(
+            event_type="artifact_read",
+            tool_call_id="artifact-read",
+            result_fingerprint="artifact-result",
+            payload={"artifact_id": "artifact_" + "a" * 32},
+        ),
+    )
+    called = False
+
+    def handler(request):
+        nonlocal called
+        called = True
+        return read_result()
+
+    correction = middleware.wrap_tool_call(read_request(), handler)
+
+    assert called is False
+    assert isinstance(correction, ToolMessage)
+    assert correction.status == "error"
+    assert correction.artifact["result_type"] == "diagnostic_decision_correction"
+    assert "record_hypothesis" in correction.content
+    assert middleware.coordinator.state("task-a").decision_correction_used is True
+
+    with pytest.raises(InvestigationStagnationError) as caught:
+        middleware.wrap_tool_call(
+            tool_request("read_file", "read-2", {"file_path": "/src/other.py"}),
+            handler,
+        )
+
+    assert caught.value.recovery.error_code == "diagnostic_decision_ignored"
 
 
 def test_direct_read_of_offloaded_result_routes_to_diagnostic_tools(tmp_path):

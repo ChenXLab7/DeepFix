@@ -229,6 +229,8 @@ class InvestigationState(StrictModel):
     exploratory_without_progress: int = 0
     reevaluation_required: bool = False
     stagnation_level: Literal[0, 1, 2] = 0
+    diagnostic_decision_required: bool = False
+    decision_correction_used: bool = False
     permit: InvestigationPermit | None = None
     post_permit_review_pending: bool = False
 

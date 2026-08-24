@@ -59,8 +59,10 @@ class InvestigationMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
-        task_id, receipt = self._prepare_tool(request)
-        if receipt is None:
+        task_id, receipt, correction = self._prepare_tool(request)
+        if correction is not None:
+            result = correction
+        elif receipt is None:
             result = _diagnostic_artifact_redirect(task_id, request)
             if result is None:
                 result = handler(request)
@@ -76,8 +78,10 @@ class InvestigationMiddleware(AgentMiddleware):
             Awaitable[ToolMessage | Command[Any]],
         ],
     ) -> ToolMessage | Command[Any]:
-        task_id, receipt = self._prepare_tool(request)
-        if receipt is None:
+        task_id, receipt, correction = self._prepare_tool(request)
+        if correction is not None:
+            result = correction
+        elif receipt is None:
             result = _diagnostic_artifact_redirect(task_id, request)
             if result is None:
                 result = await handler(request)
@@ -107,7 +111,7 @@ class InvestigationMiddleware(AgentMiddleware):
     def _prepare_tool(
         self,
         request: ToolCallRequest,
-    ) -> tuple[str, ToolExecutionReceipt | None]:
+    ) -> tuple[str, ToolExecutionReceipt | None, ToolMessage | None]:
         task_id = _runtime_task_id(request)
         call_id = str(request.tool_call.get("id", "")).strip()
         name = str(request.tool_call.get("name", "")).strip()
@@ -131,13 +135,16 @@ class InvestigationMiddleware(AgentMiddleware):
                     call_id,
                     "pause_and_inspect_tool_receipt",
                 )
-            return task_id, receipt
+            return task_id, receipt, None
 
         authorization = self.coordinator.authorize_tool(
             task_id,
             name,
             _tool_arguments(request.tool_call),
+            tool_call_id=call_id,
         )
+        if authorization.correction_required:
+            return task_id, None, _decision_correction_message(task_id, call_id)
         state = self.coordinator.state(task_id)
         allowed = self.coordinator.allowed_tool_names(state, self.capabilities)
         if name not in allowed and authorization.permit_id is None:
@@ -147,7 +154,7 @@ class InvestigationMiddleware(AgentMiddleware):
                 call_id,
                 "return_to_a_phase_that_allows_the_tool",
             )
-        return task_id, None
+        return task_id, None, None
 
     def _finish_tool(
         self,
@@ -218,7 +225,18 @@ def render_investigation_state(state: InvestigationState) -> str:
         f"<signature>{escape(item[:160])}</signature>"
         for item in state.recent_tool_signatures[-8:]
     )
-    lines.extend(("</recent_tool_signatures>", "</deepfix_investigation_state>"))
+    lines.append("</recent_tool_signatures>")
+    if state.diagnostic_decision_required:
+        lines.extend(
+            (
+                "<diagnostic_decision_checkpoint>",
+                "当前必须进行诊断决策。",
+                "证据充分时立即调用 record_hypothesis，不要继续读取相邻 traceback 片段。",
+                "证据不足时先记录 candidate 假设，再调用 continue_investigation 说明未解决问题和预期证据。",
+                "</diagnostic_decision_checkpoint>",
+            )
+        )
+    lines.append("</deepfix_investigation_state>")
     return "\n".join(lines)
 
 
@@ -264,5 +282,26 @@ def _diagnostic_artifact_redirect(
             "result_type": "diagnostic_artifact_redirect",
             "error_code": "use_diagnostic_artifact_tools",
             "operation": "read_file",
+        },
+    )
+
+
+def _decision_correction_message(task_id: str, call_id: str) -> ToolMessage:
+    return ToolMessage(
+        id=stable_generated_message_id(
+            task_id,
+            call_id,
+            "diagnostic_decision_correction",
+        ),
+        content=(
+            "当前处于诊断决策检查点，不能继续读取或执行。"
+            "请根据现有证据调用 record_hypothesis；"
+            "若证据不足，先记录 candidate，再调用 continue_investigation 申请一次定向调查。"
+        ),
+        tool_call_id=call_id,
+        status="error",
+        artifact={
+            "result_type": "diagnostic_decision_correction",
+            "error_code": "diagnostic_decision_required",
         },
     )

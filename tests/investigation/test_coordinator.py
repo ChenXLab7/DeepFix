@@ -37,6 +37,15 @@ def test_supported_hypothesis_unlocks_planning_with_stable_id(tmp_path):
     coordinator = coordinator_fixture(tmp_path)
     seed_evidence(coordinator.compaction_store, "task-a", "evidence-a")
     seed_checked_location(coordinator.store, "task-a", "src/sign.py", 1, 20)
+    coordinator.record_observation(
+        "task-a",
+        ToolObservation(
+            event_type="artifact_read",
+            tool_call_id="artifact-read",
+            result_fingerprint="artifact-result",
+            payload={"artifact_id": "artifact_" + "a" * 32},
+        ),
+    )
 
     first = coordinator.record_hypothesis(
         "task-a",
@@ -51,10 +60,20 @@ def test_supported_hypothesis_unlocks_planning_with_stable_id(tmp_path):
 
     assert first.hypothesis_id == replay.hypothesis_id
     assert coordinator.state("task-a").agent_phase is AgentPhase.PLANNING
+    assert coordinator.state("task-a").diagnostic_decision_required is False
 
 
 def test_candidate_hypothesis_does_not_unlock_planning(tmp_path):
     coordinator = coordinator_fixture(tmp_path)
+    coordinator.record_observation(
+        "task-a",
+        ToolObservation(
+            event_type="artifact_read",
+            tool_call_id="artifact-read",
+            result_fingerprint="artifact-result",
+            payload={"artifact_id": "artifact_" + "a" * 32},
+        ),
+    )
     command = RecordHypothesisInput(
         statement="the parser may change the sign",
         evidence_ids=[],
@@ -66,6 +85,7 @@ def test_candidate_hypothesis_does_not_unlock_planning(tmp_path):
     coordinator.record_hypothesis("task-a", command, source_id="tool-hyp-1")
 
     assert coordinator.state("task-a").agent_phase is AgentPhase.INVESTIGATING
+    assert coordinator.state("task-a").diagnostic_decision_required is True
 
 
 def test_state_read_failure_becomes_typed_recovery_error(tmp_path, monkeypatch):

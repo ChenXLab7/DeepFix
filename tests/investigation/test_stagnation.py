@@ -1,7 +1,11 @@
 import pytest
 
 from deepfix.investigation.errors import InvestigationStagnationError
-from deepfix.investigation.models import InvestigationState, ToolObservation
+from deepfix.investigation.models import (
+    InvestigationState,
+    NewInvestigationEvent,
+    ToolObservation,
+)
 from deepfix.investigation.stagnation import StagnationDetector, matching_cycle_size
 from investigation.helpers import continue_input, stagnated_coordinator
 
@@ -168,3 +172,40 @@ def test_permit_does_not_authorize_a_different_target(tmp_path):
 
     assert coordinator.state("task-a").permit is not None
     assert not coordinator.state("task-a").permit.consumed
+
+
+def test_candidate_can_request_one_targeted_tool_from_decision_checkpoint(tmp_path):
+    coordinator = stagnated_coordinator(tmp_path)
+    state = coordinator.state("task-a")
+    state = state.model_copy(
+        update={
+            "stagnation_level": 0,
+            "reevaluation_required": False,
+            "diagnostic_decision_required": True,
+            "permit": None,
+        }
+    )
+    coordinator.store.commit(
+        coordinator.state("task-a").version,
+        [
+            NewInvestigationEvent(
+                event_id="event-decision-checkpoint",
+                task_id="task-a",
+                event_type="reevaluation_required",
+                phase_before=state.agent_phase,
+                phase_after=state.agent_phase,
+            )
+        ],
+        state,
+    )
+
+    permit = coordinator.grant_investigation_permit("task-a", continue_input())
+
+    assert permit.consumed is False
+    authorization = coordinator.authorize_tool(
+        "task-a",
+        "grep",
+        {"pattern": "flip", "path": "src/sign.py"},
+    )
+    assert authorization.allowed is True
+    assert authorization.permit_id == permit.permit_id
