@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any
@@ -17,6 +20,7 @@ from deepfix.investigation.classification import (
 )
 from deepfix.investigation.errors import (
     InvestigationCoordinationError,
+    InvestigationStagnationError,
     InvestigationStateError,
 )
 from deepfix.investigation.identity import stable_investigation_id
@@ -24,8 +28,10 @@ from deepfix.investigation.models import (
     AgentPhase,
     CheckedFile,
     CheckedLocation,
+    ContinueInvestigationInput,
     InvestigationEventType,
     InvestigationHypothesis,
+    InvestigationPermit,
     InvestigationRecoveryMetadata,
     InvestigationState,
     NewInvestigationEvent,
@@ -34,8 +40,15 @@ from deepfix.investigation.models import (
 )
 from deepfix.investigation.phase import PhaseResolver
 from deepfix.investigation.progress import ProgressEvaluator
+from deepfix.investigation.stagnation import StagnationDetector
 from deepfix.investigation.store import InvestigationStore
 from deepfix.persistence import TaskRepository
+
+
+@dataclass(frozen=True)
+class ToolAuthorization:
+    allowed: bool
+    permit_id: str | None = None
 
 
 class InvestigationCoordinator:
@@ -48,6 +61,7 @@ class InvestigationCoordinator:
         evidence_collector: EvidenceCollector,
         phase_resolver: PhaseResolver | None = None,
         progress_evaluator: ProgressEvaluator | None = None,
+        stagnation_detector: StagnationDetector | None = None,
     ) -> None:
         self.store = store
         self.tasks = tasks
@@ -55,6 +69,7 @@ class InvestigationCoordinator:
         self.evidence_collector = evidence_collector
         self.phase_resolver = phase_resolver or PhaseResolver()
         self.progress_evaluator = progress_evaluator or ProgressEvaluator()
+        self.stagnation_detector = stagnation_detector or StagnationDetector()
 
     def ensure_started(self, task_id: str) -> InvestigationState:
         return self.state(task_id)
@@ -195,6 +210,9 @@ class InvestigationCoordinator:
         evaluated, progress = self.progress_evaluator.apply(state, observation)
         if observation.progress_kind is not None:
             progress = observation.progress_kind
+        effective_observation = observation.model_copy(
+            update={"progress_kind": progress}
+        )
         event_id = self._observation_event_id(task_id, observation)
         if self.store.has_event(task_id, event_id):
             return state
@@ -214,14 +232,22 @@ class InvestigationCoordinator:
             progress_kind=progress,
             payload=self._event_payload(observation),
         )
-        updated = self._apply_domain_state(evaluated, observation)
+        updated = self._apply_domain_state(evaluated, effective_observation)
         if progress is not None:
+            updated = self.stagnation_detector.after_event(
+                updated,
+                effective_observation,
+            )
             updated = updated.model_copy(
                 update={
-                    "progress_generation": state.progress_generation + 1,
                     "last_progress_event_id": event_id,
                     "last_progress_at": datetime.now(UTC),
                 }
+            )
+        else:
+            updated = self.stagnation_detector.after_tool(
+                updated,
+                effective_observation,
             )
         updated = updated.model_copy(update={"agent_phase": resolution.phase})
         events = [origin]
@@ -324,6 +350,144 @@ class InvestigationCoordinator:
             ),
         )
 
+    def grant_investigation_permit(
+        self,
+        task_id: str,
+        command: ContinueInvestigationInput,
+    ) -> InvestigationPermit:
+        state = self.state(task_id)
+        known_hypotheses = {item.hypothesis_id for item in state.hypotheses}
+        if not command.hypothesis_ids or not set(command.hypothesis_ids) <= known_hypotheses:
+            raise ValueError("continue_investigation 必须引用当前任务假设")
+        if state.stagnation_level != 1 or not state.reevaluation_required:
+            raise ValueError("当前任务不需要额外调查许可")
+        target_hash = _permit_target_hash(command.tool_name, command.target)
+        permit_id = stable_investigation_id(
+            "permit",
+            task_id,
+            str(state.progress_generation),
+            *sorted(command.hypothesis_ids),
+            command.tool_name.lower(),
+            target_hash,
+        )
+        if state.permit is not None:
+            if state.permit.permit_id == permit_id:
+                return state.permit
+            raise ValueError("当前进展代次已经发放调查许可")
+        permit = InvestigationPermit(
+            permit_id=permit_id,
+            tool_name=command.tool_name.strip().lower(),
+            target_hash=target_hash,
+            granted_in_generation=state.progress_generation,
+        )
+        event = NewInvestigationEvent(
+            event_id=stable_investigation_id(
+                "event", task_id, "permit-granted", permit_id
+            ),
+            task_id=task_id,
+            event_type=InvestigationEventType.INVESTIGATION_PERMIT_GRANTED,
+            phase_before=state.agent_phase,
+            phase_after=state.agent_phase,
+            payload={
+                "permit_id": permit_id,
+                "hypothesis_ids": command.hypothesis_ids,
+                "tool_name": permit.tool_name,
+                "target_hash": target_hash,
+            },
+        )
+        updated = state.model_copy(update={"permit": permit})
+        try:
+            committed = self.store.commit(state.version, [event], updated)
+        except Exception as exc:
+            raise InvestigationStateError(
+                self.recovery(
+                    task_id,
+                    "investigation_permit_commit_failed",
+                    state=state,
+                    checkpoint_available=True,
+                    recovery_action="retry_permit_commit_without_model_call",
+                )
+            ) from exc
+        if committed.permit is None:
+            raise InvestigationStateError(
+                self.recovery(
+                    task_id,
+                    "investigation_permit_missing_after_commit",
+                    state=committed,
+                    checkpoint_available=True,
+                    recovery_action="reload_investigation_state",
+                )
+            )
+        return committed.permit
+
+    def authorize_tool(
+        self,
+        task_id: str,
+        tool_name: str,
+        arguments: Mapping[str, object],
+    ) -> ToolAuthorization:
+        state = self.state(task_id)
+        normalized_tool = tool_name.strip().lower()
+        if state.stagnation_level == 0 and not state.reevaluation_required:
+            return ToolAuthorization(allowed=True)
+        if normalized_tool in {
+            "record_hypothesis",
+            "continue_investigation",
+            "save_progress",
+        }:
+            return ToolAuthorization(allowed=True)
+        permit = state.permit
+        target = _target_from_arguments(normalized_tool, arguments)
+        target_hash = _permit_target_hash(normalized_tool, target)
+        if (
+            state.stagnation_level == 1
+            and permit is not None
+            and not permit.consumed
+            and permit.tool_name == normalized_tool
+            and permit.target_hash == target_hash
+        ):
+            consumed = permit.model_copy(update={"consumed": True})
+            event = NewInvestigationEvent(
+                event_id=stable_investigation_id(
+                    "event", task_id, "permit-consumed", permit.permit_id
+                ),
+                task_id=task_id,
+                event_type=InvestigationEventType.INVESTIGATION_INTENT_RECORDED,
+                phase_before=state.agent_phase,
+                phase_after=state.agent_phase,
+                payload={"permit_id": permit.permit_id},
+            )
+            updated = state.model_copy(
+                update={
+                    "permit": consumed,
+                    "post_permit_review_pending": True,
+                }
+            )
+            try:
+                self.store.commit(state.version, [event], updated)
+            except Exception as exc:
+                raise InvestigationStateError(
+                    self.recovery(
+                        task_id,
+                        "investigation_permit_consume_failed",
+                        state=state,
+                        permit_id=permit.permit_id,
+                        checkpoint_available=True,
+                        recovery_action="retry_authorization_without_tool_execution",
+                    )
+                ) from exc
+            return ToolAuthorization(allowed=True, permit_id=permit.permit_id)
+        raise InvestigationStagnationError(
+            self.recovery(
+                task_id,
+                "investigation_stagnated",
+                state=state,
+                permit_id=permit.permit_id if permit else None,
+                checkpoint_available=True,
+                recovery_action="pause_and_request_hypothesis_reevaluation",
+            )
+        )
+
     def recovery(
         self,
         task_id: str,
@@ -331,6 +495,7 @@ class InvestigationCoordinator:
         *,
         state: InvestigationState | None = None,
         tool_call_id: str | None = None,
+        permit_id: str | None = None,
         checkpoint_available: bool,
         recovery_action: str,
     ) -> InvestigationRecoveryMetadata:
@@ -353,6 +518,7 @@ class InvestigationCoordinator:
             state_version=current.version if current else 0,
             last_event_sequence=sequence,
             tool_call_id=tool_call_id,
+            permit_id=permit_id,
             checkpoint_available=checkpoint_available,
             recovery_action=recovery_action,
         )
@@ -532,6 +698,39 @@ def _normalized_path(value: str) -> str:
     if not normalized:
         raise ValueError("文件路径不能为空")
     return str(PurePosixPath(normalized))
+
+
+def _target_from_arguments(
+    tool_name: str,
+    arguments: Mapping[str, object],
+) -> str:
+    if tool_name in {"grep", "search"}:
+        path = str(arguments.get("path") or arguments.get("file_path") or "")
+        pattern = str(arguments.get("pattern") or arguments.get("query") or "").strip()
+        return f"{_normalized_path(path)}|{pattern}"
+    if tool_name == "execute":
+        return " ".join(str(arguments.get("command", "")).split())
+    if tool_name == "read_file":
+        return _normalized_path(str(arguments.get("file_path", "")))
+    target = arguments.get("target")
+    if isinstance(target, str) and target.strip():
+        return target.strip()
+    return json.dumps(
+        arguments,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _permit_target_hash(tool_name: str, target: str) -> str:
+    normalized_tool = tool_name.strip().lower()
+    normalized_target = target.strip().replace("\\", "/").lstrip("/")
+    if not normalized_tool or not normalized_target:
+        raise ValueError("调查许可的工具和目标不能为空")
+    material = f"{normalized_tool}|{normalized_target}"
+    return f"target_{hashlib.sha256(material.encode()).hexdigest()[:32]}"
 
 
 def _non_negative_int(value: object, *, default: int) -> int:

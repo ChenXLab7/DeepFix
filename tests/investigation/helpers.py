@@ -12,6 +12,8 @@ from deepfix.investigation.models import (
     AgentPhase,
     CheckedFile,
     CheckedLocation,
+    ContinueInvestigationInput,
+    InvestigationHypothesis,
     InvestigationState,
     NewInvestigationEvent,
     ProposedChange,
@@ -140,3 +142,47 @@ def supported_input(evidence_ids: list[str]) -> RecordHypothesisInput:
         reason="the failing branch and assertion agree",
     )
 
+
+def stagnated_coordinator(tmp_path: Path) -> InvestigationCoordinator:
+    coordinator = coordinator_fixture(tmp_path)
+    state = coordinator.store.ensure_started("task-a")
+    hypothesis = InvestigationHypothesis(
+        hypothesis_id="hyp-1",
+        statement="sign flips in helper",
+        state="candidate",
+        evidence_ids=[],
+        checked_locations=[],
+        reason="candidate for one bounded follow-up",
+    )
+    event_id = stable_investigation_id("event", "task-a", "stagnated-fixture")
+    coordinator.store.commit(
+        state.version,
+        [
+            NewInvestigationEvent(
+                event_id=event_id,
+                task_id="task-a",
+                event_type="reevaluation_required",
+                phase_before=state.agent_phase,
+                phase_after=state.agent_phase,
+            )
+        ],
+        state.model_copy(
+            update={
+                "hypotheses": [hypothesis],
+                "reevaluation_required": True,
+                "stagnation_level": 1,
+            }
+        ),
+    )
+    return coordinator
+
+
+def continue_input() -> ContinueInvestigationInput:
+    return ContinueInvestigationInput(
+        hypothesis_ids=["hyp-1"],
+        unresolved_question="which call flips sign?",
+        expected_evidence="a verified call edge",
+        tool_name="grep",
+        target="src/sign.py|flip",
+        reason="test evidence points to hyp-1",
+    )
