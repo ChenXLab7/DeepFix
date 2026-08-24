@@ -43,7 +43,10 @@ from deepfix.investigation.models import (
 from deepfix.investigation.phase import PhaseResolver
 from deepfix.investigation.progress import ProgressEvaluator
 from deepfix.investigation.stagnation import StagnationDetector
-from deepfix.investigation.store import InvestigationStore
+from deepfix.investigation.store import (
+    InvestigationStateConflict,
+    InvestigationStore,
+)
 from deepfix.persistence import TaskRepository
 
 
@@ -129,6 +132,7 @@ _DIAGNOSTIC_RESULT_EVENTS = {
         "diagnostic_artifact_read",
     ): InvestigationEventType.ARTIFACT_READ,
 }
+_STATE_COMMIT_MAX_ATTEMPTS = 4
 _DIAGNOSTIC_PAYLOAD_FIELDS = {
     "diagnostic_artifact_search": (
         "artifact_ids",
@@ -340,16 +344,51 @@ class InvestigationCoordinator:
         task_id: str,
         observation: ToolObservation,
     ) -> InvestigationState:
-        state = self.state(task_id)
+        for attempt in range(_STATE_COMMIT_MAX_ATTEMPTS):
+            state = self.state(task_id)
+            event_id = self._observation_event_id(task_id, observation)
+            if self.store.has_event(task_id, event_id):
+                return state
+            events, updated = self._prepare_observation_commit(
+                task_id,
+                state,
+                observation,
+                event_id,
+            )
+            try:
+                return self.store.commit(state.version, events, updated)
+            except InvestigationStateConflict as exc:
+                if attempt + 1 < _STATE_COMMIT_MAX_ATTEMPTS:
+                    continue
+                failure = exc
+                break
+            except Exception as exc:  # noqa: BLE001 - preserve recovery boundary
+                failure = exc
+                break
+        raise InvestigationStateError(
+            self.recovery(
+                task_id,
+                "investigation_state_commit_failed",
+                state=state,
+                tool_call_id=observation.tool_call_id,
+                checkpoint_available=True,
+                recovery_action="replay_event_commit_without_model_call",
+            )
+        ) from failure
+
+    def _prepare_observation_commit(
+        self,
+        task_id: str,
+        state: InvestigationState,
+        observation: ToolObservation,
+        event_id: str,
+    ) -> tuple[list[NewInvestigationEvent], InvestigationState]:
         evaluated, progress = self.progress_evaluator.apply(state, observation)
         if observation.progress_kind is not None:
             progress = observation.progress_kind
         effective_observation = observation.model_copy(
             update={"progress_kind": progress}
         )
-        event_id = self._observation_event_id(task_id, observation)
-        if self.store.has_event(task_id, event_id):
-            return state
         resolution = self.phase_resolver.transition(
             task_id,
             state.agent_phase,
@@ -387,19 +426,7 @@ class InvestigationCoordinator:
         events = [origin]
         if resolution.phase_event is not None:
             events.append(resolution.phase_event)
-        try:
-            return self.store.commit(state.version, events, updated)
-        except Exception as exc:
-            raise InvestigationStateError(
-                self.recovery(
-                    task_id,
-                    "investigation_state_commit_failed",
-                    state=state,
-                    tool_call_id=observation.tool_call_id,
-                    checkpoint_available=True,
-                    recovery_action="replay_event_commit_without_model_call",
-                )
-            ) from exc
+        return events, updated
 
     def record_hypothesis(
         self,

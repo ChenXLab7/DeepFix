@@ -1,4 +1,6 @@
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from langchain_core.messages import ToolMessage
@@ -127,6 +129,110 @@ def test_read_file_automatically_records_checked_range_without_strong_progress(
     assert after.checked_files[0].ranges[0].start_line == 11
     assert after.checked_files[0].ranges[0].end_line == 11
     assert after.progress_generation == before.progress_generation
+
+
+def test_parallel_file_observations_retry_state_conflict_without_losing_updates(
+    tmp_path,
+    monkeypatch,
+):
+    coordinator = coordinator_fixture(tmp_path)
+    coordinator.state("task-a")
+    original_state = coordinator.state
+    first_state_reads: set[int] = set()
+    state_lock = threading.Lock()
+    first_state_barrier = threading.Barrier(2)
+
+    def synchronize_first_state_read(task_id):
+        state = original_state(task_id)
+        thread_id = threading.get_ident()
+        with state_lock:
+            first_read = thread_id not in first_state_reads
+            first_state_reads.add(thread_id)
+        if first_read:
+            first_state_barrier.wait(timeout=5)
+        return state
+
+    monkeypatch.setattr(coordinator, "state", synchronize_first_state_read)
+
+    def record(path: str, call_id: str):
+        return coordinator.record_observation(
+            "task-a",
+            ToolObservation(
+                event_type="file_checked",
+                tool_call_id=call_id,
+                source_message_id=f"msg-{call_id}",
+                signature=f"read:{path}",
+                result_fingerprint=f"result:{path}",
+                path=path,
+                payload={
+                    "path": path,
+                    "start_line": 1,
+                    "end_line": 20,
+                    "content_fingerprint": f"content:{path}",
+                },
+            ),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(record, "python_programs/mergesort.py", "read-source"),
+            executor.submit(
+                record,
+                "python_testcases/test_mergesort.py",
+                "read-test",
+            ),
+        ]
+        results = [future.result(timeout=10) for future in futures]
+
+    monkeypatch.setattr(coordinator, "state", original_state)
+    final_state = coordinator.state("task-a")
+    assert {item.path for item in final_state.checked_files} == {
+        "python_programs/mergesort.py",
+        "python_testcases/test_mergesort.py",
+    }
+    assert len(
+        [
+            event
+            for event in coordinator.store.list_events("task-a")
+            if event.event_type == "file_checked"
+        ]
+    ) == 2
+    assert max(result.version for result in results) == final_state.version
+
+
+def test_non_conflict_commit_failure_is_not_retried(tmp_path, monkeypatch):
+    coordinator = coordinator_fixture(tmp_path)
+    coordinator.state("task-a")
+    calls = 0
+
+    def fail_commit(expected_version, events, next_state):
+        nonlocal calls
+        calls += 1
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(coordinator.store, "commit", fail_commit)
+
+    with pytest.raises(InvestigationStateError) as caught:
+        coordinator.record_observation(
+            "task-a",
+            ToolObservation(
+                event_type="file_checked",
+                tool_call_id="read-source",
+                source_message_id="msg-read-source",
+                signature="read:source",
+                result_fingerprint="result:source",
+                path="python_programs/mergesort.py",
+                payload={
+                    "path": "python_programs/mergesort.py",
+                    "start_line": 1,
+                    "end_line": 20,
+                    "content_fingerprint": "content:source",
+                },
+            ),
+        )
+
+    assert calls == 1
+    assert caught.value.recovery.error_code == "investigation_state_commit_failed"
 
 
 def test_originating_progress_increments_generation_but_phase_event_does_not(tmp_path):
