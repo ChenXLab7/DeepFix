@@ -13,6 +13,7 @@ from langchain.agents.middleware import (
 from langchain_core.messages import SystemMessage, ToolMessage
 from langgraph.types import Command
 
+from deepfix.compaction.identity import stable_generated_message_id
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import InvestigationStateError
 from deepfix.investigation.models import (
@@ -60,7 +61,9 @@ class InvestigationMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command[Any]:
         task_id, receipt = self._prepare_tool(request)
         if receipt is None:
-            result = handler(request)
+            result = _diagnostic_artifact_redirect(task_id, request)
+            if result is None:
+                result = handler(request)
         else:
             result = receipt.tool_message
         return self._finish_tool(task_id, request, result, receipt)
@@ -75,7 +78,9 @@ class InvestigationMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command[Any]:
         task_id, receipt = self._prepare_tool(request)
         if receipt is None:
-            result = await handler(request)
+            result = _diagnostic_artifact_redirect(task_id, request)
+            if result is None:
+                result = await handler(request)
         else:
             result = receipt.tool_message
         return self._finish_tool(task_id, request, result, receipt)
@@ -226,3 +231,38 @@ def _runtime_task_id(request: ToolCallRequest) -> str:
 def _tool_arguments(tool_call: Mapping[str, Any]) -> Mapping[str, object]:
     value = tool_call.get("args", {})
     return value if isinstance(value, Mapping) else {}
+
+
+def _diagnostic_artifact_redirect(
+    task_id: str,
+    request: ToolCallRequest,
+) -> ToolMessage | None:
+    name = str(request.tool_call.get("name", "")).strip()
+    arguments = _tool_arguments(request.tool_call)
+    path = str(arguments.get("file_path", "")).strip().replace("\\", "/")
+    normalized = f"/{path.lstrip('/')}"
+    if name != "read_file" or not normalized.startswith(
+        "/.deepfix-artifacts/large_tool_results/"
+    ):
+        return None
+    call_id = str(request.tool_call.get("id", "")).strip()
+    return ToolMessage(
+        id=stable_generated_message_id(
+            task_id,
+            call_id,
+            "diagnostic_artifact_redirect",
+        ),
+        content=(
+            "该路径是已卸载的诊断结果，不能使用 read_file 顺序翻页。"
+            "请先调用 search_diagnostic_artifacts 搜索异常类型、末尾错误或关键栈帧，"
+            "再使用返回的 artifact_id 调用 read_diagnostic_artifact 读取必要片段。"
+        ),
+        tool_call_id=call_id,
+        name="read_file",
+        status="error",
+        artifact={
+            "result_type": "diagnostic_artifact_redirect",
+            "error_code": "use_diagnostic_artifact_tools",
+            "operation": "read_file",
+        },
+    )

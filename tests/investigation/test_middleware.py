@@ -121,6 +121,20 @@ def read_request() -> ToolCallRequest:
     )
 
 
+def offloaded_result_read_request(call_id: str = "artifact-read-1") -> ToolCallRequest:
+    return tool_request(
+        "read_file",
+        call_id,
+        {
+            "file_path": (
+                "/.deepfix-artifacts/large_tool_results/pytest-current"
+            ),
+            "offset": 60,
+            "limit": 80,
+        },
+    )
+
+
 def edit_request(call_id: str) -> ToolCallRequest:
     return tool_request(
         "edit_file",
@@ -307,6 +321,57 @@ def test_normal_investigation_exposes_diagnostic_artifact_tools(tmp_path):
         "search_diagnostic_artifacts",
         "read_diagnostic_artifact",
     } <= {tool.name for tool in captured.tools}
+
+
+def test_direct_read_of_offloaded_result_routes_to_diagnostic_tools(tmp_path):
+    middleware = middleware_fixture(tmp_path, phase="diagnosing")
+    called = False
+
+    def handler(request):
+        nonlocal called
+        called = True
+        raise AssertionError("ordinary read_file must not read diagnostic artifacts")
+
+    result = middleware.wrap_tool_call(
+        offloaded_result_read_request(),
+        handler,
+    )
+
+    assert called is False
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert result.artifact == {
+        "result_type": "diagnostic_artifact_redirect",
+        "error_code": "use_diagnostic_artifact_tools",
+        "operation": "read_file",
+    }
+    assert "search_diagnostic_artifacts" in result.content
+    state = middleware.coordinator.state("task-a")
+    assert all("large_tool_results" not in item.path for item in state.checked_files)
+    assert middleware.coordinator.store.list_events("task-a")[-1].event_type == (
+        "tool_completed"
+    )
+
+
+def test_async_direct_read_of_offloaded_result_skips_handler(tmp_path):
+    middleware = middleware_fixture(tmp_path, phase="diagnosing")
+    called = False
+
+    async def handler(request):
+        nonlocal called
+        called = True
+        raise AssertionError("ordinary read_file must not read diagnostic artifacts")
+
+    result = asyncio.run(
+        middleware.awrap_tool_call(
+            offloaded_result_read_request("artifact-read-async"),
+            handler,
+        )
+    )
+
+    assert called is False
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
 
 
 def test_level_one_exposes_only_the_unconsumed_permitted_artifact_tool(tmp_path):

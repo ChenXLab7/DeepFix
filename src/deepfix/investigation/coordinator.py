@@ -288,7 +288,7 @@ class InvestigationCoordinator:
                 ),
             )
 
-        if name == "read_file":
+        if name == "read_file" and result.status == "success":
             path = _normalized_path(str(args.get("file_path", "")))
             offset = _non_negative_int(args.get("offset"), default=0)
             line_count = max(1, len(_message_text(result).splitlines()))
