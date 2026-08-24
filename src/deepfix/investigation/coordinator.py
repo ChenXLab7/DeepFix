@@ -183,7 +183,15 @@ class InvestigationCoordinator:
         capabilities: Mapping[str, InvestigationCapability],
     ) -> set[str]:
         if state.stagnation_level > 0 or state.reevaluation_required:
-            return set(_REEVALUATION_TOOL_NAMES) & set(capabilities)
+            allowed = set(_REEVALUATION_TOOL_NAMES)
+            permit = state.permit
+            if (
+                state.stagnation_level == 1
+                and permit is not None
+                and not permit.consumed
+            ):
+                allowed.add(permit.tool_name)
+            return allowed & set(capabilities)
         allowed_capabilities = _PHASE_CAPABILITIES[state.agent_phase]
         return {
             name
@@ -953,6 +961,10 @@ def _target_from_arguments(
     tool_name: str,
     arguments: Mapping[str, object],
 ) -> str:
+    if tool_name == "search_diagnostic_artifacts":
+        return " ".join(str(arguments.get("query", "")).split())
+    if tool_name == "read_diagnostic_artifact":
+        return str(arguments.get("artifact_id", "")).strip()
     if tool_name in {"grep", "search"}:
         path = str(arguments.get("path") or arguments.get("file_path") or "")
         pattern = str(arguments.get("pattern") or arguments.get("query") or "").strip()

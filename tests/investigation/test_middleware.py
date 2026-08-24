@@ -23,6 +23,7 @@ from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.middleware import InvestigationMiddleware
 from deepfix.investigation.models import (
     AgentPhase,
+    ContinueInvestigationInput,
     InvestigationCapability,
     InvestigationHypothesis,
     InvestigationRecoveryMetadata,
@@ -170,6 +171,8 @@ def all_test_tools() -> list[BaseTool]:
         "edit_file",
         "record_hypothesis",
         "continue_investigation",
+        "search_diagnostic_artifacts",
+        "read_diagnostic_artifact",
         "save_progress",
         "compact_conversation",
     )
@@ -245,6 +248,8 @@ def middleware_fixture(
         "edit_file": InvestigationCapability.MODIFY,
         "record_hypothesis": InvestigationCapability.META,
         "continue_investigation": InvestigationCapability.META,
+        "search_diagnostic_artifacts": InvestigationCapability.READ,
+        "read_diagnostic_artifact": InvestigationCapability.READ,
         "save_progress": InvestigationCapability.MEMORY,
         "compact_conversation": InvestigationCapability.COMPACTION,
     }
@@ -284,6 +289,70 @@ def test_level_one_exposes_only_three_meta_tools(tmp_path):
     )
 
     assert {tool.name for tool in captured.tools} == {
+        "record_hypothesis",
+        "continue_investigation",
+        "save_progress",
+    }
+
+
+def test_normal_investigation_exposes_diagnostic_artifact_tools(tmp_path):
+    middleware = middleware_fixture(tmp_path)
+
+    captured = capture_model_request(
+        middleware,
+        model_request(tools=all_test_tools()),
+    )
+
+    assert {
+        "search_diagnostic_artifacts",
+        "read_diagnostic_artifact",
+    } <= {tool.name for tool in captured.tools}
+
+
+def test_level_one_exposes_only_the_unconsumed_permitted_artifact_tool(tmp_path):
+    middleware = middleware_fixture(tmp_path, stagnation_level=1)
+    middleware.coordinator.grant_investigation_permit(
+        "task-a",
+        ContinueInvestigationInput(
+            hypothesis_ids=["hyp-1"],
+            unresolved_question="which archived failure proves the branch?",
+            expected_evidence="the original AssertionError and traceback",
+            tool_name="search_diagnostic_artifacts",
+            target="AssertionError",
+            reason="the live ToolMessage contains only an offload preview",
+        ),
+    )
+
+    before = capture_model_request(
+        middleware,
+        model_request(tools=all_test_tools()),
+    )
+    assert {tool.name for tool in before.tools} == {
+        "record_hypothesis",
+        "continue_investigation",
+        "save_progress",
+        "search_diagnostic_artifacts",
+    }
+
+    request = tool_request(
+        "search_diagnostic_artifacts",
+        "artifact-search-1",
+        {"query": "  AssertionError  "},
+    )
+    middleware.wrap_tool_call(
+        request,
+        lambda _: ToolMessage(
+            content="match",
+            tool_call_id="artifact-search-1",
+            name="search_diagnostic_artifacts",
+        ),
+    )
+
+    after = capture_model_request(
+        middleware,
+        model_request(tools=all_test_tools()),
+    )
+    assert {tool.name for tool in after.tools} == {
         "record_hypothesis",
         "continue_investigation",
         "save_progress",

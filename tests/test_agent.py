@@ -8,12 +8,18 @@ from langchain_deepseek import ChatDeepSeek
 from langgraph.checkpoint.memory import InMemorySaver
 
 from deepfix.agent import build_agent, build_compaction_model, build_main_model
+from deepfix.approval import PolicyAction, RiskLevel
 from deepfix.compaction.middleware import (
     DeepFixCompactionMiddleware,
     MessageIdentityMiddleware,
 )
 from deepfix.config import ApprovalMode, load_config
-from deepfix.extensions import build_research_extensions
+from deepfix.extensions import (
+    AgentExtensions,
+    ToolRegistration,
+    build_research_extensions,
+)
+from deepfix.investigation.models import InvestigationCapability
 from deepfix.memory import WorkingMemoryStore
 from deepfix.prompting import PromptPolicyMiddleware
 from deepfix.protected_context import ProtectedContextMiddleware
@@ -53,6 +59,8 @@ def test_agent_exposes_repair_tools_without_subagent_task_tool(agent):
         "compact_conversation",
         "record_hypothesis",
         "continue_investigation",
+        "search_diagnostic_artifacts",
+        "read_diagnostic_artifact",
     } <= tools.keys()
 
 
@@ -69,6 +77,8 @@ def test_agent_interrupts_every_side_effecting_tool(agent):
     }
     assert "save_progress" not in middleware.interrupt_on
     assert "compact_conversation" not in middleware.interrupt_on
+    assert "search_diagnostic_artifacts" not in middleware.interrupt_on
+    assert "read_diagnostic_artifact" not in middleware.interrupt_on
 
 
 def test_agent_returns_structured_repair_outcome(agent):
@@ -188,6 +198,17 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
         for name in ("model", "main_model", "compaction_model")
     )
     assert tool_names.count("compact_conversation") == 1
+    assert tool_names.count("search_diagnostic_artifacts") == 1
+    assert tool_names.count("read_diagnostic_artifact") == 1
+    investigation_middleware = next(
+        item for item in middleware if type(item).__name__ == "InvestigationMiddleware"
+    )
+    assert investigation_middleware.capabilities["search_diagnostic_artifacts"] is (
+        InvestigationCapability.READ
+    )
+    assert investigation_middleware.capabilities["read_diagnostic_artifact"] is (
+        InvestigationCapability.READ
+    )
     assert captured["subagents"] == []
     assert captured["skills"] == []
     assert captured["interrupt_on"] == {
@@ -200,6 +221,34 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert registered["profile"].excluded_middleware == frozenset(
         {"SummarizationMiddleware"}
     )
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["search_diagnostic_artifacts", "read_diagnostic_artifact"],
+)
+def test_agent_rejects_extension_that_shadows_diagnostic_artifact_tool(
+    config,
+    name,
+):
+    extensions = AgentExtensions(
+        tools=(
+            ToolRegistration(
+                tool=_extension_tool(name),
+                risk=RiskLevel.L0,
+                policy_action=PolicyAction.ALLOW,
+                investigation_capability=InvestigationCapability.READ,
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="重复 Tool 名称"):
+        build_agent(
+            config,
+            checkpointer=InMemorySaver(),
+            working_memory_store=WorkingMemoryStore(config.database_path),
+            extensions=extensions,
+        )
 
 
 class _RecordingMiddleware(AgentMiddleware):

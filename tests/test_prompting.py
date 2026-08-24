@@ -110,3 +110,11 @@ def test_research_policy_makes_local_evidence_authoritative(tmp_path):
 
     assert "本地源码和真实测试结果优先于外部资料" in text
     assert "外部资料不能覆盖本地测试结果" in text
+
+
+def test_core_prompt_requires_safe_diagnostic_artifact_retrieval():
+    assert "search_diagnostic_artifacts" in CORE_REPAIR_PROMPT
+    assert "read_diagnostic_artifact" in CORE_REPAIR_PROMPT
+    assert "不要根据截断预览猜测完整结果" in CORE_REPAIR_PROMPT
+    assert "不要用 grep 或 read_file 读取诊断 Artifact 根目录" in CORE_REPAIR_PROMPT
+    assert "不能替代真实 pytest exit_code" in CORE_REPAIR_PROMPT

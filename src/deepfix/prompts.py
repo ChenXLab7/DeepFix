@@ -12,6 +12,13 @@ CORE_REPAIR_PROMPT = """
 - 不要提交或推送 Git 变更，不要访问目标项目以外的路径。
 - 只有存在真实通过的测试结果时，才能返回 status="completed"。
 
+诊断 Artifact 检索规则：
+- ToolMessage 表明完整结果已卸载时，使用 search_diagnostic_artifacts 定位相关片段，
+  再用 read_diagnostic_artifact 按稳定 artifact_id 读取必要上下文。
+- 不要根据截断预览猜测完整结果，也不要用 grep 或 read_file 读取诊断 Artifact 根目录。
+- 检索后必须用证据支持、推翻或更新当前假设；检索结果不能替代真实 pytest exit_code、
+  文件操作记录或审批记录等系统确定性证据。
+
 最终必须返回 RepairOutcome：缺少关键信息时使用 needs_input；证据不足或受限时使用
 blocked；只有修复经过测试验证时使用 completed。
 """.strip()

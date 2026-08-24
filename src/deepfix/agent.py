@@ -11,6 +11,12 @@ from deepagents.profiles.harness import (
 from langchain_deepseek import ChatDeepSeek
 
 from deepfix.approval import merge_interrupt_on
+from deepfix.artifact_retrieval.collector import ArtifactReferenceCollector
+from deepfix.artifact_retrieval.service import DiagnosticArtifactService
+from deepfix.artifact_retrieval.tools import (
+    build_read_diagnostic_artifact_tool,
+    build_search_diagnostic_artifacts_tool,
+)
 from deepfix.backend import build_backend
 from deepfix.compaction.adapter import DeepAgentsArtifactAdapter
 from deepfix.compaction.budget import ContextBudgetMonitor
@@ -145,6 +151,20 @@ def build_agent(
     compact_conversation = build_compact_conversation_tool(coordinator)
     record_hypothesis = build_record_hypothesis_tool(investigation)
     continue_investigation = build_continue_investigation_tool(investigation)
+    artifact_collector = ArtifactReferenceCollector(compaction, resolved_backend)
+    artifact_service = DiagnosticArtifactService(
+        tasks,
+        artifact_collector,
+        resolved_backend,
+    )
+    search_diagnostic_artifacts = build_search_diagnostic_artifacts_tool(
+        artifact_service,
+        investigation,
+    )
+    read_diagnostic_artifact = build_read_diagnostic_artifact_tool(
+        artifact_service,
+        investigation,
+    )
     core_tool_names = {
         "ls",
         "read_file",
@@ -158,6 +178,8 @@ def build_agent(
         "compact_conversation",
         "record_hypothesis",
         "continue_investigation",
+        "search_diagnostic_artifacts",
+        "read_diagnostic_artifact",
     }
     resolved = merge_extensions(
         extensions or AgentExtensions(),
@@ -177,6 +199,8 @@ def build_agent(
         "compact_conversation": InvestigationCapability.COMPACTION,
         "record_hypothesis": InvestigationCapability.META,
         "continue_investigation": InvestigationCapability.META,
+        "search_diagnostic_artifacts": InvestigationCapability.READ,
+        "read_diagnostic_artifact": InvestigationCapability.READ,
         **{
             item.tool.name: item.investigation_capability
             for item in resolved.tools
@@ -197,6 +221,8 @@ def build_agent(
             compact_conversation,
             record_hypothesis,
             continue_investigation,
+            search_diagnostic_artifacts,
+            read_diagnostic_artifact,
             *(item.tool for item in resolved.tools),
         ],
         middleware=[
