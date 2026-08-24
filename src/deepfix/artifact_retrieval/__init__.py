@@ -12,12 +12,14 @@ from deepfix.artifact_retrieval.models import (
     DiagnosticSearchResult,
     stable_diagnostic_artifact_id,
 )
+from deepfix.artifact_retrieval.service import DiagnosticArtifactService
 
 __all__ = [
     "ArtifactReferenceCollector",
     "DiagnosticArtifactCatalog",
     "DiagnosticArtifactDescriptor",
     "DiagnosticArtifactKind",
+    "DiagnosticArtifactService",
     "DiagnosticArtifactSystemError",
     "DiagnosticArtifactToolError",
     "DiagnosticMatch",
