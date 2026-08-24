@@ -78,3 +78,21 @@ def test_history_adapter_uses_internal_artifact_route(tmp_path, monkeypatch):
 
     assert ref.path == "/.deepfix-artifacts/conversation_history/task-a.md"
     assert (config.artifacts_path / "conversation_history" / "task-a.md").exists()
+
+
+def test_backend_routes_deep_agents_large_result_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    config = load_config(tmp_path, ApprovalMode.MANUAL)
+    backend = build_backend(config)
+
+    result = backend.write(
+        "/.deepfix-artifacts/large_tool_results/call_1",
+        "full diagnostic output",
+    )
+
+    assert result.error is None
+    assert (
+        config.artifacts_path / "large_tool_results" / "call_1"
+    ).read_text(encoding="utf-8") == "full diagnostic output"
+    assert not (config.project_root / ".deepfix-artifacts").exists()
