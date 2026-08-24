@@ -29,6 +29,13 @@ PHASE_PROMPTS = {
 本地源码和真实测试结果优先于外部资料。根因未得到证据支持前不要修改代码。
 </deepfix_phase>
 """.strip(),
+    "diagnosing": """
+<deepfix_phase name="diagnosing">
+根据真实失败测试、traceback 和已检查源码定位根因。使用 record_hypothesis 明确记录
+candidate、rejected 或 supported 状态；只有引用当前任务证据、已检查位置、拟修改目标
+和预期效果的 supported 假设才能进入 planning。不要直接修改代码。
+</deepfix_phase>
+""".strip(),
     "planning": """
 <deepfix_phase name="planning">
 基于已验证根因提出最小修复计划，说明修改位置、预期行为、回归风险和验证命令。
@@ -38,7 +45,7 @@ PHASE_PROMPTS = {
     "editing": """
 <deepfix_phase name="editing">
 严格按最小计划修改，只处理根因相关文件并保留既有行为。写入和执行仍遵守审批策略；
-发现计划依据不足时退回 investigating，而不是扩大修改范围。
+发现计划依据不足时退回 diagnosing，而不是扩大修改范围。
 </deepfix_phase>
 """.strip(),
     "testing": """

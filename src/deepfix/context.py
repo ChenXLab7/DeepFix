@@ -25,6 +25,7 @@ from deepfix.compaction.models import (
     ProvenanceRef,
     SnapshotCoverage,
 )
+from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import WorkingMemoryStore, WorkingMemoryVersion
 from deepfix.models import Evidence
 from deepfix.prompting import PromptPolicyMiddleware
@@ -149,6 +150,7 @@ def build_context_middleware(
     model,
     backend,
     store: WorkingMemoryStore,
+    investigation_store: InvestigationStore,
     research_store: ResearchEvidenceStore | None = None,
 ):
     summarization = SummarizationMiddleware(
@@ -173,7 +175,7 @@ def build_context_middleware(
                 "再在上下文足够长时调用 compact_conversation。"
             ),
         ),
-        PromptPolicyMiddleware(store),
+        PromptPolicyMiddleware(investigation_store),
         ContextMemoryMiddleware(store),
         ResearchEvidenceMiddleware(evidence_store),
     ]

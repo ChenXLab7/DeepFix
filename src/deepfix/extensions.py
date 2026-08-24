@@ -7,6 +7,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.tools import BaseTool
 
 from deepfix.approval import PolicyAction, RiskLevel
+from deepfix.investigation.models import InvestigationCapability
 
 _PROTECTED_MIDDLEWARE_NAMES = frozenset(
     {
@@ -14,18 +15,36 @@ _PROTECTED_MIDDLEWARE_NAMES = frozenset(
         "SummarizationMiddleware",
         "SummarizationToolMiddleware",
         "ContextMemoryMiddleware",
-    "MessageIdentityMiddleware",
-    "LegacyContextMigrationMiddleware",
+        "MessageIdentityMiddleware",
+        "LegacyContextMigrationMiddleware",
+        "InvestigationMigrationMiddleware",
+        "InvestigationMiddleware",
         "ProtectedContextMiddleware",
         "DeepFixCompactionMiddleware",
         "HumanInTheLoopMiddleware",
     }
 )
 _RESEARCH_TOOL_POLICY = {
-    "inspect_dependency": (RiskLevel.L0, False),
-    "search_technical_sources": (RiskLevel.L1, True),
-    "fetch_external_evidence": (RiskLevel.L1, True),
-    "link_external_evidence": (RiskLevel.L0, False),
+    "inspect_dependency": (
+        RiskLevel.L0,
+        False,
+        InvestigationCapability.READ,
+    ),
+    "search_technical_sources": (
+        RiskLevel.L1,
+        True,
+        InvestigationCapability.RESEARCH,
+    ),
+    "fetch_external_evidence": (
+        RiskLevel.L1,
+        True,
+        InvestigationCapability.RESEARCH,
+    ),
+    "link_external_evidence": (
+        RiskLevel.L0,
+        False,
+        InvestigationCapability.RESEARCH,
+    ),
 }
 
 
@@ -35,6 +54,7 @@ class ToolRegistration:
     risk: RiskLevel
     policy_action: PolicyAction
     network_access: bool = False
+    investigation_capability: InvestigationCapability | None = None
 
 
 @dataclass(frozen=True)
@@ -106,13 +126,14 @@ def build_research_extensions(
         metadata = _RESEARCH_TOOL_POLICY.get(tool.name)
         if metadata is None:
             raise ValueError(f"未知或错误的 research Tool 名称: {tool.name}")
-        risk, network_access = metadata
+        risk, network_access, capability = metadata
         registrations.append(
             ToolRegistration(
                 tool=tool,
                 risk=risk,
                 policy_action=PolicyAction.ALLOW,
                 network_access=network_access,
+                investigation_capability=capability,
             )
         )
     if {item.tool.name for item in registrations} != set(_RESEARCH_TOOL_POLICY):
@@ -129,6 +150,13 @@ def _validate_registration(registration: ToolRegistration) -> None:
         raise TypeError("ToolRegistration.policy_action 必须是 PolicyAction")
     if type(registration.network_access) is not bool:
         raise TypeError("ToolRegistration.network_access 必须是 bool")
+    if registration.investigation_capability is None:
+        raise ValueError("ToolRegistration.investigation_capability 不能为空")
+    if not isinstance(
+        registration.investigation_capability,
+        InvestigationCapability,
+    ):
+        raise TypeError("investigation_capability 必须使用 InvestigationCapability")
     if not registration.tool.name.strip():
         raise ValueError("Tool 名称不能为空")
 

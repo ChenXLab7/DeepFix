@@ -8,6 +8,7 @@ from deepfix.approval import (
 )
 from deepfix.config import ApprovalMode
 from deepfix.extensions import ToolRegistration
+from deepfix.investigation.models import InvestigationCapability
 
 
 def _registered_tool(name, action):
@@ -21,6 +22,7 @@ def _registered_tool(name, action):
         risk=RiskLevel.L1,
         policy_action=action,
         network_access=False,
+        investigation_capability=InvestigationCapability.READ,
     )
 
 

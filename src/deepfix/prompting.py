@@ -6,12 +6,12 @@ from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResp
 from langchain_core.messages import SystemMessage
 from langgraph.config import get_config
 
-from deepfix.memory import WorkingMemoryStore
+from deepfix.investigation.store import InvestigationStore
 from deepfix.prompts import CORE_REPAIR_PROMPT, PHASE_PROMPTS, RESEARCH_POLICY_PROMPT
 
 
 class PromptPolicyMiddleware(AgentMiddleware):
-    def __init__(self, store: WorkingMemoryStore) -> None:
+    def __init__(self, store: InvestigationStore) -> None:
         self.store = store
 
     def wrap_model_call(
@@ -20,8 +20,11 @@ class PromptPolicyMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelResponse:
         task_id = model_request_task_id(request)
-        latest = self.store.latest(task_id) if task_id else None
-        phase = latest.snapshot.phase if latest is not None else "investigating"
+        phase = (
+            self.store.ensure_started(task_id).agent_phase.value
+            if task_id
+            else "investigating"
+        )
         original = request.system_message.text if request.system_message else ""
         parts = [original] if original else []
         if CORE_REPAIR_PROMPT not in original:

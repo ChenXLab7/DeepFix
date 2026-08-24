@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from investigation.helpers import force_phase
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.runtime import ExecutionInfo, Runtime
 
+from deepfix.investigation.models import AgentPhase
+from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
 from deepfix.prompting import PromptPolicyMiddleware
 from deepfix.prompts import CORE_REPAIR_PROMPT, PHASE_PROMPTS, RESEARCH_POLICY_PROMPT
@@ -54,30 +57,31 @@ def _capture(middleware, request):
     return received[0]
 
 
-def test_prompt_policy_defaults_to_investigating_without_memory(tmp_path):
-    store = WorkingMemoryStore(tmp_path / "deepfix.sqlite3")
+def test_prompt_policy_defaults_to_investigating_for_new_investigation(tmp_path):
+    store = InvestigationStore(tmp_path / "deepfix.sqlite3")
 
     received = _capture(PromptPolicyMiddleware(store), _request("task-a"))
 
     assert '<deepfix_phase name="investigating">' in received.system_message.text
 
 
-def test_prompt_policy_uses_latest_snapshot_from_current_task(tmp_path):
-    store = WorkingMemoryStore(tmp_path / "deepfix.sqlite3")
-    store.save("task-a", _snapshot("planning", "旧阶段"))
-    store.save("task-a", _snapshot("editing", "最新阶段"))
-    store.save("task-b", _snapshot("testing", "其他任务"))
+def test_prompt_policy_uses_investigation_phase_not_working_memory(tmp_path):
+    database = tmp_path / "deepfix.sqlite3"
+    store = InvestigationStore(database)
+    state = store.ensure_started("task-a")
+    force_phase(store, state, AgentPhase.DIAGNOSING)
+    memory = WorkingMemoryStore(database)
+    memory.save("task-a", _snapshot("editing", "stale memory"))
 
     received = _capture(PromptPolicyMiddleware(store), _request("task-a"))
     text = received.system_message.text
 
-    assert '<deepfix_phase name="editing">' in text
-    assert '<deepfix_phase name="planning">' not in text
-    assert '<deepfix_phase name="testing">' not in text
+    assert '<deepfix_phase name="diagnosing">' in text
+    assert '<deepfix_phase name="editing">' not in text
 
 
 def test_prompt_policy_composes_core_one_phase_and_research_policy(tmp_path):
-    store = WorkingMemoryStore(tmp_path / "deepfix.sqlite3")
+    store = InvestigationStore(tmp_path / "deepfix.sqlite3")
 
     received = _capture(PromptPolicyMiddleware(store), _request("task-a"))
     text = received.system_message.text
@@ -88,7 +92,7 @@ def test_prompt_policy_composes_core_one_phase_and_research_policy(tmp_path):
 
 
 def test_prompt_policy_does_not_write_dynamic_prompts_to_message_history(tmp_path):
-    store = WorkingMemoryStore(tmp_path / "deepfix.sqlite3")
+    store = InvestigationStore(tmp_path / "deepfix.sqlite3")
     request = _request("task-a")
     original_messages = list(request.messages)
 
@@ -99,7 +103,7 @@ def test_prompt_policy_does_not_write_dynamic_prompts_to_message_history(tmp_pat
 
 
 def test_research_policy_makes_local_evidence_authoritative(tmp_path):
-    store = WorkingMemoryStore(tmp_path / "deepfix.sqlite3")
+    store = InvestigationStore(tmp_path / "deepfix.sqlite3")
 
     received = _capture(PromptPolicyMiddleware(store), _request("task-a"))
     text = received.system_message.text

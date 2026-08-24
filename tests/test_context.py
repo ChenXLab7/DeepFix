@@ -18,6 +18,7 @@ from deepfix.context import (
     build_save_progress_tool,
     render_working_memory,
 )
+from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore, WorkingMemoryVersion
 from deepfix.prompting import PromptPolicyMiddleware
 from deepfix.research.middleware import ResearchEvidenceMiddleware
@@ -218,6 +219,7 @@ def test_context_middleware_shares_one_summarization_engine(config, store):
         build_main_model(config),
         build_backend(config),
         store,
+        InvestigationStore(config.database_path),
     )
     summarization = next(
         item for item in middleware if isinstance(item, SummarizationMiddleware)
@@ -238,6 +240,7 @@ def test_context_middleware_has_explicit_prompt_memory_research_order(config, st
         build_main_model(config),
         build_backend(config),
         store,
+        InvestigationStore(config.database_path),
         research_store,
     )
     names = [type(item) for item in middleware]

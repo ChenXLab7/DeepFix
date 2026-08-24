@@ -11,6 +11,7 @@ from deepfix.extensions import (
     build_research_extensions,
     merge_extensions,
 )
+from deepfix.investigation.models import InvestigationCapability
 
 
 def _tool(name: str):
@@ -26,12 +27,14 @@ def _registration(
     risk: RiskLevel = RiskLevel.L0,
     action: PolicyAction = PolicyAction.ALLOW,
     network_access: bool = False,
+    capability: InvestigationCapability = InvestigationCapability.READ,
 ) -> ToolRegistration:
     return ToolRegistration(
         tool=_tool(name),
         risk=risk,
         policy_action=action,
         network_access=network_access,
+        investigation_capability=capability,
     )
 
 
@@ -57,6 +60,7 @@ def test_invalid_tool_policy_metadata_is_rejected():
         risk="L0",  # type: ignore[arg-type]
         policy_action=PolicyAction.ALLOW,
         network_access=False,
+        investigation_capability=InvestigationCapability.READ,
     )
 
     with pytest.raises(TypeError, match="RiskLevel"):
@@ -69,6 +73,7 @@ def test_network_access_must_be_an_explicit_boolean():
         risk=RiskLevel.L1,
         policy_action=PolicyAction.ALLOW,
         network_access="yes",  # type: ignore[arg-type]
+        investigation_capability=InvestigationCapability.READ,
     )
 
     with pytest.raises(TypeError, match="network_access"):
@@ -81,9 +86,23 @@ def test_policy_action_must_use_the_declared_enum():
         risk=RiskLevel.L1,
         policy_action="allow",  # type: ignore[arg-type]
         network_access=False,
+        investigation_capability=InvestigationCapability.READ,
     )
 
     with pytest.raises(TypeError, match="PolicyAction"):
+        merge_extensions(AgentExtensions(tools=(registration,)))
+
+
+def test_extension_capability_is_required():
+    registration = ToolRegistration(
+        tool=_tool("inspect"),
+        risk=RiskLevel.L0,
+        policy_action=PolicyAction.ALLOW,
+        network_access=False,
+        investigation_capability=None,
+    )
+
+    with pytest.raises(ValueError, match="investigation_capability"):
         merge_extensions(AgentExtensions(tools=(registration,)))
 
 
@@ -96,6 +115,8 @@ def test_policy_action_must_use_the_declared_enum():
         "ContextMemoryMiddleware",
         "MessageIdentityMiddleware",
         "LegacyContextMigrationMiddleware",
+        "InvestigationMigrationMiddleware",
+        "InvestigationMiddleware",
         "ProtectedContextMiddleware",
         "DeepFixCompactionMiddleware",
         "HumanInTheLoopMiddleware",
@@ -165,6 +186,16 @@ def test_research_extensions_have_approved_metadata():
         "search_technical_sources": (RiskLevel.L1, PolicyAction.ALLOW, True),
         "fetch_external_evidence": (RiskLevel.L1, PolicyAction.ALLOW, True),
         "link_external_evidence": (RiskLevel.L0, PolicyAction.ALLOW, False),
+    }
+    capabilities = {
+        item.tool.name: item.investigation_capability
+        for item in extensions.tools
+    }
+    assert capabilities == {
+        "inspect_dependency": InvestigationCapability.READ,
+        "search_technical_sources": InvestigationCapability.RESEARCH,
+        "fetch_external_evidence": InvestigationCapability.RESEARCH,
+        "link_external_evidence": InvestigationCapability.RESEARCH,
     }
 
 
