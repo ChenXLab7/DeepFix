@@ -10,9 +10,12 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from deepfix.agent import build_agent
 from deepfix.approval import ApprovalPolicy
 from deepfix.backend import build_backend
+from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config, state_database_path
 from deepfix.extensions import AgentExtensions, build_research_extensions
+from deepfix.investigation.coordinator import InvestigationCoordinator
+from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import TaskState, TaskStatus
 from deepfix.persistence import TaskRepository
@@ -167,6 +170,14 @@ def main(
     working_memory_store = WorkingMemoryStore(config.database_path)
     compaction_store = CompactionStore(config.database_path)
     research_evidence_store = ResearchEvidenceStore(config.database_path)
+    investigation = InvestigationCoordinator(
+        store=InvestigationStore(config.database_path),
+        tasks=repository,
+        compaction_store=compaction_store,
+        evidence_collector=EvidenceCollector(
+            compaction_store, research_evidence_store
+        ),
+    )
     artifact_backend = build_backend(config)
     with build_research_client() as client:
         extensions = build_cli_research_extensions(
@@ -185,6 +196,7 @@ def main(
                 compaction_store=compaction_store,
                 extensions=extensions,
                 research_evidence_store=research_evidence_store,
+                investigation=investigation,
                 backend=artifact_backend,
             )
             service = BugfixService(
@@ -195,6 +207,7 @@ def main(
                 working_memory_store,
                 research_evidence_store,
                 compaction_store,
+                investigation,
             )
             if args.command == "new":
                 task = service.start(args.problem)

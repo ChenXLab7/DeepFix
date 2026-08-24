@@ -184,6 +184,7 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
         compaction_store=None,
         extensions=None,
         research_evidence_store=None,
+        investigation=None,
         backend=None,
     ):
         captures["agent_store"] = working_memory_store
@@ -192,6 +193,7 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
         captures["agent_repository"] = task_repository
         captures["agent_compaction_store"] = compaction_store
         captures["agent_backend"] = backend
+        captures["agent_investigation"] = investigation
         return object()
 
     class FakeService:
@@ -204,11 +206,13 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
             working_memory_store,
             research_evidence_store,
             compaction_store,
+            investigation,
         ):
             captures["service_store"] = working_memory_store
             captures["service_research_store"] = research_evidence_store
             captures["service_compaction_store"] = compaction_store
             captures["service_repository"] = repository
+            captures["service_investigation"] = investigation
             self.config = config
 
         def start(self, problem):
@@ -235,6 +239,7 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
     assert isinstance(captures["agent_research_store"], ResearchEvidenceStore)
     assert captures["agent_repository"] is captures["service_repository"]
     assert captures["agent_compaction_store"] is captures["service_compaction_store"]
+    assert captures["agent_investigation"] is captures["service_investigation"]
     assert captures["agent_backend"] is not None
     assert {item.tool.name for item in captures["extensions"].tools} == {
         "inspect_dependency",

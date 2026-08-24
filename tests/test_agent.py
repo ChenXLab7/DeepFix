@@ -1,4 +1,8 @@
 import pytest
+from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import StructuredTool
 from langchain_deepseek import ChatDeepSeek
 from langgraph.checkpoint.memory import InMemorySaver
@@ -47,6 +51,8 @@ def test_agent_exposes_repair_tools_without_subagent_task_tool(agent):
         "execute",
         "save_progress",
         "compact_conversation",
+        "record_hypothesis",
+        "continue_investigation",
     } <= tools.keys()
 
 
@@ -152,9 +158,11 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert tool_names.count("search_technical_sources") == 1
     assert tool_names.count("fetch_external_evidence") == 1
     assert tool_names.count("link_external_evidence") == 1
-    assert middleware_names[:5] == [
+    assert middleware_names[:7] == [
         "MessageIdentityMiddleware",
         "LegacyContextMigrationMiddleware",
+        "InvestigationMigrationMiddleware",
+        "InvestigationMiddleware",
         "PromptPolicyMiddleware",
         "ProtectedContextMiddleware",
         "DeepFixCompactionMiddleware",
@@ -165,7 +173,7 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
         "ContextMemoryMiddleware",
         "ResearchEvidenceMiddleware",
     } & set(middleware_names)
-    identity, migration, prompt, protected, compaction = middleware[:5]
+    identity, migration, _, _, prompt, protected, compaction = middleware[:7]
     assert isinstance(identity, MessageIdentityMiddleware)
     assert type(migration).__name__ == "LegacyContextMigrationMiddleware"
     assert isinstance(prompt, PromptPolicyMiddleware)
@@ -192,3 +200,44 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert registered["profile"].excluded_middleware == frozenset(
         {"SummarizationMiddleware"}
     )
+
+
+class _RecordingMiddleware(AgentMiddleware):
+    def __init__(self, label, calls):
+        self.label = label
+        self.calls = calls
+
+    def wrap_model_call(self, request, handler):
+        self.calls.append(f"{self.label}:before")
+        response = handler(request)
+        self.calls.append(f"{self.label}:after")
+        return response
+
+
+class _FirstRecordingMiddleware(_RecordingMiddleware):
+    pass
+
+
+class _SecondRecordingMiddleware(_RecordingMiddleware):
+    pass
+
+
+def test_model_middleware_list_is_outermost_first_for_installed_langchain():
+    calls = []
+    agent = create_agent(
+        model=FakeListChatModel(responses=["done"]),
+        tools=[],
+        middleware=[
+            _FirstRecordingMiddleware("first", calls),
+            _SecondRecordingMiddleware("second", calls),
+        ],
+    )
+
+    agent.invoke({"messages": [HumanMessage(content="run")]})
+
+    assert calls == [
+        "first:before",
+        "second:before",
+        "second:after",
+        "first:after",
+    ]

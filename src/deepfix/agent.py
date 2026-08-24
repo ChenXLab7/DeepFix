@@ -33,6 +33,19 @@ from deepfix.compaction.tools import build_compact_conversation_tool
 from deepfix.config import AppConfig, ModelRoleConfig
 from deepfix.context import build_save_progress_tool
 from deepfix.extensions import AgentExtensions, merge_extensions
+from deepfix.investigation.coordinator import InvestigationCoordinator
+from deepfix.investigation.middleware import InvestigationMiddleware
+from deepfix.investigation.migration import (
+    InvestigationMigrationMiddleware,
+    InvestigationMigrator,
+)
+from deepfix.investigation.models import InvestigationCapability
+from deepfix.investigation.receipts import ToolExecutionReceiptStore
+from deepfix.investigation.store import InvestigationStore
+from deepfix.investigation.tools import (
+    build_continue_investigation_tool,
+    build_record_hypothesis_tool,
+)
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import RepairOutcome
 from deepfix.persistence import TaskRepository
@@ -75,6 +88,7 @@ def build_agent(
     working_memory_store: WorkingMemoryStore,
     task_repository: TaskRepository | None = None,
     compaction_store: CompactionStore | None = None,
+    investigation: InvestigationCoordinator | None = None,
     extensions: AgentExtensions | None = None,
     research_evidence_store: ResearchEvidenceStore | None = None,
     *,
@@ -97,12 +111,24 @@ def build_agent(
         config.database_path
     )
     evidence_collector = EvidenceCollector(compaction, research)
+    investigation_store = (
+        investigation.store
+        if investigation is not None
+        else InvestigationStore(config.database_path)
+    )
+    investigation = investigation or InvestigationCoordinator(
+        store=investigation_store,
+        tasks=tasks,
+        compaction_store=compaction,
+        evidence_collector=evidence_collector,
+    )
     protected_builder = ProtectedContextBuilder(
         tasks,
         working_memory_store,
         compaction,
         research,
         evidence_collector,
+        investigation_store,
     )
     budget_monitor = ContextBudgetMonitor()
     coordinator = CompactionCoordinator(
@@ -117,6 +143,8 @@ def build_agent(
     )
     save_progress = build_save_progress_tool(working_memory_store)
     compact_conversation = build_compact_conversation_tool(coordinator)
+    record_hypothesis = build_record_hypothesis_tool(investigation)
+    continue_investigation = build_continue_investigation_tool(investigation)
     core_tool_names = {
         "ls",
         "read_file",
@@ -128,12 +156,33 @@ def build_agent(
         "execute",
         "save_progress",
         "compact_conversation",
+        "record_hypothesis",
+        "continue_investigation",
     }
     resolved = merge_extensions(
         extensions or AgentExtensions(),
         existing_tool_names=core_tool_names,
         allowed_skill_roots=tuple(allowed_skill_roots),
     )
+    capabilities = {
+        "ls": InvestigationCapability.READ,
+        "read_file": InvestigationCapability.READ,
+        "write_file": InvestigationCapability.MODIFY,
+        "edit_file": InvestigationCapability.MODIFY,
+        "delete": InvestigationCapability.MODIFY,
+        "glob": InvestigationCapability.SEARCH,
+        "grep": InvestigationCapability.SEARCH,
+        "execute": InvestigationCapability.EXECUTE,
+        "save_progress": InvestigationCapability.MEMORY,
+        "compact_conversation": InvestigationCapability.COMPACTION,
+        "record_hypothesis": InvestigationCapability.META,
+        "continue_investigation": InvestigationCapability.META,
+        **{
+            item.tool.name: item.investigation_capability
+            for item in resolved.tools
+            if item.investigation_capability is not None
+        },
+    }
     core_interrupts = {
         "write_file": True,
         "edit_file": True,
@@ -146,6 +195,8 @@ def build_agent(
         tools=[
             save_progress,
             compact_conversation,
+            record_hypothesis,
+            continue_investigation,
             *(item.tool for item in resolved.tools),
         ],
         middleware=[
@@ -154,7 +205,20 @@ def build_agent(
                 LegacyContextStores(tasks, working_memory_store, compaction),
                 DeepAgentsArtifactAdapter(resolved_backend),
             ),
-            PromptPolicyMiddleware(working_memory_store),
+            InvestigationMigrationMiddleware(
+                InvestigationMigrator(
+                    tasks=tasks,
+                    store=investigation_store,
+                    compaction_store=compaction,
+                    memory=working_memory_store,
+                )
+            ),
+            InvestigationMiddleware(
+                investigation,
+                ToolExecutionReceiptStore(resolved_backend),
+                capabilities,
+            ),
+            PromptPolicyMiddleware(investigation_store),
             ProtectedContextMiddleware(protected_builder),
             DeepFixCompactionMiddleware(
                 protected_builder,
