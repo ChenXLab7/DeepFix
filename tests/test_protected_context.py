@@ -19,6 +19,10 @@ from deepfix.compaction.models import (
 )
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode
+from deepfix.investigation.models import (
+    InvestigationHypothesis,
+    InvestigationState,
+)
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore, WorkingMemoryVersion
 from deepfix.models import TaskState
 from deepfix.persistence import TaskRepository
@@ -199,6 +203,71 @@ def test_projection_globally_deduplicates_current_entities():
     assert rendered.count('hypothesis_id="hyp-1"') == 1
     assert rendered.count('claim_id="claim-1"') == 1
     assert "conversation_history/task-a.md" in rendered
+
+
+def test_investigation_support_merges_into_existing_hypothesis_once():
+    hypothesis = HypothesisRecord(
+        hypothesis_id="hyp-1",
+        text="边界分支错误",
+        state="active",
+        updated_in_version=1,
+    )
+    memory = WorkingMemoryVersion(
+        task_id="task-a",
+        version=1,
+        snapshot=ProgressSnapshot(
+            phase="investigating",
+            summary="调查",
+            active_hypotheses=[hypothesis],
+        ),
+        created_at="2026-08-22T00:00:00+00:00",
+    )
+    investigation = InvestigationState.new("task-a").model_copy(
+        update={
+            "hypotheses": [
+                InvestigationHypothesis(
+                    hypothesis_id="hyp-1",
+                    statement="边界分支错误",
+                    state="supported",
+                    evidence_ids=["evidence-1"],
+                    checked_locations=[],
+                    reason="system evidence supports it",
+                )
+            ],
+            "supported_hypothesis_ids": ["hyp-1"],
+        }
+    )
+    anchor = TaskAnchor(
+        task_id="task-a",
+        task_goal="修复错误",
+        latest_user_message_id="user-1",
+        project_root="C:/project",
+        project_python="C:/python.exe",
+        task_status="investigating",
+    )
+    evidence = DeterministicEvidenceBlock(
+        approvals=[
+            ApprovalEvidence(
+                evidence_id="evidence-1",
+                operation="execute",
+                decision="approve",
+                risk="L2",
+            )
+        ]
+    )
+    context = ProtectedContext(
+        anchor,
+        memory,
+        evidence,
+        None,
+        investigation_state=investigation,
+    )
+
+    rendered = render_protected_context(context)
+
+    assert rendered.count('hypothesis_id="hyp-1"') == 1
+    assert rendered.count('evidence_id="evidence-1"') == 1
+    assert 'investigation_support="supported"' in rendered
 
 
 class _Throwing:

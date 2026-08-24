@@ -29,6 +29,7 @@ from deepfix.investigation.models import (
     CheckedFile,
     CheckedLocation,
     ContinueInvestigationInput,
+    InvestigationCapability,
     InvestigationEventType,
     InvestigationHypothesis,
     InvestigationPermit,
@@ -49,6 +50,74 @@ from deepfix.persistence import TaskRepository
 class ToolAuthorization:
     allowed: bool
     permit_id: str | None = None
+
+
+_PHASE_CAPABILITIES: dict[AgentPhase, frozenset[InvestigationCapability]] = {
+    AgentPhase.CLARIFYING: frozenset(
+        {
+            InvestigationCapability.META,
+            InvestigationCapability.MEMORY,
+            InvestigationCapability.COMPACTION,
+        }
+    ),
+    AgentPhase.INVESTIGATING: frozenset(
+        {
+            InvestigationCapability.READ,
+            InvestigationCapability.SEARCH,
+            InvestigationCapability.EXECUTE,
+            InvestigationCapability.RESEARCH,
+            InvestigationCapability.META,
+            InvestigationCapability.MEMORY,
+            InvestigationCapability.COMPACTION,
+        }
+    ),
+    AgentPhase.DIAGNOSING: frozenset(
+        {
+            InvestigationCapability.READ,
+            InvestigationCapability.SEARCH,
+            InvestigationCapability.EXECUTE,
+            InvestigationCapability.RESEARCH,
+            InvestigationCapability.META,
+            InvestigationCapability.MEMORY,
+            InvestigationCapability.COMPACTION,
+        }
+    ),
+    AgentPhase.PLANNING: frozenset(InvestigationCapability),
+    AgentPhase.EDITING: frozenset(
+        {
+            InvestigationCapability.READ,
+            InvestigationCapability.SEARCH,
+            InvestigationCapability.EXECUTE,
+            InvestigationCapability.MODIFY,
+            InvestigationCapability.META,
+            InvestigationCapability.MEMORY,
+            InvestigationCapability.COMPACTION,
+        }
+    ),
+    AgentPhase.TESTING: frozenset(
+        {
+            InvestigationCapability.READ,
+            InvestigationCapability.SEARCH,
+            InvestigationCapability.EXECUTE,
+            InvestigationCapability.META,
+            InvestigationCapability.MEMORY,
+            InvestigationCapability.COMPACTION,
+        }
+    ),
+    AgentPhase.REVIEWING: frozenset(
+        {
+            InvestigationCapability.READ,
+            InvestigationCapability.SEARCH,
+            InvestigationCapability.EXECUTE,
+            InvestigationCapability.META,
+            InvestigationCapability.MEMORY,
+            InvestigationCapability.COMPACTION,
+        }
+    ),
+}
+_REEVALUATION_TOOL_NAMES = frozenset(
+    {"record_hypothesis", "continue_investigation", "save_progress"}
+)
 
 
 class InvestigationCoordinator:
@@ -73,6 +142,23 @@ class InvestigationCoordinator:
 
     def ensure_started(self, task_id: str) -> InvestigationState:
         return self.state(task_id)
+
+    def project_python(self, task_id: str) -> str:
+        return self.tasks.get(task_id).project_python
+
+    def allowed_tool_names(
+        self,
+        state: InvestigationState,
+        capabilities: Mapping[str, InvestigationCapability],
+    ) -> set[str]:
+        if state.stagnation_level > 0 or state.reevaluation_required:
+            return set(_REEVALUATION_TOOL_NAMES) & set(capabilities)
+        allowed_capabilities = _PHASE_CAPABILITIES[state.agent_phase]
+        return {
+            name
+            for name, capability in capabilities.items()
+            if capability in allowed_capabilities
+        }
 
     def state(self, task_id: str) -> InvestigationState:
         try:

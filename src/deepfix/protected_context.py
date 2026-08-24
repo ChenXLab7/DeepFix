@@ -21,6 +21,8 @@ from deepfix.compaction.models import (
 )
 from deepfix.compaction.store import CompactionStore
 from deepfix.context import render_working_memory
+from deepfix.investigation.models import InvestigationState
+from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore, WorkingMemoryVersion
 from deepfix.persistence import TaskRepository
 from deepfix.prompting import model_request_task_id
@@ -33,6 +35,7 @@ class ProtectedContext:
     working_memory: WorkingMemoryVersion | None
     deterministic_evidence: DeterministicEvidenceBlock
     active_snapshot: CompactionSnapshot | None
+    investigation_state: InvestigationState | None = None
 
 
 @dataclass(frozen=True)
@@ -51,12 +54,14 @@ class ProtectedContextBuilder:
         compaction: CompactionStore,
         research: ResearchEvidenceStore,
         collector: EvidenceCollector,
+        investigation: InvestigationStore | None = None,
     ) -> None:
         self.tasks = tasks
         self.memory = memory
         self.compaction = compaction
         self.research = research
         self.collector = collector
+        self.investigation = investigation
 
     def build(
         self,
@@ -79,6 +84,9 @@ class ProtectedContextBuilder:
                 normalized_event,
             )
             evidence = self.collector.collect(task_id, request_messages, task)
+            investigation_state = (
+                self.investigation.load(task_id) if self.investigation else None
+            )
         except Exception as exc:
             raise ProtectedContextLoadError(
                 ContextRecoveryMetadata(
@@ -121,7 +129,13 @@ class ProtectedContextBuilder:
             project_python=task.project_python,
             task_status=task.status.value,
         )
-        return ProtectedContext(anchor, memory_version, evidence, active_snapshot)
+        return ProtectedContext(
+            anchor,
+            memory_version,
+            evidence,
+            active_snapshot,
+            investigation_state=investigation_state,
+        )
 
 
 class ProtectedContextProjector:
@@ -133,7 +147,7 @@ class ProtectedContextProjector:
         snapshot = snapshot if snapshot is not None else context.active_snapshot
         memory = _memory_with_snapshot_provenance(context.working_memory, snapshot)
         anchor_xml = _render_anchor(context.task_anchor)
-        memory_xml = _render_memory(memory)
+        memory_xml = _render_memory(memory, context.investigation_state)
         evidence_xml = _render_deterministic_evidence(
             context.deterministic_evidence
         )
@@ -142,6 +156,7 @@ class ProtectedContextProjector:
             context.task_anchor,
             memory,
             context.deterministic_evidence,
+            context.investigation_state,
         )
         if visible_snapshot:
             memory_xml = memory_xml.replace(
@@ -220,23 +235,72 @@ def _render_anchor(anchor: TaskAnchor) -> str:
     return "\n".join(lines)
 
 
-def _render_memory(memory: WorkingMemoryVersion | None) -> str:
+def _render_memory(
+    memory: WorkingMemoryVersion | None,
+    investigation: InvestigationState | None,
+) -> str:
     if memory is not None:
-        return render_working_memory(memory)
-    return (
-        '<deepfix_working_memory version="none">\n'
-        "<facts></facts>\n"
-        "<active_hypotheses></active_hypotheses>\n"
-        "<rejected_hypotheses></rejected_hypotheses>\n"
-        "<confirmed_hypotheses></confirmed_hypotheses>\n"
-        "<evidence></evidence>\n"
-        "<checked_files></checked_files>\n"
-        "<experiments></experiments>\n"
-        "<next_steps></next_steps>\n"
-        "<unresolved_questions></unresolved_questions>\n"
-        "<coverage></coverage>\n"
-        "</deepfix_working_memory>"
-    )
+        rendered = render_working_memory(memory)
+    else:
+        rendered = (
+            '<deepfix_working_memory version="none">\n'
+            "<facts></facts>\n"
+            "<active_hypotheses></active_hypotheses>\n"
+            "<rejected_hypotheses></rejected_hypotheses>\n"
+            "<confirmed_hypotheses></confirmed_hypotheses>\n"
+            "<evidence></evidence>\n"
+            "<checked_files></checked_files>\n"
+            "<experiments></experiments>\n"
+            "<next_steps></next_steps>\n"
+            "<unresolved_questions></unresolved_questions>\n"
+            "<coverage></coverage>\n"
+            "</deepfix_working_memory>"
+        )
+    return _merge_investigation_hypotheses(rendered, memory, investigation)
+
+
+def _merge_investigation_hypotheses(
+    rendered: str,
+    memory: WorkingMemoryVersion | None,
+    investigation: InvestigationState | None,
+) -> str:
+    if investigation is None:
+        return rendered
+    memory_ids = {
+        item.hypothesis_id for item in memory.snapshot.all_hypotheses()
+    } if memory else set()
+    for item in investigation.hypotheses:
+        escaped_id = _xml(item.hypothesis_id, 120)
+        support = item.state
+        if item.hypothesis_id in memory_ids:
+            marker = f'<hypothesis hypothesis_id="{escaped_id}">'
+            rendered = rendered.replace(
+                marker,
+                (
+                    f'<hypothesis hypothesis_id="{escaped_id}" '
+                    f'investigation_support="{support}">'
+                ),
+                1,
+            )
+            continue
+        section = (
+            "rejected_hypotheses"
+            if item.state == "rejected"
+            else "active_hypotheses"
+        )
+        addition = (
+            f'<hypothesis hypothesis_id="{escaped_id}" '
+            f'investigation_support="{support}">'
+            f"<text>{_xml(item.statement, 500)}</text>"
+            f"<reason>{_xml(item.reason, 500)}</reason>"
+            "</hypothesis>"
+        )
+        rendered = rendered.replace(
+            f"</{section}>",
+            f"{addition}\n</{section}>",
+            1,
+        )
+    return rendered
 
 
 def _render_deterministic_evidence(block: DeterministicEvidenceBlock) -> str:
@@ -288,6 +352,7 @@ def _render_visible_snapshot(
     anchor: TaskAnchor,
     memory: WorkingMemoryVersion | None,
     evidence: DeterministicEvidenceBlock,
+    investigation: InvestigationState | None,
 ) -> str | None:
     if snapshot is None:
         return None
@@ -297,6 +362,10 @@ def _render_visible_snapshot(
     hypothesis_ids = {
         item.hypothesis_id for item in memory.snapshot.all_hypotheses()
     } if memory else set()
+    if investigation is not None:
+        hypothesis_ids.update(
+            item.hypothesis_id for item in investigation.hypotheses
+        )
     constraint_ids = {item.constraint_id for item in anchor.user_constraints}
     evidence_ids = {
         item.evidence_id
