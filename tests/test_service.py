@@ -21,7 +21,10 @@ from deepfix.compaction.models import (
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config
 from deepfix.investigation.coordinator import InvestigationCoordinator
-from deepfix.investigation.errors import InvestigationStagnationError
+from deepfix.investigation.errors import (
+    InvestigationStagnationError,
+    InvestigationStateError,
+)
 from deepfix.investigation.models import (
     AgentPhase,
     InvestigationRecoveryMetadata,
@@ -694,6 +697,21 @@ class ForeignInvestigationErrorAgent:
         raise InvestigationStagnationError(investigation_recovery("other-task"))
 
 
+class DiagnosticArtifactErrorAgent:
+    def __init__(self, recovery_task_id: str | None = None):
+        self.recovery_task_id = recovery_task_id
+
+    def invoke(self, value, config):
+        task_id = self.recovery_task_id or config["configurable"]["thread_id"]
+        recovery = investigation_recovery(task_id).model_copy(
+            update={
+                "error_code": "diagnostic_artifact_backend_read_failed",
+                "recovery_action": "pause_and_retry_diagnostic_artifact_read",
+            }
+        )
+        raise InvestigationStateError(recovery)
+
+
 def test_investigation_error_pauses_and_persists_metadata(app_config):
     coordinator = service_coordinator(app_config)
     service, repository = make_service(
@@ -719,6 +737,37 @@ def test_foreign_investigation_recovery_task_id_fails_closed(app_config):
 
     assert task.status is TaskStatus.FAILED
     assert "其他任务" in task.final_summary
+
+
+def test_diagnostic_artifact_system_error_pauses_only_at_service_boundary(
+    app_config,
+):
+    service, repository = make_service(
+        app_config,
+        DiagnosticArtifactErrorAgent(),
+    )
+
+    task = service.start("recover archived traceback")
+
+    assert task.status is TaskStatus.PAUSED
+    assert task.investigation_recovery.error_code == (
+        "diagnostic_artifact_backend_read_failed"
+    )
+    assert repository.get(task.task_id).status is TaskStatus.PAUSED
+
+
+def test_foreign_diagnostic_artifact_recovery_fails_closed(app_config):
+    service, repository = make_service(
+        app_config,
+        DiagnosticArtifactErrorAgent("other-task"),
+    )
+
+    task = service.start("recover archived traceback")
+
+    assert task.status is TaskStatus.FAILED
+    assert task.investigation_recovery is None
+    assert "其他任务" in task.final_summary
+    assert repository.get(task.task_id).status is TaskStatus.FAILED
 
 
 def test_needs_input_synchronizes_agent_phase_to_clarifying(app_config):
