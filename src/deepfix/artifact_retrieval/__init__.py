@@ -1,3 +1,4 @@
+from deepfix.artifact_retrieval.collector import ArtifactReferenceCollector
 from deepfix.artifact_retrieval.errors import (
     DiagnosticArtifactSystemError,
     DiagnosticArtifactToolError,
@@ -13,6 +14,7 @@ from deepfix.artifact_retrieval.models import (
 )
 
 __all__ = [
+    "ArtifactReferenceCollector",
     "DiagnosticArtifactCatalog",
     "DiagnosticArtifactDescriptor",
     "DiagnosticArtifactKind",
