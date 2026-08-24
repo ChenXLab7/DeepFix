@@ -128,14 +128,14 @@ class InvestigationMiddleware(AgentMiddleware):
                 )
             return task_id, receipt
 
-        state = self.coordinator.state(task_id)
-        self.coordinator.authorize_tool(
+        authorization = self.coordinator.authorize_tool(
             task_id,
             name,
             _tool_arguments(request.tool_call),
         )
+        state = self.coordinator.state(task_id)
         allowed = self.coordinator.allowed_tool_names(state, self.capabilities)
-        if name not in allowed:
+        if name not in allowed and authorization.permit_id is None:
             raise self._state_error(
                 task_id,
                 "tool_not_allowed_in_agent_phase",
