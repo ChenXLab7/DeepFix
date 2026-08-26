@@ -1,7 +1,7 @@
 # DeepFix 能力导向 Agent Loop 设计
 
 日期：2026-08-26  
-状态：根据第二轮审阅修订，待复审
+状态：已通过复审，架构冻结
 适用范围：DeepFix Python Bug 修复 Agent 的调查、修改、验证与结论生成流程
 
 ## 1. 背景
@@ -215,7 +215,7 @@ class SemanticSuccessCriterion(StrictModel):
     description: str
     question: str
     required_evidence_types: set[EvidenceType]
-    minimum_source_count: int = 1
+    minimum_independent_root_count: int = 1
     required: bool = True
 
 
@@ -230,8 +230,14 @@ SuccessCriterion = Annotated[
 不能接受模型生成的可执行表达式。
 
 语义条件包括“现有证据是否支持 foo() 是根因”或“H2 是否比 H1 更符合观察”。它必须声明问题、所需证据
-类型和最少来源数；EvidenceEvaluator 只有在来源校验通过后才调用主模型判断。一个 Criterion 的 kind 在
-Experiment 执行期间不能由 Executor 修改。
+类型和最少独立 provenance root 数；EvidenceEvaluator 只有在来源校验通过后才调用主模型判断。一个
+Criterion 的 kind 在 Experiment 执行期间不能由 Executor 修改。
+
+每个 Evidence/Observation/Claim 保存系统生成的 `provenance_root_ids`。派生对象继承其全部父来源的 root，
+不能把 Observation、Claim 和 Summary 各自算成独立来源。重复读取相同文件内容和范围、在相同
+`code_state_hash` 上重复同一测试，或对同一外部文档生成多个摘要，必须归一到同一个 root fingerprint；
+用户消息、不同代码状态的真实执行、不同原始文档或具有独立内容来源的观测才可能形成不同 root。
+`minimum_independent_root_count` 统计去重后的 root ID，模型不能创建或改写这些 ID。
 
 ```python
 class ExperimentSpec(BaseModel):
@@ -417,8 +423,8 @@ editing，修改后验证为 testing，证据足以裁决为 reviewing。这样�
 
 ### 10.3 实验级停滞
 
-停滞比较 Experiment 的目标假设、Evidence Gap、证据来源、策略族、工具参数和执行前后 Blackboard
-版本：
+停滞比较 Experiment 的目标假设、Evidence Gap、证据来源、策略族、工具参数和执行前后的
+`progress_fingerprint`，不直接比较 Blackboard version：
 
 1. 第一次无进展：反馈失败原因，允许 Planner 重新规划；
 2. 连续第二次无进展：强制 `REFLECT`，比较至少两条替代策略；
@@ -426,15 +432,62 @@ editing，修改后验证为 testing，证据足以裁决为 reviewing。这样�
    是否需要 Subagent；
 4. 仍无进展或任务硬预算耗尽：返回 `PAUSED`、`NEEDS_INPUT` 或 `BLOCKED`。
 
-只有策略实质重复且 Blackboard 没有变化才算循环。代码哈希变化后重新运行同一测试是正常验证，不算
-重复。
+`progress_fingerprint` 只包含已关闭 Evidence Gap ID、独立新增 provenance root、由真实证据驱动的假设
+supported/rejected 迁移、`code_state_hash`、新测试结果指纹和新的用户约束/信息 ID。它排除 timestamp、
+普通 Event sequence、Working Memory 更新、Artifact 访问、纯措辞 Claim 和没有独立 root 的弱假设。
+
+只有策略实质重复且 progress fingerprint 没有变化才算循环。Blackboard version 可以因审计事件或弱进展
+增长，但不能据此重置停滞；代码 hash 变化后重新运行同一测试是正常验证，不算重复。
 
 ## 11. OutcomeAdjudicator
 
-Planner 可以建议结束，系统根据任务约束、复现、修改、测试、审批和未解决问题裁决：
+### 11.1 `VerificationPolicy`
 
-- `FIXED`：发生允许范围内的真实修改；修改后的用户指定验证或仓库原有测试通过；修改与根因证据有关；
-  无范围违规。Agent 生成测试或最小复现通过不能单独满足该条件。
+Task 创建时由系统根据用户指定验证、项目测试配置和任务约束构造并版本化 VerificationPolicy，避免
+Adjudicator 在结束时临时选择有利测试：
+
+```python
+class VerificationOracle(StrictModel):
+    oracle_id: str
+    origin: Literal["user_specified", "repository_existing"]
+    command: str
+    scope: Literal["targeted", "module", "full_suite"]
+    role: Literal["required", "supplemental"]
+    expected_exit_code: int = 0
+    required_timing: Literal["baseline", "post_change"]
+    relevant_paths: list[str]
+
+
+class VerificationPolicy(StrictModel):
+    policy_id: str
+    task_id: str
+    version: int
+    required_oracles: list[VerificationOracle]
+    supplemental_oracles: list[VerificationOracle]
+    conflict_rules: list[OracleConflictRule]
+```
+
+用户明确指定的验证命令默认是 required oracle；从仓库配置发现的 targeted、module 或 full-suite 命令按
+用户约束和项目策略确定 required 或 supplemental。Agent 生成测试和最小复现永远不能成为 required
+oracle。required oracle 不能因执行失败或结果不利被静默删除；不可执行时必须产生确定性证据，并使结果
+进入 `PARTIALLY_VERIFIED`、`BLOCKED` 或 `NEEDS_INPUT`，不能裁决 `FIXED`。
+
+Policy 在第一次修改前冻结。用户可以修改用户约束；系统只能通过带原因和来源的版本化 Policy Event 加入
+新发现的仓库 Oracle 或更新可执行状态，不能把失败 Oracle 降级为 supplemental。所有 post-change
+required oracle 必须在同一个 `code_state_hash` 或其无代码变化后继状态上通过。
+
+`FIXED` 要求所有可执行 required oracle 满足，并且不存在更高权威的冲突证据。即使 targeted required
+oracle 通过，同一代码状态下与修改路径存在确定性依赖关系的仓库 module/full-suite 失败仍阻止 FIXED；
+无法确定相关性时创建 REVIEW Evidence Gap，而不是忽略失败。Supplemental evidence 可以提高或降低信心，
+但不能替代 required oracle。
+
+### 11.2 Outcome 规则
+
+Planner 可以建议结束，系统根据 VerificationPolicy、任务约束、复现、修改、测试、审批和未解决问题
+裁决：
+
+- `FIXED`：发生允许范围内的真实修改；所有可执行 required oracle 在修改后通过；不存在更高权威冲突
+  证据；修改与根因证据有关；无范围违规。Agent 生成测试或最小复现通过不能单独满足该条件。
 - `NOT_REPRODUCED`：修改前指定测试通过或用户报告无法复现；没有无依据修改；报告明确指出与用户描述
   不一致。
 - `PARTIALLY_VERIFIED`：修改完成但只能执行局部验证，或完整回归因环境受限无法执行。
@@ -466,7 +519,32 @@ Planner 的 `CONCLUDE` 证据不足时，Adjudicator 创建新的 Evidence Gap �
 评测 Harness 必须总是创建全新 Workspace。旧任务迁移到新 Loop 时，如果无法证明现有目录的 Baseline，
 任务暂停并要求建立恢复快照，不能猜测哪些修改由 Agent 产生。
 
-### 12.2 Operation Journal
+### 12.2 Workspace Confinement
+
+独立目录只提供代码版本隔离，不等于 Shell 沙箱。所有文件 Tool 必须先规范化路径，解析 `..`、绝对路径、
+symlink，以及 Windows junction/reparse point，再验证最终 canonical path 位于 Task Workspace 的允许根内；
+创建或替换文件时在提交前重新检查父目录和目标，避免通过链接竞态越界。指向 Workspace 外部的链接默认
+不可读写，除非它是显式登记的只读依赖根。
+
+`EXECUTE` 通过 `WorkspaceCommandRunner` 执行并记录 `confinement_level`。自动执行至少满足：
+
+- cwd 固定为 Task Workspace，HOME、用户配置、缓存和临时目录重定向到 Task 专属目录；
+- 命令中的显式绝对路径和 `..` 目标经过 canonical scope 检查；
+- 拒绝 `git config --global`、系统包安装、修改全局环境和其他已知 Workspace 外副作用；
+- `pip install` 只能进入 Task 专属虚拟环境或显式 `--target` 目录；
+- 子进程继承相同策略，并使用受管进程组、超时和网络策略；
+- Workspace 内的 symlink/junction 不能把读写重定向到允许根之外。
+
+字符串检查无法阻止 `python script.py` 在脚本内部写绝对路径。无人值守执行任意项目代码时，
+`confinement_level=strict` 必须由 OS 沙箱或容器提供：Workspace 和 Task 临时目录是仅有的可写挂载，依赖
+只读挂载，用户目录和系统配置不可写。当前本地 Shell 若无法提供该保证，只能标记为
+`confinement_level=guarded_local`，限制为已分类的诊断/测试命令并执行既有审批；任意脚本或无法证明范围的
+命令不得无人值守执行。工程验收中的“越界副作用零违规”只适用于 strict runner 和 guarded_local 明确
+拒绝的攻击用例，不能把普通 `cwd` 声称为强隔离。
+
+Confinement 负责阻止越界，Operation Journal 负责恢复已经允许且开始执行的副作用；二者不能互相替代。
+
+### 12.3 Operation Journal
 
 所有文件修改和命令执行先在 DeepFix 内部 Artifact/持久化目录写入追加式 Journal：
 
@@ -499,7 +577,7 @@ class OperationJournalEntry(StrictModel):
 Journal 不复制完整 ToolMessage 或大型输出，只保存生命周期、hash 和 Artifact/Receipt 引用。Receipt 仍是
 工具结果权威对象；Journal 解决副作用跨越 Receipt 和数据库提交边界的恢复问题。
 
-### 12.3 恢复协调
+### 12.4 恢复协调
 
 恢复时先冻结对应 Task Workspace，扫描非 committed Journal，再读取真实文件 hash、Git 状态、内部输出
 Artifact 和已有 Receipt：
@@ -535,6 +613,27 @@ Middleware、Executor、Evaluator 和 Reducer 不直接修改业务任务状态�
 预算分为工具级、Experiment 级和 Task 级。工具级限制命令时间和输出；Experiment 级限制工具调用、模型
 调用、Token 和总时间；Task 级限制实验数量、连续无进展实验、总 Token/费用和总运行时间。软预算要求
 Planner 缩小策略，硬预算才暂停。Graph recursion limit 只作为最后保险。
+
+### 13.1 Token 预留与结算
+
+Provider usage 通常在 Model Call 返回后才准确可用，因此每次调用前必须原子预留预算：
+
+```text
+reserved_input  = tokenizer(prompt) + input_safety_margin
+reserved_output = requested_max_output_tokens
+available       = hard_cap - settled - outstanding_reservations
+```
+
+如果 Experiment 或 Task 任一层的 input/output available 无法覆盖本次预留，不发起调用，返回
+`BUDGET_EXHAUSTED` 给外层循环。并行 Model Call 分别持有 reservation，不能超卖同一剩余预算。
+
+调用完成后使用 Provider 的真实 input/output usage 结算并释放差额；Provider 未返回 usage 或调用结果未知
+时，按完整 reservation 计费。若 Provider 报告的真实 usage 因 tokenizer 偏差超过 reservation，记录
+budget breach、扣除真实值并暂停后续 Model Call，不能通过下一轮补偿掩盖越界。宣称“硬 Token 上限”的
+模型必须具有兼容 tokenizer 和可控的最大输出；否则指标标记为 conservative estimate，不声称绝对硬限。
+
+A/B Harness 使用同一预留算法、安全余量和 Provider usage 结算规则。预算状态持久化到 Task/Experiment
+运行记录，以便审批、崩溃和恢复后继续使用同一上限。
 
 ## 14. 模型、Prompt、工具、记忆与 Skill
 
@@ -603,11 +702,13 @@ Planner 或 Evaluator Store。旧任务没有活动 Experiment 时由 Blackboard
 - StrategyDecision、ExperimentSpec、Result 和 Assessment 校验；
 - Executor 只能声明已有 criterion ID，不能注入 status、文件修改或测试证据；
 - deterministic Criterion 不调用模型，semantic Criterion 缺少有效来源时拒绝评估；
+- Semantic Criterion 按独立 provenance root 去重，派生 Observation/Claim 不重复计数；
 - Executor 工具、模型、Token 和时间预算；
+- Model Call 预留、真实 usage 结算、并发 reservation 和 usage unknown 计费；
 - Evaluator 确定性证据优先、Claim 来源校验和进展分类；
 - Reducer 幂等、并发、假设与 Evidence Gap 迁移；
-- Phase 派生和 Experiment 级停滞；
-- OutcomeAdjudicator 六种结果；
+- Phase 派生、progress fingerprint 和 Experiment 级停滞；
+- VerificationPolicy 冻结、required/supplemental 分类、冲突规则和 Outcome 六种结果；
 - 类型化异常和恢复元数据；
 - Workspace Baseline、Journal 生命周期和真实文件 hash 对账；
 - 测试 origin、scope、timing 的确定性分类及证据降级。
@@ -621,8 +722,13 @@ Planner 或 Evaluator Store。旧任务没有活动 Experiment 时由 Blackboard
 - 未变化状态下拒绝相同无效实验；
 - 证据不足的 CONCLUDE 重新产生 Evidence Gap；
 - Executor 声称 Criterion 完成但证据不满足时，Evaluator 保持未完成；
+- targeted required oracle 通过但相关 module/full-suite 失败时不能 FIXED；
+- required oracle 不可执行或被尝试降级时不能 FIXED；
 - 程序本来正确时输出 NOT_REPRODUCED；
 - 修改范围违规阻止 FIXED；
+- `..`、绝对路径、symlink 和 Windows junction 越界被拒绝；guarded_local 拒绝全局配置和无范围脚本；
+- Token 剩余预算不足以覆盖预留时不发起 Model Call；
+- 只新增弱 Claim、Working Memory 或普通 Event 不改变 progress fingerprint，也不重置停滞；
 - 连续实验失败进入 REFLECT 而不是工具循环；
 - 文件修改后 Receipt/Store 故障通过 Workspace 和 Journal 重建结果，不重复执行修改；
 - 命令执行状态未知时停止受管进程、标记 unknown 并暂停，不自动重跑；
@@ -648,8 +754,8 @@ Harness 在运行新 Loop 前固定每个任务的最大总 input token、最大
 - wall time、Experiment 数量和 Artifact Retrieval 次数；
 - 每 100k 总 Token 的成功修复数量，以及每个成功任务的 Token 中位数。
 
-`false FIXED` 定义为任务报告 FIXED，但用户指定 Oracle 未通过、要求的仓库测试未通过、存在未处理范围
-违规，或只有 Agent 生成测试/最小复现支持成功。报告同时给出 `false FIXED / FIXED claims` 和
+`false FIXED` 定义为任务报告 FIXED，但任一可执行 required oracle 未通过、存在更高权威冲突证据、存在
+未处理范围违规，或只有 Agent 生成测试/最小复现支持成功。报告同时给出 `false FIXED / FIXED claims` 和
 `false FIXED / all tasks`，避免分母掩盖问题。Token 优先采用 Provider usage；缺失时使用统一估算器并在
 结果中标记 estimated。
 
@@ -688,10 +794,14 @@ Debug 记录稳定 task/decision/experiment/evidence ID、预算变化和清洗�
    丢失恢复元数据均为零。
 9. 模型 Benchmark 报告 false FIXED rate；其门槛在新 Loop 评测前登记，并显著低于旧 Loop 基线。
 10. 测试证据包含 origin、scope 和 timing；Agent 生成测试或最小复现不能单独证明 FIXED。
-11. 正确识别修改前已通过的任务为 `NOT_REPRODUCED`。
-12. 至少解决三个当前架构稳定失败的代表性 Bug，总体修复成功率明显高于相同模型的现有基线。
-13. A/B 使用相同硬资源上限，并报告 input/output Token、Model/Tool Call、wall time 和成功修复/100k Token。
-14. 连续失败时可观察到假设、证据来源或 Experiment 意图的实质变化，而不是只改变工具表面参数。
-15. Working Memory、Compaction、Artifact Retrieval、Research、审批和 CLI Progress 联合测试无回归。
-16. 只有 A/B 门禁通过才替换生产入口并删除旧 Tool 级策略；不长期维护两套 Loop。
-17. 第一阶段不实现 Multi-Agent、独立角色模型或复杂 Token 调度。
+11. FIXED 满足冻结 VerificationPolicy 的全部可执行 required oracle，且不存在更高权威冲突证据。
+12. 文件 Tool canonicalize 并阻止链接越界；无人值守任意代码只在 strict confinement 下执行。
+13. 正确识别修改前已通过的任务为 `NOT_REPRODUCED`。
+14. 至少解决三个当前架构稳定失败的代表性 Bug，总体修复成功率明显高于相同模型的现有基线。
+15. A/B 使用相同硬资源上限，并报告 input/output Token、Model/Tool Call、wall time 和成功修复/100k Token。
+16. Model Call 在调用前预留、调用后按真实 usage 结算，余额不足时不发起下一次调用。
+17. 停滞使用 progress fingerprint；弱 Claim、时间戳和 Working Memory 更新不能伪造进展。
+18. 连续失败时可观察到假设、证据来源或 Experiment 意图的实质变化，而不是只改变工具表面参数。
+19. Working Memory、Compaction、Artifact Retrieval、Research、审批和 CLI Progress 联合测试无回归。
+20. 只有 A/B 门禁通过才替换生产入口并删除旧 Tool 级策略；不长期维护两套 Loop。
+21. 第一阶段不实现 Multi-Agent、独立角色模型或复杂 Token 调度。
