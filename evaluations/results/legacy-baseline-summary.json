@@ -1,0 +1,385 @@
+{
+  "schema_version": 1,
+  "loop": "legacy",
+  "status": "complete",
+  "manifest_sha256": "a811db99739876c54694965eacf7b0abb1fed38df9a562da9874f2eddf86b2c1",
+  "budget": {
+    "max_input_tokens": 400000,
+    "max_output_tokens": 60000,
+    "max_wall_seconds": 900,
+    "max_tool_calls": 80,
+    "max_side_effects": 10
+  },
+  "case_ids": [
+    "mergesort-buggy",
+    "find-first-buggy",
+    "breadth-first-search-buggy",
+    "quicksort-timeout-buggy",
+    "find-first-correct-control"
+  ],
+  "runs": [
+    {
+      "run_id": "mergesort-buggy-001",
+      "case_id": "mergesort-buggy",
+      "loop": "legacy",
+      "task_id": "c6e30ee317154c8a812b7e6533ac1465",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 341624,
+        "output_tokens": 6086,
+        "model_calls": 24,
+        "tool_calls": 26,
+        "wall_seconds": 132.1248837000021,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "find-first-buggy-001",
+      "case_id": "find-first-buggy",
+      "loop": "legacy",
+      "task_id": "66acef343a7c49e8bc596ca887a87b42",
+      "conclusion": "blocked",
+      "oracle_exit_code": 1,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 125726,
+        "output_tokens": 4679,
+        "model_calls": 13,
+        "tool_calls": 3,
+        "wall_seconds": 193.16323900000134,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": false,
+        "false_fixed": false
+      },
+      "sanitized_error_code": "agent_paused",
+      "budget_violations": []
+    },
+    {
+      "run_id": "breadth-first-search-buggy-001",
+      "case_id": "breadth-first-search-buggy",
+      "loop": "legacy",
+      "task_id": "27dbae79c7d54df5a8f2bea992ee93bf",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 192605,
+        "output_tokens": 4760,
+        "model_calls": 15,
+        "tool_calls": 18,
+        "wall_seconds": 74.83899939999901,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "quicksort-timeout-buggy-001",
+      "case_id": "quicksort-timeout-buggy",
+      "loop": "legacy",
+      "task_id": "573012be66254ae8937f072b47ba7dcb",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 187760,
+        "output_tokens": 4727,
+        "model_calls": 16,
+        "tool_calls": 17,
+        "wall_seconds": 75.05692579999959,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "find-first-correct-control-001",
+      "case_id": "find-first-correct-control",
+      "loop": "legacy",
+      "task_id": "c70d633fb38544178dea292dfeec8438",
+      "conclusion": "blocked",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 32351,
+        "output_tokens": 366,
+        "model_calls": 4,
+        "tool_calls": 5,
+        "wall_seconds": 15.990054200003215,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": false,
+        "false_fixed": false
+      },
+      "sanitized_error_code": "agent_paused",
+      "budget_violations": []
+    },
+    {
+      "run_id": "mergesort-buggy-002",
+      "case_id": "mergesort-buggy",
+      "loop": "legacy",
+      "task_id": "718da7e6ffd0436eacf79fe7dc438055",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 300070,
+        "output_tokens": 5621,
+        "model_calls": 23,
+        "tool_calls": 25,
+        "wall_seconds": 124.51103560000047,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "find-first-buggy-002",
+      "case_id": "find-first-buggy",
+      "loop": "legacy",
+      "task_id": "5dfa9e58336246fdab80dfb36f5c46c1",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 178257,
+        "output_tokens": 5202,
+        "model_calls": 15,
+        "tool_calls": 16,
+        "wall_seconds": 198.60966240000198,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "breadth-first-search-buggy-002",
+      "case_id": "breadth-first-search-buggy",
+      "loop": "legacy",
+      "task_id": "c8832862741247b3b6fbf3a3efedeb6f",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 175011,
+        "output_tokens": 4144,
+        "model_calls": 15,
+        "tool_calls": 17,
+        "wall_seconds": 70.02190289999999,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "quicksort-timeout-buggy-002",
+      "case_id": "quicksort-timeout-buggy",
+      "loop": "legacy",
+      "task_id": "035cb6b03eff424abed8b59932778159",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 174463,
+        "output_tokens": 4643,
+        "model_calls": 15,
+        "tool_calls": 16,
+        "wall_seconds": 74.11796770000001,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "find-first-correct-control-002",
+      "case_id": "find-first-correct-control",
+      "loop": "legacy",
+      "task_id": "9bbd8287340443e8966b8f69d728b285",
+      "conclusion": "blocked",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 42892,
+        "output_tokens": 1111,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "wall_seconds": 23.289315000001807,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": false,
+        "false_fixed": false
+      },
+      "sanitized_error_code": "agent_paused",
+      "budget_violations": []
+    },
+    {
+      "run_id": "mergesort-buggy-003",
+      "case_id": "mergesort-buggy",
+      "loop": "legacy",
+      "task_id": "0c5ab3f1fdbe44c691d36296255d79e8",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 127618,
+        "output_tokens": 3729,
+        "model_calls": 12,
+        "tool_calls": 14,
+        "wall_seconds": 73.24406040000031,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "find-first-buggy-003",
+      "case_id": "find-first-buggy",
+      "loop": "legacy",
+      "task_id": "900bc50460164514a64e636cbb14cdf3",
+      "conclusion": "blocked",
+      "oracle_exit_code": 1,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 121104,
+        "output_tokens": 4195,
+        "model_calls": 13,
+        "tool_calls": 3,
+        "wall_seconds": 188.8350210000026,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": false,
+        "false_fixed": false
+      },
+      "sanitized_error_code": "agent_paused",
+      "budget_violations": []
+    },
+    {
+      "run_id": "breadth-first-search-buggy-003",
+      "case_id": "breadth-first-search-buggy",
+      "loop": "legacy",
+      "task_id": "ae1b92bfc1974375ba0d148e11c665d6",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 151530,
+        "output_tokens": 3707,
+        "model_calls": 13,
+        "tool_calls": 16,
+        "wall_seconds": 62.245910300000105,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "quicksort-timeout-buggy-003",
+      "case_id": "quicksort-timeout-buggy",
+      "loop": "legacy",
+      "task_id": "3fd180c7702d467f9bdf4f35294e0918",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 189769,
+        "output_tokens": 5111,
+        "model_calls": 15,
+        "tool_calls": 17,
+        "wall_seconds": 76.61176350000096,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "find-first-correct-control-003",
+      "case_id": "find-first-correct-control",
+      "loop": "legacy",
+      "task_id": "7a72240b108c48b2980d6339a24315d7",
+      "conclusion": "blocked",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 42709,
+        "output_tokens": 1106,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "wall_seconds": 22.48730070000238,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": false,
+        "false_fixed": false
+      },
+      "sanitized_error_code": "agent_paused",
+      "budget_violations": []
+    }
+  ],
+  "aggregate": {
+    "run_count": 15,
+    "success_count": 10,
+    "success_rate": 0.6666666666666666,
+    "false_fixed_count": 0,
+    "false_fixed_per_fixed_claim": 0.0,
+    "false_fixed_per_all_tasks": 0.0,
+    "not_reproduced_claim_count": 0,
+    "correct_not_reproduced_count": 0,
+    "not_reproduced_accuracy": 0.0,
+    "total_input_tokens": 2383489,
+    "total_output_tokens": 59187,
+    "total_model_calls": 203,
+    "total_tool_calls": 205,
+    "total_wall_seconds": 1405.1480416000159,
+    "successes_per_100k_tokens": 0.4093870820362586,
+    "median_tokens_per_success": 187973.0
+  }
+}
