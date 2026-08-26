@@ -164,6 +164,132 @@ def test_cli_runs_real_harness_with_injected_runner_and_writes_sanitized_summary
     assert "completed baseline" in capsys.readouterr().out
 
 
+def test_cli_run_start_assigns_non_overlapping_run_ids(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("DEEPFIX_RUN_ONLINE", "1")
+    manifest = _write_manifest(tmp_path / "cases.json")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    summary_path = tmp_path / "summary.json"
+
+    code = main(
+        [
+            "baseline",
+            "--manifest",
+            str(manifest),
+            "--project",
+            str(source),
+            "--runs",
+            "2",
+            "--run-start",
+            "2",
+            "--output",
+            str(tmp_path / "runs"),
+            "--summary",
+            str(summary_path),
+        ],
+        runner_factory=lambda _python: FixedRunner(),
+    )
+
+    summary = validate_summary(summary_path)
+    assert code == 0
+    assert [run.run_id for run in summary.runs] == [
+        "sample-buggy-002",
+        "sample-buggy-003",
+    ]
+    assert (tmp_path / "runs" / "sample-buggy" / "002" / "result.json").is_file()
+    assert (tmp_path / "runs" / "sample-buggy" / "003" / "result.json").is_file()
+
+
+def test_cli_rejects_non_positive_run_start(tmp_path) -> None:
+    manifest = _write_manifest(tmp_path / "cases.json")
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "baseline",
+                "--manifest",
+                str(manifest),
+                "--project",
+                str(tmp_path),
+                "--run-start",
+                "0",
+                "--dry-run",
+            ]
+        )
+
+
+def test_cli_merges_compatible_summaries_and_recomputes_aggregate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    first = _write_batch_summary(tmp_path, monkeypatch, run_start=1)
+    second = _write_batch_summary(tmp_path, monkeypatch, run_start=2)
+    merged_path = tmp_path / "merged.json"
+
+    code = main(
+        [
+            "merge-summaries",
+            "--output",
+            str(merged_path),
+            str(first),
+            str(second),
+        ]
+    )
+
+    merged = validate_summary(merged_path)
+    assert code == 0
+    assert [run.run_id for run in merged.runs] == [
+        "sample-buggy-001",
+        "sample-buggy-002",
+    ]
+    assert merged.aggregate.run_count == 2
+    assert merged.aggregate.total_input_tokens == 160
+
+
+def test_cli_merge_rejects_mismatched_budget(tmp_path, monkeypatch, capsys) -> None:
+    first = _write_batch_summary(tmp_path, monkeypatch, run_start=1)
+    second = _write_batch_summary(tmp_path, monkeypatch, run_start=2)
+    raw = json.loads(second.read_text(encoding="utf-8"))
+    raw["budget"]["max_input_tokens"] = 99_999
+    second.write_text(json.dumps(raw), encoding="utf-8")
+
+    code = main(
+        [
+            "merge-summaries",
+            "--output",
+            str(tmp_path / "merged.json"),
+            str(first),
+            str(second),
+        ]
+    )
+
+    assert code == 2
+    assert "budget" in capsys.readouterr().err
+    assert not (tmp_path / "merged.json").exists()
+
+
+def test_cli_merge_rejects_duplicate_run_ids(tmp_path, monkeypatch, capsys) -> None:
+    summary = _write_batch_summary(tmp_path, monkeypatch, run_start=1)
+
+    code = main(
+        [
+            "merge-summaries",
+            "--output",
+            str(tmp_path / "merged.json"),
+            str(summary),
+            str(summary),
+        ]
+    )
+
+    assert code == 2
+    assert "duplicate run" in capsys.readouterr().err
+    assert not (tmp_path / "merged.json").exists()
+
+
 def test_validate_summary_rejects_forbidden_prompt_field(tmp_path) -> None:
     path = tmp_path / "unsafe-summary.json"
     path.write_text(
@@ -259,3 +385,34 @@ def test_cli_stops_repetitions_after_observed_token_budget_exceeded(
     assert runner.calls == 1
     assert summary.status == "stopped_budget"
     assert summary.runs[0].budget_violations == ["max_input_tokens"]
+
+
+def _write_batch_summary(tmp_path, monkeypatch, *, run_start: int) -> Path:
+    monkeypatch.setenv("DEEPFIX_RUN_ONLINE", "1")
+    batch = tmp_path / f"batch-{run_start}"
+    batch.mkdir()
+    manifest = _write_manifest(batch / "cases.json")
+    source = batch / "source"
+    source.mkdir()
+    (source / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    summary = batch / "summary.json"
+    code = main(
+        [
+            "baseline",
+            "--manifest",
+            str(manifest),
+            "--project",
+            str(source),
+            "--runs",
+            "1",
+            "--run-start",
+            str(run_start),
+            "--output",
+            str(batch / "runs"),
+            "--summary",
+            str(summary),
+        ],
+        runner_factory=lambda _python: FixedRunner(),
+    )
+    assert code == 0
+    return summary

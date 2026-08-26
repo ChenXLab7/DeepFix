@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     baseline.add_argument("--project", required=True)
     baseline.add_argument("--python", default=sys.executable)
     baseline.add_argument("--runs", type=_positive_int, default=3)
+    baseline.add_argument("--run-start", type=_positive_int, default=1)
     baseline.add_argument("--case", dest="selected_cases", action="append")
     baseline.add_argument("--output")
     baseline.add_argument("--summary")
@@ -55,6 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate = subparsers.add_parser("validate-summary")
     validate.add_argument("path")
+
+    merge = subparsers.add_parser("merge-summaries")
+    merge.add_argument("summaries", nargs="+")
+    merge.add_argument("--output", required=True)
     return parser
 
 
@@ -75,6 +80,11 @@ def main(
             f"cases={len(summary.case_ids)} runs={len(summary.runs)}"
         )
         return 0
+    if args.command == "merge-summaries":
+        return _merge_summaries(
+            [Path(path) for path in args.summaries],
+            Path(args.output),
+        )
 
     manifest_path = Path(args.manifest).expanduser().resolve()
     try:
@@ -119,7 +129,7 @@ def main(
     graded_runs: list[EvaluationRun] = []
     stopped_budget = False
     for case in cases:
-        for run_index in range(1, args.runs + 1):
+        for run_index in range(args.run_start, args.run_start + args.runs):
             execution = harness.run_case(
                 case,
                 project,
@@ -171,6 +181,64 @@ def validate_summary(path: Path) -> EvaluationSummary:
     if forbidden is not None:
         raise ValueError(f"forbidden summary field: {forbidden}")
     return EvaluationSummary.model_validate(raw)
+
+
+def _merge_summaries(paths: list[Path], output: Path) -> int:
+    if len(paths) < 2:
+        print("merge requires at least two summaries", file=sys.stderr)
+        return 2
+    try:
+        summaries = [validate_summary(path.expanduser().resolve()) for path in paths]
+        first = summaries[0]
+        runs: list[EvaluationRun] = []
+        seen_runs: set[tuple[str, str]] = set()
+        for summary in summaries:
+            _require_compatible_summary(first, summary)
+            for run in summary.runs:
+                identity = (run.case_id, run.run_id)
+                if identity in seen_runs:
+                    raise ValueError(
+                        f"duplicate run: case_id={run.case_id} run_id={run.run_id}"
+                    )
+                seen_runs.add(identity)
+                runs.append(run)
+    except (OSError, ValueError) as error:
+        print(f"cannot merge summaries: {error}", file=sys.stderr)
+        return 2
+
+    merged = EvaluationSummary(
+        loop=first.loop,
+        status=(
+            "stopped_budget"
+            if any(summary.status == "stopped_budget" for summary in summaries)
+            else "complete"
+        ),
+        manifest_sha256=first.manifest_sha256,
+        budget=first.budget,
+        case_ids=first.case_ids,
+        runs=runs,
+        aggregate=aggregate_runs(runs),
+    )
+    output_path = output.expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(merged.model_dump_json(indent=2), encoding="utf-8")
+    print(f"merged summaries: runs={len(runs)} output={output_path}")
+    return 0
+
+
+def _require_compatible_summary(
+    expected: EvaluationSummary,
+    actual: EvaluationSummary,
+) -> None:
+    checks = (
+        ("loop", expected.loop, actual.loop),
+        ("manifest_sha256", expected.manifest_sha256, actual.manifest_sha256),
+        ("budget", expected.budget, actual.budget),
+        ("case_ids", expected.case_ids, actual.case_ids),
+    )
+    for name, expected_value, actual_value in checks:
+        if actual_value != expected_value:
+            raise ValueError(f"incompatible {name}")
 
 
 def _find_forbidden_field(value: Any) -> str | None:
