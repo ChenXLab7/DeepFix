@@ -18,18 +18,17 @@ def build_provenance_batch(
     project: Path,
     project_python: Path,
     run_ids: list[str],
-    *,
-    runner_revision: str | None = None,
 ) -> EvaluationProvenanceBatch:
     source_root = project.expanduser().resolve()
     python_executable = project_python.expanduser().resolve()
     runner_root = _git_root(Path(__file__).resolve().parent)
     source_git_root = _git_root(source_root)
-    source_revision = _git_value(source_root, "rev-parse", "HEAD") or "unversioned"
+    source_revision_value = _git_value(source_root, "rev-parse", "HEAD")
+    source_revision = source_revision_value or "unversioned"
     source_repository = _sanitized_repository(
         _git_value(source_root, "remote", "get-url", "origin")
     )
-    resolved_runner_revision = runner_revision or _git_value(
+    resolved_runner_revision = _git_value(
         runner_root,
         "rev-parse",
         "HEAD",
@@ -39,14 +38,17 @@ def build_provenance_batch(
 
     return EvaluationProvenanceBatch(
         run_ids=run_ids,
+        capture_timing="runtime",
         source_repository=source_repository,
         source_revision=source_revision,
         source_tree_sha256=_source_tree_sha256(source_root),
-        source_dirty=_git_dirty(source_git_root),
-        runner_revision=resolved_runner_revision,
-        runner_dirty=(
-            False if runner_revision is not None else _git_dirty(runner_root)
+        source_dirty=(
+            _git_dirty(source_git_root)
+            if source_revision_value is not None
+            else True
         ),
+        runner_revision=resolved_runner_revision,
+        runner_dirty=_git_dirty(runner_root),
         main_model_name=os.environ.get("DEEPFIX_MAIN_MODEL", "deepseek-v4-pro"),
         compaction_model_name=os.environ.get(
             "DEEPFIX_COMPACTION_MODEL",
@@ -85,8 +87,21 @@ def _git_value(path: Path, *args: str) -> str | None:
 
 
 def _git_dirty(root: Path) -> bool:
-    value = _git_value(root, "status", "--porcelain", "--untracked-files=no")
-    return bool(value)
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError("cannot read Git working tree status") from error
+    if completed.returncode != 0:
+        raise ValueError("cannot read Git working tree status")
+    return bool(completed.stdout.strip())
 
 
 def _sanitized_repository(value: str | None) -> str:

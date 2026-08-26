@@ -69,7 +69,9 @@ class EvaluationHarness:
         if run_index <= 0:
             raise ValueError("run_index must be positive")
 
-        source_root = source.expanduser().resolve()
+        unresolved_source = source.expanduser().absolute()
+        _reject_links_and_junctions(unresolved_source)
+        source_root = unresolved_source.resolve()
         source_directory = (source_root / case.source_subdir).resolve()
         try:
             source_directory.relative_to(source_root)
@@ -77,7 +79,6 @@ class EvaluationHarness:
             raise ValueError("source_subdir escapes source root") from error
         if not source_directory.is_dir():
             raise ValueError(f"source directory does not exist: {source_directory}")
-        _reject_links_and_junctions(source_directory)
 
         allowed_paths = {_normalized_relative(path) for path in case.allowed_paths}
         run_dir = self.runs_root / case.case_id / f"{run_index:03d}"
@@ -182,11 +183,16 @@ def _remove_gold_material(workspace: Path) -> None:
 
 
 def _reject_links_and_junctions(source: Path) -> None:
-    for path in (source, *source.rglob("*")):
-        is_junction = getattr(path, "is_junction", lambda: False)
-        if path.is_symlink() or is_junction():
-            relative = path.relative_to(source) if path != source else Path(".")
-            raise ValueError(f"source contains link or junction: {relative}")
+    _reject_link_or_junction(source, source)
+    for path in source.rglob("*"):
+        _reject_link_or_junction(path, source)
+
+
+def _reject_link_or_junction(path: Path, source: Path) -> None:
+    is_junction = getattr(path, "is_junction", lambda: False)
+    if path.is_symlink() or is_junction():
+        relative = path.relative_to(source) if path != source else Path(".")
+        raise ValueError(f"source contains link or junction: {relative}")
 
 
 def _remove_path(path: Path) -> None:

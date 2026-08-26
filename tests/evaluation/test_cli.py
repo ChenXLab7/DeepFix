@@ -305,8 +305,16 @@ def test_cli_merge_upgrades_complete_legacy_batches_with_explicit_provenance(
 ) -> None:
     first = _write_batch_summary(tmp_path, monkeypatch, run_start=1)
     second = _write_batch_summary(tmp_path, monkeypatch, run_start=2)
-    for path in (first, second):
+    provenance_paths = []
+    for index, path in enumerate((first, second)):
         raw = json.loads(path.read_text(encoding="utf-8"))
+        provenance = raw["provenance"][0]
+        provenance["runner_revision"] = ("a" if index == 0 else "b") * 40
+        provenance["runner_dirty"] = False
+        provenance["capture_timing"] = "historical_backfill"
+        provenance_path = tmp_path / f"provenance-{index + 1}.json"
+        provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+        provenance_paths.append(provenance_path)
         raw.pop("case_expectations")
         raw.pop("expected_runs_per_case")
         raw.pop("provenance")
@@ -318,14 +326,10 @@ def test_cli_merge_upgrades_complete_legacy_batches_with_explicit_provenance(
             "merge-summaries",
             "--manifest",
             str(first.parent / "cases.json"),
-            "--project",
-            str(first.parent / "source"),
-            "--python",
-            sys.executable,
-            "--runner-revision",
-            "a" * 40,
-            "--runner-revision",
-            "b" * 40,
+            "--historical-provenance",
+            str(provenance_paths[0]),
+            "--historical-provenance",
+            str(provenance_paths[1]),
             "--output",
             str(merged_path),
             str(first),
@@ -340,6 +344,10 @@ def test_cli_merge_upgrades_complete_legacy_batches_with_explicit_provenance(
         "a" * 40,
         "b" * 40,
     ]
+    assert all(
+        item.capture_timing == "historical_backfill"
+        for item in merged.provenance
+    )
     assert all(item.runner_dirty is False for item in merged.provenance)
 
 

@@ -381,6 +381,7 @@
         "quicksort-timeout-buggy-001",
         "find-first-correct-control-001"
       ],
+      "capture_timing": "historical_backfill",
       "source_repository": "https://github.com/jkoppel/QuixBugs.git",
       "source_revision": "4257f44b0ff1181dedaedee6a447e133219fcebf",
       "source_tree_sha256": "af561f1971a20044d803f9efecf22df0a74146f926ec2ab15df263d7bc024627",
@@ -403,6 +404,7 @@
         "quicksort-timeout-buggy-002",
         "find-first-correct-control-002"
       ],
+      "capture_timing": "historical_backfill",
       "source_repository": "https://github.com/jkoppel/QuixBugs.git",
       "source_revision": "4257f44b0ff1181dedaedee6a447e133219fcebf",
       "source_tree_sha256": "af561f1971a20044d803f9efecf22df0a74146f926ec2ab15df263d7bc024627",
@@ -425,6 +427,7 @@
         "quicksort-timeout-buggy-003",
         "find-first-correct-control-003"
       ],
+      "capture_timing": "historical_backfill",
       "source_repository": "https://github.com/jkoppel/QuixBugs.git",
       "source_revision": "4257f44b0ff1181dedaedee6a447e133219fcebf",
       "source_tree_sha256": "af561f1971a20044d803f9efecf22df0a74146f926ec2ab15df263d7bc024627",

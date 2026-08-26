@@ -196,8 +196,8 @@ def _run_oracle(
     timeout_seconds: int,
     project_python: Path,
 ) -> int:
-    bound_command = _bind_python_command(command, project_python)
     try:
+        bound_command = _bind_python_command(command, project_python)
         completed = subprocess.run(
             bound_command,
             cwd=workspace,
@@ -211,7 +211,7 @@ def _run_oracle(
         )
     except subprocess.TimeoutExpired:
         return 124
-    except OSError:
+    except (OSError, ValueError):
         return 127
     return completed.returncode
 
@@ -220,7 +220,7 @@ def _bind_python_command(command: str, project_python: Path) -> str:
     stripped = command.lstrip()
     match = re.match(r"(?i)python(?:\.exe)?(?=\s|$)", stripped)
     if match is None:
-        return command
+        raise ValueError("oracle command must start with python")
     executable = subprocess.list2cmdline([str(project_python)])
     return f"{executable}{stripped[match.end():]}"
 

@@ -586,7 +586,7 @@ python -m deepfix.evaluation baseline `
 
 Expected: fifteen sanitized run records plus an aggregate containing `success_rate`, `false_fixed_rate`, `input_tokens`, `output_tokens`, `model_calls`, `tool_calls`, `wall_seconds`, and `successes_per_100k_tokens`.
 
-Each batch also records sanitized reproducibility provenance: corpus repository/revision/tree identity, DeepFix runner revision, main/compaction model names, endpoint fingerprint, Python version/executable hash, budget-enforcement mode, and model-accounting scope. A merged summary preserves the provenance of every input batch.
+Each batch also records sanitized reproducibility provenance: corpus repository/revision/tree identity, DeepFix runner revision, main/compaction model names, endpoint fingerprint, Python version/executable hash, budget-enforcement mode, and model-accounting scope. A merged summary preserves the provenance of every input batch. New runs mark these values as `runtime`; historical batches require an explicit per-batch provenance sidecar and are marked `historical_backfill`, so current environment values are never silently presented as runtime observations.
 
 - [ ] **Step 7: Verify and commit only the sanitized baseline**
 

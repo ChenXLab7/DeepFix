@@ -1,5 +1,7 @@
 import json
+import os
 import stat
+import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -231,6 +233,69 @@ def test_source_symlink_is_rejected_before_workspace_copy(tmp_path) -> None:
     assert not (tmp_path / "runs" / "sample-buggy" / "001").exists()
 
 
+def test_source_root_directory_link_is_rejected_before_resolve(tmp_path) -> None:
+    actual_source = tmp_path / "actual-source"
+    actual_source.mkdir()
+    (actual_source / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    source_link = tmp_path / "source-link"
+    _make_directory_link(source_link, actual_source)
+    harness = EvaluationHarness(tmp_path / "runs", RecordingRunner())
+
+    try:
+        with pytest.raises(ValueError, match="link or junction"):
+            harness.run_case(case(), source_link, run_index=1, budget=BUDGET)
+    finally:
+        _remove_directory_link(source_link)
+
+    assert not (tmp_path / "runs" / "sample-buggy" / "001").exists()
+
+
+def test_source_subdirectory_link_is_rejected_before_resolve(tmp_path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    actual_subdirectory = source / "actual"
+    actual_subdirectory.mkdir()
+    (actual_subdirectory / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    linked_subdirectory = source / "linked"
+    _make_directory_link(linked_subdirectory, actual_subdirectory)
+    harness = EvaluationHarness(tmp_path / "runs", RecordingRunner())
+
+    try:
+        with pytest.raises(ValueError, match="link or junction"):
+            harness.run_case(
+                case(source_subdir="linked"),
+                source,
+                run_index=1,
+                budget=BUDGET,
+            )
+    finally:
+        _remove_directory_link(linked_subdirectory)
+
+    assert not (tmp_path / "runs" / "sample-buggy" / "001").exists()
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError:
+        if os.name != "nt":
+            pytest.skip("directory symlink creation is unavailable")
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip("directory junction creation is unavailable")
+
+
+def _remove_directory_link(link: Path) -> None:
+    if link.exists() or link.is_symlink():
+        link.rmdir()
+
+
 def _app_config(workspace: Path, run_dir: Path) -> AppConfig:
     role = ModelRoleConfig(
         model_name="test-model",
@@ -367,6 +432,30 @@ def test_default_oracle_binds_python_command_to_selected_interpreter(
 
     assert exit_code == 0
     assert str(captured["command"]).startswith(f'"{selected_python}" -m pytest')
+
+
+def test_default_oracle_rejects_commands_that_cannot_bind_selected_python(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    called = False
+
+    def fake_run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("deepfix.evaluation.legacy.subprocess.run", fake_run)
+
+    exit_code = _run_oracle(
+        "pytest tests/test_sample.py -q",
+        tmp_path,
+        30,
+        Path(sys.executable),
+    )
+
+    assert exit_code == 127
+    assert called is False
 
 
 def test_legacy_runner_does_not_approve_manual_actions(tmp_path) -> None:

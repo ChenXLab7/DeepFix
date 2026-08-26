@@ -83,6 +83,7 @@ class AggregateMetrics(StrictModel):
 
 class EvaluationProvenanceBatch(StrictModel):
     run_ids: list[str] = Field(min_length=1)
+    capture_timing: Literal["runtime", "historical_backfill"]
     source_repository: str = Field(min_length=1)
     source_revision: str = Field(min_length=1)
     source_tree_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

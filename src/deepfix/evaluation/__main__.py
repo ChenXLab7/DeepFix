@@ -20,6 +20,7 @@ from deepfix.evaluation.metrics import (
 from deepfix.evaluation.models import (
     EvaluationBudget,
     EvaluationCase,
+    EvaluationProvenanceBatch,
     EvaluationRun,
     EvaluationSummary,
 )
@@ -66,9 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("summaries", nargs="+")
     merge.add_argument("--output", required=True)
     merge.add_argument("--manifest")
-    merge.add_argument("--project")
-    merge.add_argument("--python", default=sys.executable)
-    merge.add_argument("--runner-revision", action="append")
+    merge.add_argument("--historical-provenance", action="append")
     return parser
 
 
@@ -94,9 +93,11 @@ def main(
             [Path(path) for path in args.summaries],
             Path(args.output),
             manifest_path=Path(args.manifest) if args.manifest else None,
-            project=Path(args.project) if args.project else None,
-            project_python=Path(args.python),
-            runner_revisions=args.runner_revision,
+            historical_provenance_paths=(
+                [Path(path) for path in args.historical_provenance]
+                if args.historical_provenance
+                else None
+            ),
         )
 
     manifest_path = Path(args.manifest).expanduser().resolve()
@@ -216,16 +217,17 @@ def _merge_summaries(
     output: Path,
     *,
     manifest_path: Path | None,
-    project: Path | None,
-    project_python: Path,
-    runner_revisions: list[str] | None,
+    historical_provenance_paths: list[Path] | None,
 ) -> int:
     if len(paths) < 2:
         print("merge requires at least two summaries", file=sys.stderr)
         return 2
     try:
-        if runner_revisions is not None and len(runner_revisions) != len(paths):
-            raise ValueError("runner revision count must match summary count")
+        if (
+            historical_provenance_paths is not None
+            and len(historical_provenance_paths) != len(paths)
+        ):
+            raise ValueError("historical provenance count must match summary count")
         manifest = load_manifest(manifest_path) if manifest_path is not None else None
         resolved_manifest_path = (
             manifest_path.expanduser().resolve()
@@ -237,9 +239,13 @@ def _merge_summaries(
                 path,
                 manifest=manifest,
                 manifest_path=resolved_manifest_path,
-                project=project,
-                project_python=project_python,
-                runner_revision=(runner_revisions[index] if runner_revisions else None),
+                historical_provenance=(
+                    _load_historical_provenance(
+                        historical_provenance_paths[index]
+                    )
+                    if historical_provenance_paths
+                    else None
+                ),
             )
             for index, path in enumerate(paths)
         ]
@@ -295,9 +301,7 @@ def _load_summary_for_merge(
     *,
     manifest,
     manifest_path: Path | None,
-    project: Path | None,
-    project_python: Path,
-    runner_revision: str | None,
+    historical_provenance: EvaluationProvenanceBatch | None,
 ) -> EvaluationSummary:
     resolved_path = path.expanduser().resolve()
     raw = json.loads(resolved_path.read_text(encoding="utf-8"))
@@ -312,11 +316,10 @@ def _load_summary_for_merge(
     if (
         manifest is None
         or manifest_path is None
-        or project is None
-        or runner_revision is None
+        or historical_provenance is None
     ):
         raise ValueError(
-            "legacy summary requires manifest, project, Python, and runner revision"
+            "legacy summary requires manifest and per-batch historical provenance"
         )
     manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     if raw.get("manifest_sha256") != manifest_hash:
@@ -348,17 +351,20 @@ def _load_summary_for_merge(
         case_id: case_by_id[case_id].expected_outcome for case_id in case_ids
     }
     raw["expected_runs_per_case"] = expected_runs_per_case
-    raw["provenance"] = [
-        build_provenance_batch(
-            project,
-            project_python,
-            run_ids,
-            runner_revision=runner_revision,
-        ).model_dump(mode="json")
-    ]
+    if historical_provenance.capture_timing != "historical_backfill":
+        raise ValueError("historical provenance must be marked as backfilled")
+    if set(historical_provenance.run_ids) != set(run_ids):
+        raise ValueError("historical provenance does not match summary runs")
+    raw["provenance"] = [historical_provenance.model_dump(mode="json")]
     summary = EvaluationSummary.model_validate(raw)
     _validate_summary_integrity(summary)
     return summary
+
+
+def _load_historical_provenance(path: Path) -> EvaluationProvenanceBatch:
+    return EvaluationProvenanceBatch.model_validate_json(
+        path.expanduser().resolve().read_text(encoding="utf-8")
+    )
 
 
 def _require_compatible_summary(
