@@ -1,8 +1,15 @@
 import json
+from pathlib import Path
 
 import pytest
 
 from deepfix.evaluation.manifest import load_manifest
+
+REPOSITORY_MANIFEST = (
+    Path(__file__).parents[2]
+    / "evaluations"
+    / "quixbugs-python.json"
+)
 
 
 def test_manifest_rejects_duplicate_case_ids(tmp_path) -> None:
@@ -33,3 +40,17 @@ def test_manifest_rejects_duplicate_case_ids(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="duplicate case_id"):
         load_manifest(path)
+
+
+def test_repository_quixbugs_manifest_has_fixed_cases_and_control() -> None:
+    manifest = load_manifest(REPOSITORY_MANIFEST)
+
+    assert [case.case_id for case in manifest.cases] == [
+        "mergesort-buggy",
+        "find-first-buggy",
+        "breadth-first-search-buggy",
+        "quicksort-timeout-buggy",
+        "find-first-correct-control",
+    ]
+    assert manifest.cases[-1].source_variant == "correct_control"
+    assert manifest.cases[-1].expected_outcome == "not_reproduced"

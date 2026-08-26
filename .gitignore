@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info/
 .venv/
 .worktrees/
+.deepfix-evaluation/
 .env
 *.sqlite3
 llm_calls.jsonl

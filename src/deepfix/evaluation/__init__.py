@@ -11,6 +11,7 @@ from deepfix.evaluation.models import (
     EvaluationCase,
     EvaluationManifest,
     EvaluationRun,
+    EvaluationSummary,
     EvaluationVerdict,
     RunUsage,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "EvaluationHarness",
     "EvaluationManifest",
     "EvaluationRun",
+    "EvaluationSummary",
     "EvaluationVerdict",
     "LegacyLoopRunner",
     "RunUsage",

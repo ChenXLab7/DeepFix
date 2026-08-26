@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from deepfix.compaction.models import StrictModel
 
@@ -59,6 +59,7 @@ class EvaluationRun(StrictModel):
     usage: RunUsage
     verdict: EvaluationVerdict | None = None
     sanitized_error_code: str | None = None
+    budget_violations: list[str] = Field(default_factory=list)
 
 
 class AggregateMetrics(StrictModel):
@@ -78,3 +79,24 @@ class AggregateMetrics(StrictModel):
     total_wall_seconds: float = Field(ge=0)
     successes_per_100k_tokens: float = Field(ge=0)
     median_tokens_per_success: float = Field(ge=0)
+
+
+class EvaluationSummary(StrictModel):
+    schema_version: int = 1
+    loop: Literal["legacy", "experiment"]
+    status: Literal["complete", "stopped_budget"]
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    budget: EvaluationBudget
+    case_ids: list[str] = Field(min_length=1)
+    runs: list[EvaluationRun]
+    aggregate: AggregateMetrics
+
+    @model_validator(mode="after")
+    def validate_run_summary(self) -> EvaluationSummary:
+        if self.aggregate.run_count != len(self.runs):
+            raise ValueError("aggregate run_count does not match runs")
+        if any(run.verdict is None for run in self.runs):
+            raise ValueError("summary runs must be graded")
+        if any(run.case_id not in self.case_ids for run in self.runs):
+            raise ValueError("summary run references an unknown case_id")
+        return self

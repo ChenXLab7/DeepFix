@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "budget": {
+    "max_input_tokens": 300000,
+    "max_output_tokens": 60000,
+    "max_wall_seconds": 900,
+    "max_tool_calls": 80,
+    "max_side_effects": 10
+  },
+  "cases": [
+    {
+      "case_id": "mergesort-buggy",
+      "problem": "mergesort 的相关测试失败。只允许修改 python_programs/mergesort.py，并运行 python -m pytest python_testcases/test_mergesort.py -q --timeout=5 验证。",
+      "allowed_paths": [
+        "python_programs/mergesort.py"
+      ],
+      "required_command": "python -m pytest python_testcases/test_mergesort.py -q --timeout=5",
+      "expected_outcome": "fixed",
+      "source_variant": "buggy"
+    },
+    {
+      "case_id": "find-first-buggy",
+      "problem": "find_first_in_sorted 的相关测试失败。只允许修改 python_programs/find_first_in_sorted.py，并运行 python -m pytest python_testcases/test_find_first_in_sorted.py -q --timeout=5 验证。",
+      "allowed_paths": [
+        "python_programs/find_first_in_sorted.py"
+      ],
+      "required_command": "python -m pytest python_testcases/test_find_first_in_sorted.py -q --timeout=5",
+      "expected_outcome": "fixed",
+      "source_variant": "buggy"
+    },
+    {
+      "case_id": "breadth-first-search-buggy",
+      "problem": "breadth_first_search 的相关测试失败。只允许修改 python_programs/breadth_first_search.py，并运行 python -m pytest python_testcases/test_breadth_first_search.py -q --timeout=5 验证。",
+      "allowed_paths": [
+        "python_programs/breadth_first_search.py"
+      ],
+      "required_command": "python -m pytest python_testcases/test_breadth_first_search.py -q --timeout=5",
+      "expected_outcome": "fixed",
+      "source_variant": "buggy"
+    },
+    {
+      "case_id": "quicksort-timeout-buggy",
+      "problem": "quicksort 的相关测试失败或超时。只允许修改 python_programs/quicksort.py，并运行 python -m pytest python_testcases/test_quicksort.py -q --timeout=5 验证。",
+      "allowed_paths": [
+        "python_programs/quicksort.py"
+      ],
+      "required_command": "python -m pytest python_testcases/test_quicksort.py -q --timeout=5",
+      "expected_outcome": "fixed",
+      "source_variant": "buggy"
+    },
+    {
+      "case_id": "find-first-correct-control",
+      "problem": "find_first_in_sorted 的相关测试失败。只允许修改 python_programs/find_first_in_sorted.py，并运行 python -m pytest python_testcases/test_find_first_in_sorted.py -q --timeout=5 验证。",
+      "allowed_paths": [
+        "python_programs/find_first_in_sorted.py"
+      ],
+      "required_command": "python -m pytest python_testcases/test_find_first_in_sorted.py -q --timeout=5",
+      "expected_outcome": "not_reproduced",
+      "source_variant": "correct_control"
+    }
+  ]
+}
