@@ -17,6 +17,7 @@ _IGNORED_DIRECTORIES = frozenset(
     {
         ".deepfix",
         ".deepfix-artifacts",
+        ".deepfix-runtime",
         ".git",
         ".pytest_cache",
         ".venv",
@@ -29,6 +30,10 @@ _SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class WorkspaceBaselineError(RuntimeError):
+    pass
+
+
+class WorkspaceScopeError(ValueError):
     pass
 
 
@@ -48,6 +53,31 @@ class TaskWorkspace(StrictModel):
     task_id: str
     root: Path
     baseline: WorkspaceBaseline
+
+
+class WorkspacePathPolicy:
+    def __init__(self, workspace_root: str | Path) -> None:
+        self.root = Path(workspace_root).expanduser().resolve(strict=True)
+        if not self.root.is_dir():
+            raise NotADirectoryError(self.root)
+
+    def resolve_allowed(self, path: str | Path) -> Path:
+        raw = Path(path).expanduser()
+        candidate = raw if raw.is_absolute() else self.root / raw
+        canonical = candidate.resolve(strict=False)
+        try:
+            common = Path(os.path.commonpath((self.root, canonical)))
+        except ValueError as error:
+            raise WorkspaceScopeError(f"path escapes workspace: {path}") from error
+        if os.path.normcase(str(common)) != os.path.normcase(str(self.root)):
+            raise WorkspaceScopeError(f"path escapes workspace: {path}")
+        relative = canonical.relative_to(self.root)
+        if (
+            relative.name == _BASELINE_FILE
+            or (relative.parts and relative.parts[0] == ".deepfix-runtime")
+        ):
+            raise WorkspaceScopeError(f"path targets internal workspace state: {path}")
+        return canonical
 
 
 class WorkspaceFactory:

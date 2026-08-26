@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 
 import pytest
 
 from deepfix.workspace import (
     WorkspaceBaselineError,
     WorkspaceFactory,
+    WorkspacePathPolicy,
+    WorkspaceScopeError,
     compute_code_state_hash,
 )
 
@@ -90,3 +94,87 @@ def test_unsafe_task_id_cannot_escape_workspace_root(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="task_id"):
         factory.create("../outside", source)
+
+
+def test_parent_escape_is_rejected(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    policy = WorkspacePathPolicy(workspace)
+
+    with pytest.raises(WorkspaceScopeError):
+        policy.resolve_allowed("../outside.txt")
+
+
+def test_directory_link_to_outside_is_rejected(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    link = workspace / "link"
+    _make_directory_link(link, outside)
+    policy = WorkspacePathPolicy(workspace)
+
+    try:
+        with pytest.raises(WorkspaceScopeError):
+            policy.resolve_allowed("link/value.py")
+    finally:
+        _remove_directory_link(link)
+
+
+def test_absolute_path_inside_workspace_is_canonicalized(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    target = workspace / "pkg" / "value.py"
+    target.parent.mkdir(parents=True)
+    policy = WorkspacePathPolicy(workspace)
+
+    assert policy.resolve_allowed(target) == target.resolve()
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [".deepfix-baseline.json", ".deepfix-runtime/gitconfig"],
+)
+def test_internal_workspace_state_is_not_exposed_as_agent_path(
+    tmp_path,
+    relative,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    policy = WorkspacePathPolicy(workspace)
+
+    with pytest.raises(WorkspaceScopeError, match="internal"):
+        policy.resolve_allowed(relative)
+
+
+def test_task_runtime_files_do_not_change_code_state_hash(tmp_path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    workspace = WorkspaceFactory(tmp_path / "workspaces").create("task-1", source)
+    runtime_file = workspace.root / ".deepfix-runtime" / "tmp" / "session.txt"
+    runtime_file.parent.mkdir(parents=True)
+    runtime_file.write_text("runtime\n", encoding="utf-8")
+
+    assert compute_code_state_hash(workspace.root) == workspace.baseline.code_state_hash
+
+
+def _make_directory_link(link, target) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError:
+        if os.name != "nt":
+            pytest.skip("directory symlink creation is unavailable")
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip("directory junction creation is unavailable")
+
+
+def _remove_directory_link(link) -> None:
+    if link.exists() or link.is_symlink():
+        link.rmdir()
