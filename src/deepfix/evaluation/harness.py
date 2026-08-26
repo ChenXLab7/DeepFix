@@ -25,7 +25,13 @@ _IGNORED_RUNTIME_DIRECTORIES = frozenset(
 _IGNORED_RUNTIME_FILES = frozenset({".coverage"})
 _IGNORED_RUNTIME_SUFFIXES = frozenset({".pyc", ".pyo"})
 _GOLD_DIRECTORIES = frozenset(
-    {"correct_python_programs", "gold", "answers", "solutions"}
+    {
+        "correct_java_programs",
+        "correct_python_programs",
+        "gold",
+        "answers",
+        "solutions",
+    }
 )
 _GOLD_FILE_SUFFIXES = frozenset({".diff", ".patch"})
 

@@ -138,12 +138,17 @@ def test_correct_control_is_copied_before_gold_material_is_removed(tmp_path) -> 
     source = tmp_path / "source"
     (source / "python_programs").mkdir(parents=True)
     (source / "correct_python_programs").mkdir()
+    (source / "correct_java_programs").mkdir()
     (source / "python_programs" / "sample.py").write_text(
         "VALUE = 'buggy'\n",
         encoding="utf-8",
     )
     (source / "correct_python_programs" / "sample.py").write_text(
         "VALUE = 'correct'\n",
+        encoding="utf-8",
+    )
+    (source / "correct_java_programs" / "SAMPLE.java").write_text(
+        "class SAMPLE {}\n",
         encoding="utf-8",
     )
     (source / "answer.patch").write_text("secret patch", encoding="utf-8")
@@ -161,6 +166,7 @@ def test_correct_control_is_copied_before_gold_material_is_removed(tmp_path) -> 
         encoding="utf-8"
     ) == "VALUE = 'correct'\n"
     assert not (execution.workspace / "correct_python_programs").exists()
+    assert not (execution.workspace / "correct_java_programs").exists()
     assert not (execution.workspace / "answer.patch").exists()
     assert (source / "correct_python_programs" / "sample.py").is_file()
 
