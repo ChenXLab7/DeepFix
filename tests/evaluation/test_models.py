@@ -18,3 +18,14 @@ def test_budget_rejects_zero_token_cap() -> None:
             max_tool_calls=40,
             max_side_effects=10,
         )
+
+
+def test_case_id_cannot_escape_the_runs_directory() -> None:
+    with pytest.raises(ValidationError):
+        EvaluationCase(
+            case_id="../outside",
+            problem="broken",
+            allowed_paths=["python_programs/x.py"],
+            required_command="python -m pytest python_testcases/test_x.py -q",
+            expected_outcome="fixed",
+        )

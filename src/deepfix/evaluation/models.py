@@ -16,7 +16,10 @@ class EvaluationBudget(StrictModel):
 
 
 class EvaluationCase(StrictModel):
-    case_id: str = Field(min_length=1)
+    case_id: str = Field(
+        min_length=1,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
     problem: str = Field(min_length=1)
     allowed_paths: list[str] = Field(min_length=1)
     required_command: str = Field(min_length=1)
