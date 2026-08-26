@@ -8,6 +8,7 @@ from deepfix.evaluation.models import (
     EvaluationVerdict,
     RunUsage,
 )
+from deepfix.evaluation.traces import summarize_llm_trace
 
 __all__ = [
     "AggregateMetrics",
@@ -18,4 +19,5 @@ __all__ = [
     "EvaluationVerdict",
     "RunUsage",
     "load_manifest",
+    "summarize_llm_trace",
 ]
