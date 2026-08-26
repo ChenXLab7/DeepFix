@@ -53,7 +53,7 @@ class ToolExecutionReceiptStore:
                     return
                 raise RuntimeError("tool execution receipt 回执冲突")
             path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            temporary = path.with_name(f".r-{uuid.uuid4().hex[:28]}.tmp")
             try:
                 with temporary.open(
                     "x",

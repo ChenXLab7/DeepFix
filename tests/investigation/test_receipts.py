@@ -84,3 +84,16 @@ def test_failed_atomic_replace_leaves_no_partial_receipt(tmp_path, monkeypatch):
 
     assert store.load("task-a", "read-1") is None
     assert not list(root.rglob("*.tmp"))
+
+
+def test_receipt_save_uses_a_windows_safe_temporary_path(tmp_path):
+    target_root_length = 164
+    padding_length = max(1, target_root_length - len(str(tmp_path.resolve())) - 1)
+    root = tmp_path / ("r" * padding_length)
+    store = ToolExecutionReceiptStore(root)
+    expected = receipt("task-a", "read-1", "source")
+
+    store.save(expected)
+
+    assert store.load("task-a", "read-1") == expected
+    assert not list(root.rglob("*.tmp"))
