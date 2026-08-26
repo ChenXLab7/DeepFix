@@ -80,7 +80,7 @@ gate = GateDefinition(
     ),
     runs_per_case=3,
     budget=EvaluationBudget(
-        max_input_tokens=300_000,
+        max_input_tokens=400_000,
         max_output_tokens=60_000,
         max_wall_seconds=900,
         max_tool_calls=80,

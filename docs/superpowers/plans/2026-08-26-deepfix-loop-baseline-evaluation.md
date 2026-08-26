@@ -494,7 +494,7 @@ The real `baseline` command must refuse to call a model unless `DEEPFIX_RUN_ONLI
 {
   "schema_version": 1,
   "budget": {
-    "max_input_tokens": 300000,
+    "max_input_tokens": 400000,
     "max_output_tokens": 60000,
     "max_wall_seconds": 900,
     "max_tool_calls": 80,
