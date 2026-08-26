@@ -12,13 +12,18 @@ from typing import Any
 from deepfix.evaluation.harness import CaseRunner, EvaluationHarness
 from deepfix.evaluation.legacy import LegacyLoopRunner
 from deepfix.evaluation.manifest import load_manifest
-from deepfix.evaluation.metrics import aggregate_runs, grade_run
+from deepfix.evaluation.metrics import (
+    aggregate_runs,
+    grade_run,
+    grade_run_for_expected_outcome,
+)
 from deepfix.evaluation.models import (
     EvaluationBudget,
     EvaluationCase,
     EvaluationRun,
     EvaluationSummary,
 )
+from deepfix.evaluation.provenance import build_provenance_batch
 
 RunnerFactory = Callable[[Path], CaseRunner]
 
@@ -60,6 +65,10 @@ def build_parser() -> argparse.ArgumentParser:
     merge = subparsers.add_parser("merge-summaries")
     merge.add_argument("summaries", nargs="+")
     merge.add_argument("--output", required=True)
+    merge.add_argument("--manifest")
+    merge.add_argument("--project")
+    merge.add_argument("--python", default=sys.executable)
+    merge.add_argument("--runner-revision", action="append")
     return parser
 
 
@@ -84,13 +93,17 @@ def main(
         return _merge_summaries(
             [Path(path) for path in args.summaries],
             Path(args.output),
+            manifest_path=Path(args.manifest) if args.manifest else None,
+            project=Path(args.project) if args.project else None,
+            project_python=Path(args.python),
+            runner_revisions=args.runner_revision,
         )
 
     manifest_path = Path(args.manifest).expanduser().resolve()
     try:
         manifest = load_manifest(manifest_path)
         cases = _select_cases(manifest.cases, args.selected_cases)
-    except (OSError, ValueError) as error:
+    except (OSError, TypeError, ValueError) as error:
         print(f"invalid manifest: {error}", file=sys.stderr)
         return 2
 
@@ -154,14 +167,27 @@ def main(
         if stopped_budget:
             break
 
+    canonical_runs = _canonical_runs(
+        graded_runs,
+        [case.case_id for case in cases],
+    )
     summary = EvaluationSummary(
         loop="legacy",
         status="stopped_budget" if stopped_budget else "complete",
         manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
         budget=manifest.budget,
         case_ids=[case.case_id for case in cases],
-        runs=graded_runs,
-        aggregate=aggregate_runs(graded_runs),
+        case_expectations={case.case_id: case.expected_outcome for case in cases},
+        expected_runs_per_case=args.runs,
+        runs=canonical_runs,
+        provenance=[
+            build_provenance_batch(
+                project,
+                project_python,
+                [run.run_id for run in canonical_runs],
+            )
+        ],
+        aggregate=aggregate_runs(canonical_runs),
     )
     summary_path = Path(args.summary).expanduser().resolve()
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -180,15 +206,43 @@ def validate_summary(path: Path) -> EvaluationSummary:
     forbidden = _find_forbidden_field(raw)
     if forbidden is not None:
         raise ValueError(f"forbidden summary field: {forbidden}")
-    return EvaluationSummary.model_validate(raw)
+    summary = EvaluationSummary.model_validate(raw)
+    _validate_summary_integrity(summary)
+    return summary
 
 
-def _merge_summaries(paths: list[Path], output: Path) -> int:
+def _merge_summaries(
+    paths: list[Path],
+    output: Path,
+    *,
+    manifest_path: Path | None,
+    project: Path | None,
+    project_python: Path,
+    runner_revisions: list[str] | None,
+) -> int:
     if len(paths) < 2:
         print("merge requires at least two summaries", file=sys.stderr)
         return 2
     try:
-        summaries = [validate_summary(path.expanduser().resolve()) for path in paths]
+        if runner_revisions is not None and len(runner_revisions) != len(paths):
+            raise ValueError("runner revision count must match summary count")
+        manifest = load_manifest(manifest_path) if manifest_path is not None else None
+        resolved_manifest_path = (
+            manifest_path.expanduser().resolve()
+            if manifest_path is not None
+            else None
+        )
+        summaries = [
+            _load_summary_for_merge(
+                path,
+                manifest=manifest,
+                manifest_path=resolved_manifest_path,
+                project=project,
+                project_python=project_python,
+                runner_revision=(runner_revisions[index] if runner_revisions else None),
+            )
+            for index, path in enumerate(paths)
+        ]
         first = summaries[0]
         runs: list[EvaluationRun] = []
         seen_runs: set[tuple[str, str]] = set()
@@ -202,10 +256,11 @@ def _merge_summaries(paths: list[Path], output: Path) -> int:
                     )
                 seen_runs.add(identity)
                 runs.append(run)
-    except (OSError, ValueError) as error:
+    except (OSError, TypeError, ValueError) as error:
         print(f"cannot merge summaries: {error}", file=sys.stderr)
         return 2
 
+    merged_runs = _canonical_runs(runs, first.case_ids)
     merged = EvaluationSummary(
         loop=first.loop,
         status=(
@@ -216,14 +271,94 @@ def _merge_summaries(paths: list[Path], output: Path) -> int:
         manifest_sha256=first.manifest_sha256,
         budget=first.budget,
         case_ids=first.case_ids,
-        runs=runs,
-        aggregate=aggregate_runs(runs),
+        case_expectations=first.case_expectations,
+        expected_runs_per_case=sum(
+            summary.expected_runs_per_case for summary in summaries
+        ),
+        runs=merged_runs,
+        provenance=[
+            provenance
+            for summary in summaries
+            for provenance in summary.provenance
+        ],
+        aggregate=aggregate_runs(merged_runs),
     )
     output_path = output.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(merged.model_dump_json(indent=2), encoding="utf-8")
     print(f"merged summaries: runs={len(runs)} output={output_path}")
     return 0
+
+
+def _load_summary_for_merge(
+    path: Path,
+    *,
+    manifest,
+    manifest_path: Path | None,
+    project: Path | None,
+    project_python: Path,
+    runner_revision: str | None,
+) -> EvaluationSummary:
+    resolved_path = path.expanduser().resolve()
+    raw = json.loads(resolved_path.read_text(encoding="utf-8"))
+    new_fields = {"case_expectations", "expected_runs_per_case", "provenance"}
+    present_new_fields = new_fields.intersection(raw)
+    if present_new_fields:
+        if present_new_fields != new_fields:
+            missing = ", ".join(sorted(new_fields - present_new_fields))
+            raise ValueError(f"partially upgraded summary is missing: {missing}")
+        return validate_summary(resolved_path)
+
+    if (
+        manifest is None
+        or manifest_path is None
+        or project is None
+        or runner_revision is None
+    ):
+        raise ValueError(
+            "legacy summary requires manifest, project, Python, and runner revision"
+        )
+    manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    if raw.get("manifest_sha256") != manifest_hash:
+        raise ValueError("legacy summary manifest hash does not match")
+    case_by_id = {case.case_id: case for case in manifest.cases}
+    case_ids = raw.get("case_ids")
+    if not isinstance(case_ids, list) or any(
+        case_id not in case_by_id for case_id in case_ids
+    ):
+        raise ValueError("legacy summary contains unknown cases")
+    runs = raw.get("runs")
+    if not isinstance(runs, list):
+        raise TypeError("legacy summary runs are invalid")
+    coverage = {
+        case_id: sum(run.get("case_id") == case_id for run in runs)
+        for case_id in case_ids
+    }
+    coverage_counts = set(coverage.values())
+    if raw.get("status") != "complete" or len(coverage_counts) != 1:
+        raise ValueError("legacy summary must have complete uniform coverage")
+    expected_runs_per_case = coverage_counts.pop()
+    if expected_runs_per_case <= 0:
+        raise ValueError("legacy summary contains no runs")
+    run_ids = [run.get("run_id") for run in runs]
+    if any(not isinstance(run_id, str) or not run_id for run_id in run_ids):
+        raise ValueError("legacy summary run IDs are invalid")
+
+    raw["case_expectations"] = {
+        case_id: case_by_id[case_id].expected_outcome for case_id in case_ids
+    }
+    raw["expected_runs_per_case"] = expected_runs_per_case
+    raw["provenance"] = [
+        build_provenance_batch(
+            project,
+            project_python,
+            run_ids,
+            runner_revision=runner_revision,
+        ).model_dump(mode="json")
+    ]
+    summary = EvaluationSummary.model_validate(raw)
+    _validate_summary_integrity(summary)
+    return summary
 
 
 def _require_compatible_summary(
@@ -235,10 +370,71 @@ def _require_compatible_summary(
         ("manifest_sha256", expected.manifest_sha256, actual.manifest_sha256),
         ("budget", expected.budget, actual.budget),
         ("case_ids", expected.case_ids, actual.case_ids),
+        (
+            "case_expectations",
+            expected.case_expectations,
+            actual.case_expectations,
+        ),
     )
     for name, expected_value, actual_value in checks:
         if actual_value != expected_value:
             raise ValueError(f"incompatible {name}")
+
+
+def _canonical_runs(
+    runs: list[EvaluationRun],
+    case_ids: list[str],
+) -> list[EvaluationRun]:
+    case_order = {case_id: index for index, case_id in enumerate(case_ids)}
+    return sorted(runs, key=lambda run: (case_order[run.case_id], run.run_id))
+
+
+def _validate_summary_integrity(summary: EvaluationSummary) -> None:
+    if set(summary.case_expectations) != set(summary.case_ids):
+        raise ValueError("case expectations do not match case_ids")
+
+    run_ids: set[str] = set()
+    task_ids: set[str] = set()
+    coverage = {case_id: 0 for case_id in summary.case_ids}
+    for run in summary.runs:
+        if run.loop != summary.loop:
+            raise ValueError(f"run loop does not match summary: {run.run_id}")
+        if run.run_id in run_ids:
+            raise ValueError(f"duplicate run: {run.run_id}")
+        run_ids.add(run.run_id)
+        if run.task_id in task_ids:
+            raise ValueError(f"duplicate task: {run.task_id}")
+        task_ids.add(run.task_id)
+        coverage[run.case_id] += 1
+        expected_verdict = grade_run_for_expected_outcome(
+            summary.case_expectations[run.case_id],
+            run,
+        )
+        if run.verdict != expected_verdict:
+            raise ValueError(f"run verdict does not match evidence: {run.run_id}")
+
+    if summary.status == "complete" and any(
+        count != summary.expected_runs_per_case for count in coverage.values()
+    ):
+        raise ValueError("summary case coverage is incomplete")
+    if summary.status == "stopped_budget" and any(
+        count > summary.expected_runs_per_case for count in coverage.values()
+    ):
+        raise ValueError("summary case coverage exceeds expected runs")
+
+    provenance_run_ids = [
+        run_id
+        for provenance in summary.provenance
+        for run_id in provenance.run_ids
+    ]
+    if len(provenance_run_ids) != len(set(provenance_run_ids)):
+        raise ValueError("duplicate provenance run coverage")
+    if set(provenance_run_ids) != run_ids:
+        raise ValueError("provenance coverage does not match runs")
+
+    expected_aggregate = aggregate_runs(summary.runs)
+    if summary.aggregate != expected_aggregate:
+        raise ValueError("aggregate does not match runs")
 
 
 def _find_forbidden_field(value: Any) -> str | None:

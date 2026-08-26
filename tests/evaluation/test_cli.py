@@ -54,7 +54,7 @@ class FixedRunner:
             run_id=f"{case.case_id}-{run_dir.name}",
             case_id=case.case_id,
             loop="legacy",
-            task_id="task-fixture",
+            task_id=f"task-{run_dir.name}",
             conclusion="fixed",
             oracle_exit_code=0,
             scope_violations=[],
@@ -158,6 +158,13 @@ def test_cli_runs_real_harness_with_injected_runner_and_writes_sanitized_summary
     assert summary.status == "complete"
     assert summary.case_ids == ["sample-buggy"]
     assert summary.aggregate.success_count == 1
+    assert summary.case_expectations == {"sample-buggy": "fixed"}
+    assert summary.expected_runs_per_case == 1
+    assert len(summary.provenance) == 1
+    assert summary.provenance[0].run_ids == ["sample-buggy-001"]
+    assert summary.provenance[0].budget_enforcement == "post_run_observation"
+    assert summary.provenance[0].model_accounting == "main_model_trace_only"
+    assert len(summary.provenance[0].endpoint_fingerprint) == 64
     assert summary.runs[0].verdict is not None
     assert summary.runs[0].verdict.success is True
     assert (tmp_path / "runs" / "sample-buggy" / "001" / "result.json").is_file()
@@ -235,8 +242,8 @@ def test_cli_merges_compatible_summaries_and_recomputes_aggregate(
             "merge-summaries",
             "--output",
             str(merged_path),
-            str(first),
             str(second),
+            str(first),
         ]
     )
 
@@ -248,6 +255,8 @@ def test_cli_merges_compatible_summaries_and_recomputes_aggregate(
     ]
     assert merged.aggregate.run_count == 2
     assert merged.aggregate.total_input_tokens == 160
+    assert merged.expected_runs_per_case == 2
+    assert len(merged.provenance) == 2
 
 
 def test_cli_merge_rejects_mismatched_budget(tmp_path, monkeypatch, capsys) -> None:
@@ -288,6 +297,114 @@ def test_cli_merge_rejects_duplicate_run_ids(tmp_path, monkeypatch, capsys) -> N
     assert code == 2
     assert "duplicate run" in capsys.readouterr().err
     assert not (tmp_path / "merged.json").exists()
+
+
+def test_cli_merge_upgrades_complete_legacy_batches_with_explicit_provenance(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    first = _write_batch_summary(tmp_path, monkeypatch, run_start=1)
+    second = _write_batch_summary(tmp_path, monkeypatch, run_start=2)
+    for path in (first, second):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw.pop("case_expectations")
+        raw.pop("expected_runs_per_case")
+        raw.pop("provenance")
+        path.write_text(json.dumps(raw), encoding="utf-8")
+    merged_path = tmp_path / "merged-legacy.json"
+
+    code = main(
+        [
+            "merge-summaries",
+            "--manifest",
+            str(first.parent / "cases.json"),
+            "--project",
+            str(first.parent / "source"),
+            "--python",
+            sys.executable,
+            "--runner-revision",
+            "a" * 40,
+            "--runner-revision",
+            "b" * 40,
+            "--output",
+            str(merged_path),
+            str(first),
+            str(second),
+        ]
+    )
+
+    merged = validate_summary(merged_path)
+    assert code == 0
+    assert merged.expected_runs_per_case == 2
+    assert [item.runner_revision for item in merged.provenance] == [
+        "a" * 40,
+        "b" * 40,
+    ]
+    assert all(item.runner_dirty is False for item in merged.provenance)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (lambda raw: raw["aggregate"].update({"success_count": 0}), "aggregate"),
+        (
+            lambda raw: raw["runs"][0]["verdict"].update({"success": False}),
+            "verdict",
+        ),
+        (lambda raw: raw["runs"][0].update({"loop": "experiment"}), "loop"),
+    ],
+)
+def test_validate_summary_rejects_tampered_derived_facts(
+    tmp_path,
+    monkeypatch,
+    mutation,
+    error,
+) -> None:
+    summary = _write_batch_summary(tmp_path, monkeypatch, run_start=1)
+    raw = json.loads(summary.read_text(encoding="utf-8"))
+    mutation(raw)
+    summary.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=error):
+        validate_summary(summary)
+
+
+def test_validate_summary_rejects_duplicate_task_ids(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    summary = _write_batch_summary(
+        tmp_path,
+        monkeypatch,
+        run_start=1,
+        runs=2,
+    )
+    raw = json.loads(summary.read_text(encoding="utf-8"))
+    raw["runs"][1]["task_id"] = raw["runs"][0]["task_id"]
+    summary.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate task"):
+        validate_summary(summary)
+
+
+def test_validate_summary_rejects_incomplete_case_coverage(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    summary = _write_batch_summary(
+        tmp_path,
+        monkeypatch,
+        run_start=1,
+        runs=2,
+    )
+    raw = json.loads(summary.read_text(encoding="utf-8"))
+    raw["runs"] = raw["runs"][:1]
+    raw["aggregate"]["run_count"] = 1
+    raw["provenance"][0]["run_ids"] = [raw["runs"][0]["run_id"]]
+    summary.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="coverage"):
+        validate_summary(summary)
 
 
 def test_validate_summary_rejects_forbidden_prompt_field(tmp_path) -> None:
@@ -387,7 +504,13 @@ def test_cli_stops_repetitions_after_observed_token_budget_exceeded(
     assert summary.runs[0].budget_violations == ["max_input_tokens"]
 
 
-def _write_batch_summary(tmp_path, monkeypatch, *, run_start: int) -> Path:
+def _write_batch_summary(
+    tmp_path,
+    monkeypatch,
+    *,
+    run_start: int,
+    runs: int = 1,
+) -> Path:
     monkeypatch.setenv("DEEPFIX_RUN_ONLINE", "1")
     batch = tmp_path / f"batch-{run_start}"
     batch.mkdir()
@@ -404,7 +527,7 @@ def _write_batch_summary(tmp_path, monkeypatch, *, run_start: int) -> Path:
             "--project",
             str(source),
             "--runs",
-            "1",
+            str(runs),
             "--run-start",
             str(run_start),
             "--output",

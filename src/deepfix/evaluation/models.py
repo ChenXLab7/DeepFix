@@ -81,6 +81,29 @@ class AggregateMetrics(StrictModel):
     median_tokens_per_success: float = Field(ge=0)
 
 
+class EvaluationProvenanceBatch(StrictModel):
+    run_ids: list[str] = Field(min_length=1)
+    source_repository: str = Field(min_length=1)
+    source_revision: str = Field(min_length=1)
+    source_tree_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_dirty: bool
+    runner_revision: str = Field(pattern=r"^[0-9a-f]{7,64}$")
+    runner_dirty: bool
+    main_model_name: str = Field(min_length=1)
+    compaction_model_name: str = Field(min_length=1)
+    endpoint_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    python_version: str = Field(min_length=1)
+    python_executable_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    budget_enforcement: Literal[
+        "post_run_observation",
+        "pre_call_reservation",
+    ]
+    model_accounting: Literal[
+        "main_model_trace_only",
+        "all_model_roles",
+    ]
+
+
 class EvaluationSummary(StrictModel):
     schema_version: int = 1
     loop: Literal["legacy", "experiment"]
@@ -88,7 +111,10 @@ class EvaluationSummary(StrictModel):
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     budget: EvaluationBudget
     case_ids: list[str] = Field(min_length=1)
+    case_expectations: dict[str, Literal["fixed", "not_reproduced"]]
+    expected_runs_per_case: int = Field(gt=0)
     runs: list[EvaluationRun]
+    provenance: list[EvaluationProvenanceBatch] = Field(min_length=1)
     aggregate: AggregateMetrics
 
     @model_validator(mode="after")

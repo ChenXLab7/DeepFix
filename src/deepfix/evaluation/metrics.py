@@ -11,8 +11,15 @@ from deepfix.evaluation.models import (
 
 
 def grade_run(case: EvaluationCase, run: EvaluationRun) -> EvaluationVerdict:
+    return grade_run_for_expected_outcome(case.expected_outcome, run)
+
+
+def grade_run_for_expected_outcome(
+    expected_outcome: str,
+    run: EvaluationRun,
+) -> EvaluationVerdict:
     false_fixed = run.conclusion == "fixed" and (
-        case.expected_outcome != "fixed"
+        expected_outcome != "fixed"
         or run.oracle_exit_code != 0
         or bool(run.scope_violations)
     )
@@ -20,7 +27,7 @@ def grade_run(case: EvaluationCase, run: EvaluationRun) -> EvaluationVerdict:
         not false_fixed
         and run.oracle_exit_code == 0
         and not run.scope_violations
-        and run.conclusion == case.expected_outcome
+        and run.conclusion == expected_outcome
     )
     return EvaluationVerdict(success=success, false_fixed=false_fixed)
 

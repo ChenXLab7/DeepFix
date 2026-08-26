@@ -18,6 +18,8 @@
 - API keys, full prompts, source code, stdout bodies, and environment variables never enter committed result summaries.
 - Online benchmark execution requires `DEEPFIX_RUN_ONLINE=1`; default pytest remains offline.
 - Baseline thresholds are frozen before the new-loop A/B run.
+- In Plan 1, resource limits are an observed post-run envelope: the Harness records a violation and stops later runs, but does not interrupt an in-flight model call. Pre-call reservation and all-model-role accounting are implemented for both loops in Plan 3 Task 6.
+- The historical baseline labels its enforcement and accounting scope explicitly as `post_run_observation` and `main_model_trace_only`.
 
 ## File Structure
 
@@ -584,11 +586,15 @@ python -m deepfix.evaluation baseline `
 
 Expected: fifteen sanitized run records plus an aggregate containing `success_rate`, `false_fixed_rate`, `input_tokens`, `output_tokens`, `model_calls`, `tool_calls`, `wall_seconds`, and `successes_per_100k_tokens`.
 
+Each batch also records sanitized reproducibility provenance: corpus repository/revision/tree identity, DeepFix runner revision, main/compaction model names, endpoint fingerprint, Python version/executable hash, budget-enforcement mode, and model-accounting scope. A merged summary preserves the provenance of every input batch.
+
 - [ ] **Step 7: Verify and commit only the sanitized baseline**
 
 Run: `python -m deepfix.evaluation validate-summary evaluations/results/legacy-baseline-summary.json`
 
 Expected: `valid summary: loop=legacy cases=5 runs=15`, with no secret/prompt/source fields.
+
+Validation recomputes verdicts and aggregate metrics, rejects duplicate run/task identities and loop mismatches, verifies complete per-case coverage, and verifies every run is covered by exactly one provenance batch.
 
 ```bash
 git add evaluations/results/legacy-baseline-summary.json
@@ -597,4 +603,4 @@ git commit -m "test: freeze legacy loop baseline"
 
 ## Plan 1 Completion Checkpoint
 
-Stop for review. Do not start the trusted-execution plan until the manifest, hard resource envelope, outcome labels, and sanitized legacy summary have been reviewed.
+Stop for review. Do not start the trusted-execution plan until the manifest, observed resource envelope and its explicit enforcement/accounting semantics, outcome labels, provenance, and sanitized legacy summary have been reviewed. Runtime side-effect confinement and journaling remain Plan 2 work; pre-call Token reservation and all-model-role accounting remain Plan 3 work.

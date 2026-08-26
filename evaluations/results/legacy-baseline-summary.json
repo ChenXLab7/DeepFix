@@ -17,6 +17,14 @@
     "quicksort-timeout-buggy",
     "find-first-correct-control"
   ],
+  "case_expectations": {
+    "mergesort-buggy": "fixed",
+    "find-first-buggy": "fixed",
+    "breadth-first-search-buggy": "fixed",
+    "quicksort-timeout-buggy": "fixed",
+    "find-first-correct-control": "not_reproduced"
+  },
+  "expected_runs_per_case": 3,
   "runs": [
     {
       "run_id": "mergesort-buggy-001",
@@ -32,6 +40,52 @@
         "model_calls": 24,
         "tool_calls": 26,
         "wall_seconds": 132.1248837000021,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "mergesort-buggy-002",
+      "case_id": "mergesort-buggy",
+      "loop": "legacy",
+      "task_id": "718da7e6ffd0436eacf79fe7dc438055",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 300070,
+        "output_tokens": 5621,
+        "model_calls": 23,
+        "tool_calls": 25,
+        "wall_seconds": 124.51103560000047,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "mergesort-buggy-003",
+      "case_id": "mergesort-buggy",
+      "loop": "legacy",
+      "task_id": "0c5ab3f1fdbe44c691d36296255d79e8",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 127618,
+        "output_tokens": 3729,
+        "model_calls": 12,
+        "tool_calls": 14,
+        "wall_seconds": 73.24406040000031,
         "usage_estimated": false
       },
       "verdict": {
@@ -65,98 +119,6 @@
       "budget_violations": []
     },
     {
-      "run_id": "breadth-first-search-buggy-001",
-      "case_id": "breadth-first-search-buggy",
-      "loop": "legacy",
-      "task_id": "27dbae79c7d54df5a8f2bea992ee93bf",
-      "conclusion": "fixed",
-      "oracle_exit_code": 0,
-      "scope_violations": [],
-      "usage": {
-        "input_tokens": 192605,
-        "output_tokens": 4760,
-        "model_calls": 15,
-        "tool_calls": 18,
-        "wall_seconds": 74.83899939999901,
-        "usage_estimated": false
-      },
-      "verdict": {
-        "success": true,
-        "false_fixed": false
-      },
-      "sanitized_error_code": null,
-      "budget_violations": []
-    },
-    {
-      "run_id": "quicksort-timeout-buggy-001",
-      "case_id": "quicksort-timeout-buggy",
-      "loop": "legacy",
-      "task_id": "573012be66254ae8937f072b47ba7dcb",
-      "conclusion": "fixed",
-      "oracle_exit_code": 0,
-      "scope_violations": [],
-      "usage": {
-        "input_tokens": 187760,
-        "output_tokens": 4727,
-        "model_calls": 16,
-        "tool_calls": 17,
-        "wall_seconds": 75.05692579999959,
-        "usage_estimated": false
-      },
-      "verdict": {
-        "success": true,
-        "false_fixed": false
-      },
-      "sanitized_error_code": null,
-      "budget_violations": []
-    },
-    {
-      "run_id": "find-first-correct-control-001",
-      "case_id": "find-first-correct-control",
-      "loop": "legacy",
-      "task_id": "c70d633fb38544178dea292dfeec8438",
-      "conclusion": "blocked",
-      "oracle_exit_code": 0,
-      "scope_violations": [],
-      "usage": {
-        "input_tokens": 32351,
-        "output_tokens": 366,
-        "model_calls": 4,
-        "tool_calls": 5,
-        "wall_seconds": 15.990054200003215,
-        "usage_estimated": false
-      },
-      "verdict": {
-        "success": false,
-        "false_fixed": false
-      },
-      "sanitized_error_code": "agent_paused",
-      "budget_violations": []
-    },
-    {
-      "run_id": "mergesort-buggy-002",
-      "case_id": "mergesort-buggy",
-      "loop": "legacy",
-      "task_id": "718da7e6ffd0436eacf79fe7dc438055",
-      "conclusion": "fixed",
-      "oracle_exit_code": 0,
-      "scope_violations": [],
-      "usage": {
-        "input_tokens": 300070,
-        "output_tokens": 5621,
-        "model_calls": 23,
-        "tool_calls": 25,
-        "wall_seconds": 124.51103560000047,
-        "usage_estimated": false
-      },
-      "verdict": {
-        "success": true,
-        "false_fixed": false
-      },
-      "sanitized_error_code": null,
-      "budget_violations": []
-    },
-    {
       "run_id": "find-first-buggy-002",
       "case_id": "find-first-buggy",
       "loop": "legacy",
@@ -170,98 +132,6 @@
         "model_calls": 15,
         "tool_calls": 16,
         "wall_seconds": 198.60966240000198,
-        "usage_estimated": false
-      },
-      "verdict": {
-        "success": true,
-        "false_fixed": false
-      },
-      "sanitized_error_code": null,
-      "budget_violations": []
-    },
-    {
-      "run_id": "breadth-first-search-buggy-002",
-      "case_id": "breadth-first-search-buggy",
-      "loop": "legacy",
-      "task_id": "c8832862741247b3b6fbf3a3efedeb6f",
-      "conclusion": "fixed",
-      "oracle_exit_code": 0,
-      "scope_violations": [],
-      "usage": {
-        "input_tokens": 175011,
-        "output_tokens": 4144,
-        "model_calls": 15,
-        "tool_calls": 17,
-        "wall_seconds": 70.02190289999999,
-        "usage_estimated": false
-      },
-      "verdict": {
-        "success": true,
-        "false_fixed": false
-      },
-      "sanitized_error_code": null,
-      "budget_violations": []
-    },
-    {
-      "run_id": "quicksort-timeout-buggy-002",
-      "case_id": "quicksort-timeout-buggy",
-      "loop": "legacy",
-      "task_id": "035cb6b03eff424abed8b59932778159",
-      "conclusion": "fixed",
-      "oracle_exit_code": 0,
-      "scope_violations": [],
-      "usage": {
-        "input_tokens": 174463,
-        "output_tokens": 4643,
-        "model_calls": 15,
-        "tool_calls": 16,
-        "wall_seconds": 74.11796770000001,
-        "usage_estimated": false
-      },
-      "verdict": {
-        "success": true,
-        "false_fixed": false
-      },
-      "sanitized_error_code": null,
-      "budget_violations": []
-    },
-    {
-      "run_id": "find-first-correct-control-002",
-      "case_id": "find-first-correct-control",
-      "loop": "legacy",
-      "task_id": "9bbd8287340443e8966b8f69d728b285",
-      "conclusion": "blocked",
-      "oracle_exit_code": 0,
-      "scope_violations": [],
-      "usage": {
-        "input_tokens": 42892,
-        "output_tokens": 1111,
-        "model_calls": 5,
-        "tool_calls": 6,
-        "wall_seconds": 23.289315000001807,
-        "usage_estimated": false
-      },
-      "verdict": {
-        "success": false,
-        "false_fixed": false
-      },
-      "sanitized_error_code": "agent_paused",
-      "budget_violations": []
-    },
-    {
-      "run_id": "mergesort-buggy-003",
-      "case_id": "mergesort-buggy",
-      "loop": "legacy",
-      "task_id": "0c5ab3f1fdbe44c691d36296255d79e8",
-      "conclusion": "fixed",
-      "oracle_exit_code": 0,
-      "scope_violations": [],
-      "usage": {
-        "input_tokens": 127618,
-        "output_tokens": 3729,
-        "model_calls": 12,
-        "tool_calls": 14,
-        "wall_seconds": 73.24406040000031,
         "usage_estimated": false
       },
       "verdict": {
@@ -295,6 +165,52 @@
       "budget_violations": []
     },
     {
+      "run_id": "breadth-first-search-buggy-001",
+      "case_id": "breadth-first-search-buggy",
+      "loop": "legacy",
+      "task_id": "27dbae79c7d54df5a8f2bea992ee93bf",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 192605,
+        "output_tokens": 4760,
+        "model_calls": 15,
+        "tool_calls": 18,
+        "wall_seconds": 74.83899939999901,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "breadth-first-search-buggy-002",
+      "case_id": "breadth-first-search-buggy",
+      "loop": "legacy",
+      "task_id": "c8832862741247b3b6fbf3a3efedeb6f",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 175011,
+        "output_tokens": 4144,
+        "model_calls": 15,
+        "tool_calls": 17,
+        "wall_seconds": 70.02190289999999,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
       "run_id": "breadth-first-search-buggy-003",
       "case_id": "breadth-first-search-buggy",
       "loop": "legacy",
@@ -308,6 +224,52 @@
         "model_calls": 13,
         "tool_calls": 16,
         "wall_seconds": 62.245910300000105,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "quicksort-timeout-buggy-001",
+      "case_id": "quicksort-timeout-buggy",
+      "loop": "legacy",
+      "task_id": "573012be66254ae8937f072b47ba7dcb",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 187760,
+        "output_tokens": 4727,
+        "model_calls": 16,
+        "tool_calls": 17,
+        "wall_seconds": 75.05692579999959,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": true,
+        "false_fixed": false
+      },
+      "sanitized_error_code": null,
+      "budget_violations": []
+    },
+    {
+      "run_id": "quicksort-timeout-buggy-002",
+      "case_id": "quicksort-timeout-buggy",
+      "loop": "legacy",
+      "task_id": "035cb6b03eff424abed8b59932778159",
+      "conclusion": "fixed",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 174463,
+        "output_tokens": 4643,
+        "model_calls": 15,
+        "tool_calls": 16,
+        "wall_seconds": 74.11796770000001,
         "usage_estimated": false
       },
       "verdict": {
@@ -341,6 +303,52 @@
       "budget_violations": []
     },
     {
+      "run_id": "find-first-correct-control-001",
+      "case_id": "find-first-correct-control",
+      "loop": "legacy",
+      "task_id": "c70d633fb38544178dea292dfeec8438",
+      "conclusion": "blocked",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 32351,
+        "output_tokens": 366,
+        "model_calls": 4,
+        "tool_calls": 5,
+        "wall_seconds": 15.990054200003215,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": false,
+        "false_fixed": false
+      },
+      "sanitized_error_code": "agent_paused",
+      "budget_violations": []
+    },
+    {
+      "run_id": "find-first-correct-control-002",
+      "case_id": "find-first-correct-control",
+      "loop": "legacy",
+      "task_id": "9bbd8287340443e8966b8f69d728b285",
+      "conclusion": "blocked",
+      "oracle_exit_code": 0,
+      "scope_violations": [],
+      "usage": {
+        "input_tokens": 42892,
+        "output_tokens": 1111,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "wall_seconds": 23.289315000001807,
+        "usage_estimated": false
+      },
+      "verdict": {
+        "success": false,
+        "false_fixed": false
+      },
+      "sanitized_error_code": "agent_paused",
+      "budget_violations": []
+    },
+    {
       "run_id": "find-first-correct-control-003",
       "case_id": "find-first-correct-control",
       "loop": "legacy",
@@ -362,6 +370,74 @@
       },
       "sanitized_error_code": "agent_paused",
       "budget_violations": []
+    }
+  ],
+  "provenance": [
+    {
+      "run_ids": [
+        "mergesort-buggy-001",
+        "find-first-buggy-001",
+        "breadth-first-search-buggy-001",
+        "quicksort-timeout-buggy-001",
+        "find-first-correct-control-001"
+      ],
+      "source_repository": "https://github.com/jkoppel/QuixBugs.git",
+      "source_revision": "4257f44b0ff1181dedaedee6a447e133219fcebf",
+      "source_tree_sha256": "af561f1971a20044d803f9efecf22df0a74146f926ec2ab15df263d7bc024627",
+      "source_dirty": false,
+      "runner_revision": "4a778f65c43744108661037456519706c5a5194b",
+      "runner_dirty": false,
+      "main_model_name": "deepseek-v4-pro",
+      "compaction_model_name": "deepseek-v4-pro",
+      "endpoint_fingerprint": "e31f9727e46e077cf24859a72b202b0a96cf49bf05436a5e1ae7ae90a5dffdfa",
+      "python_version": "Python 3.12.4",
+      "python_executable_sha256": "fd5c46d73d29ba21b04c844bbaf9096066136526911230645a2a040d23fb612b",
+      "budget_enforcement": "post_run_observation",
+      "model_accounting": "main_model_trace_only"
+    },
+    {
+      "run_ids": [
+        "mergesort-buggy-002",
+        "find-first-buggy-002",
+        "breadth-first-search-buggy-002",
+        "quicksort-timeout-buggy-002",
+        "find-first-correct-control-002"
+      ],
+      "source_repository": "https://github.com/jkoppel/QuixBugs.git",
+      "source_revision": "4257f44b0ff1181dedaedee6a447e133219fcebf",
+      "source_tree_sha256": "af561f1971a20044d803f9efecf22df0a74146f926ec2ab15df263d7bc024627",
+      "source_dirty": false,
+      "runner_revision": "4fae8abe7228da063b269c0483bfc6373cab23bb",
+      "runner_dirty": false,
+      "main_model_name": "deepseek-v4-pro",
+      "compaction_model_name": "deepseek-v4-pro",
+      "endpoint_fingerprint": "e31f9727e46e077cf24859a72b202b0a96cf49bf05436a5e1ae7ae90a5dffdfa",
+      "python_version": "Python 3.12.4",
+      "python_executable_sha256": "fd5c46d73d29ba21b04c844bbaf9096066136526911230645a2a040d23fb612b",
+      "budget_enforcement": "post_run_observation",
+      "model_accounting": "main_model_trace_only"
+    },
+    {
+      "run_ids": [
+        "mergesort-buggy-003",
+        "find-first-buggy-003",
+        "breadth-first-search-buggy-003",
+        "quicksort-timeout-buggy-003",
+        "find-first-correct-control-003"
+      ],
+      "source_repository": "https://github.com/jkoppel/QuixBugs.git",
+      "source_revision": "4257f44b0ff1181dedaedee6a447e133219fcebf",
+      "source_tree_sha256": "af561f1971a20044d803f9efecf22df0a74146f926ec2ab15df263d7bc024627",
+      "source_dirty": false,
+      "runner_revision": "4fae8abe7228da063b269c0483bfc6373cab23bb",
+      "runner_dirty": false,
+      "main_model_name": "deepseek-v4-pro",
+      "compaction_model_name": "deepseek-v4-pro",
+      "endpoint_fingerprint": "e31f9727e46e077cf24859a72b202b0a96cf49bf05436a5e1ae7ae90a5dffdfa",
+      "python_version": "Python 3.12.4",
+      "python_executable_sha256": "fd5c46d73d29ba21b04c844bbaf9096066136526911230645a2a040d23fb612b",
+      "budget_enforcement": "post_run_observation",
+      "model_accounting": "main_model_trace_only"
     }
   ],
   "aggregate": {

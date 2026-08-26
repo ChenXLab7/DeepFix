@@ -86,7 +86,7 @@ class LegacyLoopRunner:
         elapsed = max(0.0, self.clock() - started_at)
         if task is None:
             conclusion = "failed"
-            task_id = "unavailable"
+            task_id = f"unavailable-{case.case_id}-{run_dir.name}"
             tool_calls = 0
         else:
             conclusion, task_error = _task_outcome(task)
