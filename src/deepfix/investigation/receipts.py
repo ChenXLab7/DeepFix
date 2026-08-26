@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import threading
+import uuid
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
-from deepagents.backends import BackendProtocol
 from langchain_core.messages import (
     ToolMessage,
     message_to_dict,
@@ -35,19 +38,37 @@ class ToolExecutionReceipt(StrictModel):
 
 
 class ToolExecutionReceiptStore:
-    def __init__(self, backend: BackendProtocol) -> None:
-        self.backend = backend
+    def __init__(self, root_dir: str | Path) -> None:
+        self.root_dir = Path(root_dir).expanduser().resolve()
+        self._locks: dict[Path, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
 
     def save(self, receipt: ToolExecutionReceipt) -> None:
         path = self._path(receipt.task_id, receipt.tool_call_id)
         payload = receipt.model_dump_json(indent=2)
-        written = self.backend.write(path, payload)
-        if written.error:
-            raise RuntimeError("tool execution receipt 写入失败")
-        read = self.backend.read(path)
-        content = None if read.file_data is None else read.file_data["content"]
-        if read.error or content != payload:
-            raise RuntimeError("tool execution receipt 校验失败")
+        with self._lock_for(path):
+            existing = self._load_path(path)
+            if existing is not None:
+                if existing == receipt:
+                    return
+                raise RuntimeError("tool execution receipt 回执冲突")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                with temporary.open(
+                    "x",
+                    encoding="utf-8",
+                    newline="",
+                ) as file:
+                    file.write(payload)
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+            content = path.read_text(encoding="utf-8")
+            if content != payload or self._load_path(path) != receipt:
+                raise RuntimeError("tool execution receipt 校验失败")
 
     def load(
         self,
@@ -55,22 +76,34 @@ class ToolExecutionReceiptStore:
         tool_call_id: str,
     ) -> ToolExecutionReceipt | None:
         path = self._path(task_id, tool_call_id)
-        result = self.backend.read(path)
-        if result.error:
-            return None
-        if result.file_data is None:
-            raise RuntimeError("tool execution receipt 缺少内容")
-        return ToolExecutionReceipt.model_validate_json(
-            result.file_data["content"]
-        )
+        return self._load_path(path)
 
-    @staticmethod
-    def _path(task_id: str, tool_call_id: str) -> str:
-        task_segment = hashlib.sha256(task_id.strip().encode()).hexdigest()[:32]
+    def _path(self, task_id: str, tool_call_id: str) -> Path:
+        task_segment = receipt_task_segment(task_id)
         call_segment = hashlib.sha256(tool_call_id.strip().encode()).hexdigest()[:32]
         if not task_id.strip() or not tool_call_id.strip():
             raise ValueError("receipt task_id 和 tool_call_id 不能为空")
-        return f"/investigation_receipts/{task_segment}/{call_segment}.json"
+        return self.root_dir / task_segment / f"{call_segment}.json"
+
+    def _load_path(self, path: Path) -> ToolExecutionReceipt | None:
+        if not path.exists():
+            return None
+        if not path.is_file():
+            raise RuntimeError("tool execution receipt 缺少内容")
+        return ToolExecutionReceipt.model_validate_json(
+            path.read_text(encoding="utf-8")
+        )
+
+    def _lock_for(self, path: Path) -> threading.Lock:
+        with self._locks_guard:
+            return self._locks.setdefault(path, threading.Lock())
+
+
+def receipt_task_segment(task_id: str) -> str:
+    normalized = task_id.strip()
+    if not normalized:
+        raise ValueError("receipt task_id 不能为空")
+    return hashlib.sha256(normalized.encode()).hexdigest()[:32]
 
 
 def receipt_from_result(

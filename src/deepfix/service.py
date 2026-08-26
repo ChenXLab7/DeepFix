@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 
 from deepfix.approval import ApprovalPolicy, PolicyAction
@@ -13,10 +14,15 @@ from deepfix.compaction.identity import (
     ensure_message_ids,
     stable_conversation_message_id,
 )
+from deepfix.compaction.models import FileChangeEvidence, SystemTestEvidence
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import AppConfig, redact_config_secrets
+from deepfix.debug import append_debug_record
+from deepfix.investigation.classification import is_pytest_verification
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import InvestigationCoordinationError
+from deepfix.investigation.models import InvestigationRecoveryMetadata
+from deepfix.investigation.receipts import receipt_task_segment
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus, TestResult
 from deepfix.persistence import TaskRepository
@@ -140,7 +146,10 @@ class BugfixService:
 
         task.agent_invocations += 1
         self._save(task)
-        graph_config = {"configurable": {"thread_id": task.task_id}}
+        graph_config = {
+            "configurable": {"thread_id": task.task_id},
+            "recursion_limit": self.config.max_graph_steps,
+        }
         try:
             result = self.agent.invoke(value, graph_config)
         except InvestigationCoordinationError as exc:
@@ -149,10 +158,12 @@ class BugfixService:
                 task.transition_to(TaskStatus.FAILED)
                 self._save(task)
                 return task
-            task.investigation_recovery = exc.recovery
+            recovery = self._sanitize_investigation_recovery(exc.recovery)
+            task.investigation_recovery = recovery
+            self._record_investigation_recovery(recovery)
             return self._pause(
                 task,
-                f"调查协调需要恢复：{exc.recovery.error_code}",
+                f"调查协调需要恢复：{recovery.error_code}",
             )
         except ContextCoordinationError as exc:
             if exc.recovery.task_id != task.task_id:
@@ -164,6 +175,11 @@ class BugfixService:
             return self._pause(
                 task,
                 f"上下文协调需要恢复：{exc.recovery.error_code}",
+            )
+        except GraphRecursionError:
+            return self._pause(
+                task,
+                "已达到单次 Agent 执行步骤上限，可能存在重复工具调用循环",
             )
         except Exception as exc:  # noqa: BLE001 - persist every Agent boundary failure
             safe_error = redact_config_secrets(str(exc), self.config)
@@ -273,7 +289,9 @@ class BugfixService:
                     path = str(args.get("file_path", args.get("path", "")))
                     if path:
                         approved_paths.append(path)
-                if name == "execute" and self._is_pytest(str(args.get("command", ""))):
+                if name == "execute" and self._is_pytest(
+                    str(args.get("command", "")), task.project_python
+                ):
                     approved_test = True
             else:
                 graph_decisions.append(
@@ -322,7 +340,9 @@ class BugfixService:
             task.processed_tool_call_ids.append(call_id)
             name, args = calls.get(call_id, (str(message.name or ""), {}))
             command = str(args.get("command", ""))
-            if name != "execute" or not self._is_pytest(command):
+            if name != "execute" or not self._is_pytest(
+                command, task.project_python
+            ):
                 continue
             artifact = message.artifact
             if not isinstance(artifact, Mapping) or "exit_code" not in artifact:
@@ -337,12 +357,15 @@ class BugfixService:
                     source_message_id=str(message.id),
                 )
             )
-            if exit_code == 0:
-                task.consecutive_test_failures = 0
-            else:
-                task.consecutive_test_failures += 1
+            if task.changed_files:
+                if exit_code == 0:
+                    task.consecutive_test_failures = 0
+                else:
+                    task.consecutive_test_failures += 1
 
     def _apply_outcome(self, task: TaskState, outcome: RepairOutcome) -> TaskState:
+        self._sync_context(task)
+        task.resolution = None
         task.hypotheses = list(outcome.hypotheses)
         task.diagnosis = outcome.diagnosis
         task.repair_plan = list(outcome.repair_plan)
@@ -369,7 +392,39 @@ class BugfixService:
             return self._pause(task, outcome.summary)
         elif not any(result.exit_code == 0 for result in task.test_results):
             return self._pause(task, "缺少通过的测试证据，不能标记为完成")
+        elif outcome.resolution == "not_reproduced" and any(
+            result.exit_code != 0 for result in task.test_results
+        ):
+            return self._pause(
+                task,
+                "当前任务存在失败测试证据，不能标记为未复现",
+            )
+        elif outcome.resolution == "not_reproduced" and task.successful_changed_files:
+            return self._pause(
+                task,
+                "当前任务已经成功修改文件，不能标记为未复现",
+            )
         else:
+            if task.successful_changed_files:
+                if not any(
+                    result.exit_code != 0 for result in task.test_results
+                ):
+                    return self._pause(
+                        task,
+                        "缺少修复前的失败测试证据，不能标记为已修复",
+                    )
+                task.resolution = "fixed"
+            elif any(result.exit_code != 0 for result in task.test_results):
+                return self._pause(
+                    task,
+                    "当前任务存在失败测试证据且没有成功修改，不能标记为完成",
+                )
+            else:
+                task.resolution = "not_reproduced"
+                task.final_summary = (
+                    "未复现用户描述的问题：当前环境中所运行的 pytest 测试通过，"
+                    "且未修改代码。"
+                )
             self._return_to_investigating(task)
             task.transition_to(TaskStatus.REVIEWING)
             task.transition_to(TaskStatus.COMPLETED)
@@ -381,6 +436,7 @@ class BugfixService:
             task.transition_to(TaskStatus.INVESTIGATING)
 
     def _pause(self, task: TaskState, reason: str) -> TaskState:
+        task.pause_reason = reason
         task.final_summary = reason
         if task.status is not TaskStatus.PAUSED:
             task.transition_to(TaskStatus.PAUSED)
@@ -422,6 +478,36 @@ class BugfixService:
         self._sync_context(task)
         self.repository.save(task)
 
+    def _sanitize_investigation_recovery(
+        self,
+        recovery: InvestigationRecoveryMetadata,
+    ) -> InvestigationRecoveryMetadata:
+        detail = recovery.error_detail
+        if detail is not None:
+            detail = redact_config_secrets(detail, self.config)
+        return recovery.model_copy(update={"error_detail": detail})
+
+    def _record_investigation_recovery(
+        self,
+        recovery: InvestigationRecoveryMetadata,
+    ) -> None:
+        record = {
+            "event": "investigation_recovery",
+            "task_id": recovery.task_id,
+            "error_code": recovery.error_code,
+            "error_type": recovery.error_type,
+            "error_detail": recovery.error_detail,
+            "error_fingerprint": recovery.error_fingerprint,
+            "recovery_action": recovery.recovery_action,
+        }
+        try:
+            append_debug_record(
+                self.config.artifacts_path / "debug" / "llm_calls.jsonl",
+                record,
+            )
+        except OSError:
+            return
+
     def _sync_context(self, task: TaskState) -> None:
         latest = self.working_memory_store.latest(task.task_id)
         if latest is not None:
@@ -444,6 +530,24 @@ class BugfixService:
                 )
             )
 
+        successful_changed_files: list[str] = []
+        latest_change_verification = "not_applicable"
+        for item in self.compaction_store.list_evidence(task.task_id):
+            if isinstance(item, FileChangeEvidence) and item.status == "succeeded":
+                successful_changed_files = list(
+                    dict.fromkeys([*successful_changed_files, item.path])
+                )
+                latest_change_verification = "pending"
+            elif (
+                isinstance(item, SystemTestEvidence)
+                and latest_change_verification != "not_applicable"
+            ):
+                latest_change_verification = (
+                    "passed" if item.exit_code == 0 else "failed"
+                )
+        task.successful_changed_files = successful_changed_files
+        task.latest_change_verification = latest_change_verification
+
         task.context_metrics = self.working_memory_store.metrics(task.task_id)
         external_evidence = self.research_evidence_store.list_evidence(task.task_id)
         task.external_evidence_ids = [item.evidence_id for item in external_evidence]
@@ -457,18 +561,39 @@ class BugfixService:
         ]
         if self.config.artifacts_path.exists():
             task.offloaded_artifacts = sorted(
-                path.relative_to(self.config.artifacts_path).as_posix()
+                relative_path
                 for path in self.config.artifacts_path.rglob("*")
                 if path.is_file()
+                and _artifact_belongs_to_task(
+                    relative_path := path.relative_to(
+                        self.config.artifacts_path
+                    ).as_posix(),
+                    task,
+                )
             )
 
     @staticmethod
-    def _is_pytest(command: str) -> bool:
-        normalized = command.strip().lower()
-        return normalized == "pytest" or normalized.startswith(
-            ("pytest ", "python -m pytest")
-        )
+    def _is_pytest(command: str, project_python: str) -> bool:
+        return is_pytest_verification(command, project_python)
 
 
 def _bounded_provider_error(value: str, limit: int = 300) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _artifact_belongs_to_task(relative_path: str, task: TaskState) -> bool:
+    normalized = relative_path.replace("\\", "/").lstrip("/")
+    last_compaction = (
+        task.context_metrics.last_compaction_artifact or ""
+    ).replace("\\", "/")
+    artifact_prefix = ".deepfix-artifacts/"
+    last_compaction = last_compaction.removeprefix(artifact_prefix)
+    exact_paths = {
+        f"conversation_history/{task.task_id}.md",
+        last_compaction.lstrip("/"),
+    }
+    task_prefixes = (
+        f"research/{task.task_id}/",
+        f"investigation_receipts/{receipt_task_segment(task.task_id)}/",
+    )
+    return normalized in exact_paths or normalized.startswith(task_prefixes)

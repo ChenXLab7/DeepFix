@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
@@ -57,6 +57,14 @@ class HypothesisProgressInput(StrictModel):
     reason: str | None = None
     reopens_hypothesis_id: str | None = None
     sources: list[ProvenanceRef] = Field(default_factory=list)
+
+    @field_validator("target_state", mode="before")
+    @classmethod
+    def normalize_investigation_state(cls, value: object) -> object:
+        return {
+            "candidate": "active",
+            "supported": "active",
+        }.get(value, value)
 
 
 class HypothesisTransition(HypothesisProgressInput):
@@ -290,4 +298,3 @@ class ContextRecoveryMetadata(StrictModel):
     prepared_snapshot_lifecycle: Literal["prepared", "active", "abandoned"] | None = None
     conversation_artifact: str | None = None
     original_messages_preserved: bool
-

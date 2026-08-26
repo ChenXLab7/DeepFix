@@ -32,6 +32,8 @@ def test_pytest_classifier_accepts_real_pytest_commands(command):
         "pip install pytest",
         "ruff check .",
         "python -c \"print('pytest')\"",
+        "python -m pytest -q 2>&1 | head -50",
+        "python -m pytest -q > pytest.log",
         "",
     ],
 )
@@ -105,4 +107,3 @@ def test_relation_rejects_unverified_relation_type():
             target="src/sign.py",
             source_message_id="msg-1",
         )
-

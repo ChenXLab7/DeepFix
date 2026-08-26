@@ -31,6 +31,8 @@ def is_pytest_verification(command: str, project_python: str) -> bool:
         return False
     if not tokens:
         return False
+    if any(_is_shell_control_token(token) for token in tokens):
+        return False
 
     raw_executable = tokens[0].strip('"')
     executable = Path(raw_executable).name.lower()
@@ -46,6 +48,16 @@ def is_pytest_verification(command: str, project_python: str) -> bool:
         "-m",
         "pytest",
     ]
+
+
+def _is_shell_control_token(token: str) -> bool:
+    value = token.strip()
+    return (
+        value in {"|", "||", "&&", ";", "<", ">"}
+        or value.startswith((">", "<"))
+        or ">&" in value
+        or "<&" in value
+    )
 
 
 def tool_signature(tool_name: str, arguments: Mapping[str, object]) -> str:

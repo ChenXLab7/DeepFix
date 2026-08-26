@@ -1,3 +1,4 @@
+import json
 from collections import deque
 from dataclasses import replace
 from uuid import uuid4
@@ -5,6 +6,7 @@ from uuid import uuid4
 import pytest
 from langchain_core.exceptions import ContextOverflowError
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.errors import GraphRecursionError
 from langgraph.types import Command, Interrupt
 
 from deepfix.approval import ApprovalPolicy
@@ -17,6 +19,7 @@ from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.models import (
     CompactionFailureRecord,
     ContextRecoveryMetadata,
+    FileChangeEvidence,
 )
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config
@@ -29,9 +32,14 @@ from deepfix.investigation.models import (
     AgentPhase,
     InvestigationRecoveryMetadata,
 )
+from deepfix.investigation.receipts import (
+    ToolExecutionReceiptStore,
+    receipt_from_result,
+)
 from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
 from deepfix.models import Evidence, RepairOutcome, TaskState, TaskStatus
+from deepfix.models import TestResult as RepairTestResult
 from deepfix.persistence import TaskRepository
 from deepfix.research.models import ExternalEvidence, SearchCandidate
 from deepfix.research.store import ResearchEvidenceStore
@@ -49,6 +57,29 @@ class FakeAgent:
         if isinstance(result, Exception):
             raise result
         return result
+
+
+def test_service_passes_single_run_graph_step_limit(app_config):
+    fake_agent = FakeAgent(outcome())
+    service, _ = make_service(app_config, fake_agent)
+
+    service.start("prevent internal tool loops")
+
+    _, graph_config = fake_agent.invoke_calls[0]
+    assert graph_config["recursion_limit"] == app_config.max_graph_steps
+
+
+def test_graph_step_limit_pauses_instead_of_failing(app_config):
+    service, repository = make_service(
+        app_config,
+        FakeAgent(GraphRecursionError("recursion limit reached")),
+    )
+
+    task = service.start("prevent internal tool loops")
+
+    assert task.status is TaskStatus.PAUSED
+    assert "单次 Agent 执行步骤上限" in task.pause_reason
+    assert repository.get(task.task_id).status is TaskStatus.PAUSED
 
 
 def make_interrupt(name: str, args: dict[str, object]):
@@ -125,6 +156,46 @@ def test_recorded_test_result_keeps_tool_and_message_provenance(app_config):
     assert len(task.test_results) == 1
     assert task.test_results[0].tool_call_id == "test-call-1"
     assert task.test_results[0].source_message_id == "test-message-1"
+
+
+def test_pre_edit_pytest_failure_does_not_consume_repair_failure_budget(app_config):
+    service, _ = make_service(app_config, FakeAgent())
+    task = TaskState.create(app_config.project_root, "复现错误", ApprovalMode.MANUAL)
+    failed = passing_outcome()
+    failed["messages"][-1].artifact = {"exit_code": 1}
+    failed["messages"][-1].content = "1 failed"
+
+    service._record_tool_results(task, failed)
+
+    assert task.test_results[0].exit_code == 1
+    assert task.consecutive_test_failures == 0
+
+
+def test_pause_syncs_successful_change_as_pending_verification(app_config):
+    service, _ = make_service(app_config, FakeAgent())
+    task = TaskState.create(app_config.project_root, "修复查找错误", ApprovalMode.MANUAL)
+    task.transition_to(TaskStatus.INVESTIGATING)
+    service.compaction_store.save_evidence(
+        task.task_id,
+        FileChangeEvidence(
+            evidence_id="file-change-1",
+            path="python_programs/find_first_in_sorted.py",
+            operation="edit",
+            status="succeeded",
+            tool_call_id="edit-call-1",
+            source_message_id="edit-message-1",
+        ),
+    )
+
+    paused = service._pause(task, "调查协调需要恢复：investigation_state_commit_failed")
+
+    assert paused.successful_changed_files == [
+        "python_programs/find_first_in_sorted.py"
+    ]
+    assert paused.latest_change_verification == "pending"
+    assert paused.pause_reason == (
+        "调查协调需要恢复：investigation_state_commit_failed"
+    )
 
 
 @pytest.fixture
@@ -455,10 +526,17 @@ def test_consecutive_test_failure_budget_pauses_task(app_config):
     failed_result["structured_response"] = outcome()["structured_response"]
     failed_result["messages"][-1].artifact = {"exit_code": 1}
     failed_result["messages"][-1].content = "1 failed"
-    fake_agent = FakeAgent(failed_result)
+    fake_agent = FakeAgent(
+        make_interrupt(
+            "edit_file",
+            {"file_path": "/src/calc.py", "old_string": "x", "new_string": "y"},
+        ),
+        failed_result,
+    )
     service, _ = make_service(limited, fake_agent)
 
-    task = service.start("测试失败")
+    awaiting_approval = service.start("测试失败")
+    task = service.decide(awaiting_approval.task_id, ["approve"])
 
     assert task.status is TaskStatus.PAUSED
     assert task.consecutive_test_failures == 1
@@ -506,7 +584,97 @@ def test_completed_outcome_requires_and_records_passing_test(app_config):
     assert task.status is TaskStatus.COMPLETED
     assert task.test_results[0].command == "pytest -q"
     assert task.test_results[0].exit_code == 0
-    assert task.final_summary == "缺陷已修复"
+    assert task.resolution == "not_reproduced"
+    assert task.final_summary == (
+        "未复现用户描述的问题：当前环境中所运行的 pytest 测试通过，且未修改代码。"
+    )
+
+
+def test_not_reproduced_is_rejected_when_current_task_has_failed_test(app_config):
+    service, _ = make_service(app_config, FakeAgent())
+    task = TaskState.create(app_config.project_root, "测试失败", ApprovalMode.MANUAL)
+    task.transition_to(TaskStatus.INVESTIGATING)
+    task.test_results.extend(
+        [
+            RepairTestResult("pytest -q", 1, "1 failed"),
+            RepairTestResult("pytest -q", 0, "1 passed"),
+        ]
+    )
+
+    result = service._apply_outcome(
+        task,
+        RepairOutcome(
+            status="completed",
+            resolution="not_reproduced",
+            summary="没有复现",
+        ),
+    )
+
+    assert result.status is TaskStatus.PAUSED
+    assert result.resolution is None
+    assert "失败测试证据" in result.final_summary
+
+
+def test_not_reproduced_is_rejected_after_successful_file_change(app_config):
+    service, _ = make_service(app_config, FakeAgent())
+    task = TaskState.create(app_config.project_root, "测试失败", ApprovalMode.MANUAL)
+    task.transition_to(TaskStatus.INVESTIGATING)
+    task.test_results.append(RepairTestResult("pytest -q", 0, "1 passed"))
+    service.compaction_store.save_evidence(
+        task.task_id,
+        FileChangeEvidence(
+            evidence_id="file-change-1",
+            path="python_programs/example.py",
+            operation="edit",
+            status="succeeded",
+            tool_call_id="edit-call-1",
+            source_message_id="edit-message-1",
+        ),
+    )
+
+    result = service._apply_outcome(
+        task,
+        RepairOutcome(
+            status="completed",
+            resolution="not_reproduced",
+            summary="没有复现",
+        ),
+    )
+
+    assert result.status is TaskStatus.PAUSED
+    assert result.resolution is None
+    assert "已经成功修改文件" in result.final_summary
+
+
+def test_fixed_is_rejected_without_reproduced_failure(app_config):
+    service, _ = make_service(app_config, FakeAgent())
+    task = TaskState.create(app_config.project_root, "测试失败", ApprovalMode.MANUAL)
+    task.transition_to(TaskStatus.INVESTIGATING)
+    task.test_results.append(RepairTestResult("pytest -q", 0, "1 passed"))
+    service.compaction_store.save_evidence(
+        task.task_id,
+        FileChangeEvidence(
+            evidence_id="file-change-1",
+            path="python_programs/example.py",
+            operation="edit",
+            status="succeeded",
+            tool_call_id="edit-call-1",
+            source_message_id="edit-message-1",
+        ),
+    )
+
+    result = service._apply_outcome(
+        task,
+        RepairOutcome(
+            status="completed",
+            resolution="fixed",
+            summary="已经修复",
+        ),
+    )
+
+    assert result.status is TaskStatus.PAUSED
+    assert result.resolution is None
+    assert "缺少修复前的失败测试证据" in result.final_summary
 
 
 def test_completed_outcome_without_passing_test_is_paused(app_config):
@@ -712,6 +880,21 @@ class DiagnosticArtifactErrorAgent:
         raise InvestigationStateError(recovery)
 
 
+class DetailedInvestigationErrorAgent:
+    def invoke(self, value, config):
+        task_id = config["configurable"]["thread_id"]
+        recovery = investigation_recovery(task_id).model_copy(
+            update={
+                "error_code": "tool_receipt_persistence_failed",
+                "error_type": "OSError",
+                "error_detail": "disk rejected secret",
+                "error_fingerprint": "error_deadbeef",
+                "recovery_action": "do_not_retry_tool_without_manual_recovery",
+            }
+        )
+        raise InvestigationStateError(recovery)
+
+
 def test_investigation_error_pauses_and_persists_metadata(app_config):
     coordinator = service_coordinator(app_config)
     service, repository = make_service(
@@ -728,6 +911,35 @@ def test_investigation_error_pauses_and_persists_metadata(app_config):
         repository.get(task.task_id).investigation_recovery
         == task.investigation_recovery
     )
+
+
+def test_investigation_recovery_redacts_detail_and_writes_debug_event(app_config):
+    service, repository = make_service(
+        app_config,
+        DetailedInvestigationErrorAgent(),
+    )
+
+    task = service.start("receipt persistence fails")
+    persisted = repository.get(task.task_id)
+    log_path = app_config.artifacts_path / "debug" / "llm_calls.jsonl"
+    records = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert persisted.investigation_recovery.error_detail == (
+        "disk rejected [REDACTED]"
+    )
+    assert all("secret" not in line for line in log_path.read_text(encoding="utf-8").splitlines())
+    assert records[-1] == {
+        "event": "investigation_recovery",
+        "task_id": task.task_id,
+        "error_code": "tool_receipt_persistence_failed",
+        "error_type": "OSError",
+        "error_detail": "disk rejected [REDACTED]",
+        "error_fingerprint": "error_deadbeef",
+        "recovery_action": "do_not_retry_tool_without_manual_recovery",
+    }
 
 
 def test_foreign_investigation_recovery_task_id_fails_closed(app_config):
@@ -868,18 +1080,74 @@ def test_recovery_metadata_clears_only_after_successful_resumed_invoke(app_confi
     assert resumed.context_recovery is None
 
 
-def test_service_records_existing_context_artifacts(app_config, memory_store):
-    history = app_config.artifacts_path / "conversation_history" / "task.md"
-    large_result = app_config.artifacts_path / "large_tool_results" / "call-1"
-    history.parent.mkdir(parents=True)
-    large_result.parent.mkdir(parents=True)
-    history.write_text("history", encoding="utf-8")
-    large_result.write_text("output", encoding="utf-8")
-    service, _ = make_service(app_config, FakeAgent(outcome()), memory_store)
+def test_service_records_only_current_task_artifacts(app_config, memory_store):
+    service, _ = make_service(app_config, FakeAgent(), memory_store)
+    task = TaskState.create(app_config.project_root, "测试失败", ApprovalMode.MANUAL)
+    current_history = (
+        app_config.artifacts_path / "conversation_history" / f"{task.task_id}.md"
+    )
+    foreign_history = (
+        app_config.artifacts_path / "conversation_history" / "other-task.md"
+    )
+    current_research = (
+        app_config.artifacts_path / "research" / task.task_id / "evidence.md"
+    )
+    foreign_research = (
+        app_config.artifacts_path / "research" / "other-task" / "evidence.md"
+    )
+    for path in (
+        current_history,
+        foreign_history,
+        current_research,
+        foreign_research,
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("artifact", encoding="utf-8")
+    receipt_store = ToolExecutionReceiptStore(
+        app_config.artifacts_path / "investigation_receipts"
+    )
+    current_receipt = receipt_from_result(
+        task.task_id,
+        {
+            "name": "read_file",
+            "id": "current-read",
+            "args": {"file_path": "src/current.py"},
+        },
+        ToolMessage(
+            id="current-result",
+            content="current",
+            name="read_file",
+            tool_call_id="current-read",
+        ),
+    )
+    foreign_receipt = receipt_from_result(
+        "other-task",
+        {
+            "name": "read_file",
+            "id": "foreign-read",
+            "args": {"file_path": "src/foreign.py"},
+        },
+        ToolMessage(
+            id="foreign-result",
+            content="foreign",
+            name="read_file",
+            tool_call_id="foreign-read",
+        ),
+    )
+    receipt_store.save(current_receipt)
+    receipt_store.save(foreign_receipt)
+    current_receipt_path = next(
+        path
+        for path in (app_config.artifacts_path / "investigation_receipts").rglob(
+            "*.json"
+        )
+        if task.task_id in path.read_text(encoding="utf-8")
+    ).relative_to(app_config.artifacts_path).as_posix()
 
-    task = service.start("测试失败")
+    service._save(task)
 
     assert task.offloaded_artifacts == [
-        "conversation_history/task.md",
-        "large_tool_results/call-1",
+        f"conversation_history/{task.task_id}.md",
+        current_receipt_path,
+        f"research/{task.task_id}/evidence.md",
     ]

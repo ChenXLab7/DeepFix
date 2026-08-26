@@ -38,6 +38,7 @@ from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.tools import build_compact_conversation_tool
 from deepfix.config import AppConfig, ModelRoleConfig
 from deepfix.context import build_save_progress_tool
+from deepfix.debug import LLMTraceMiddleware
 from deepfix.extensions import AgentExtensions, merge_extensions
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.middleware import InvestigationMiddleware
@@ -241,7 +242,9 @@ def build_agent(
             ),
             InvestigationMiddleware(
                 investigation,
-                ToolExecutionReceiptStore(resolved_backend),
+                ToolExecutionReceiptStore(
+                    config.artifacts_path / "investigation_receipts"
+                ),
                 capabilities,
             ),
             PromptPolicyMiddleware(investigation_store),
@@ -252,6 +255,10 @@ def build_agent(
                 coordinator,
             ),
             *resolved.middleware,
+            LLMTraceMiddleware(
+                log_path=config.artifacts_path / "debug" / "llm_calls.jsonl",
+                role="main",
+            ),
         ],
         backend=resolved_backend,
         subagents=[],

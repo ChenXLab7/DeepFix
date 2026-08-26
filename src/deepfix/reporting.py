@@ -80,12 +80,14 @@ def render_report(
         "",
         "## 结论、风险与未验证项",
         "",
-        f"结论：{task.final_summary or '无'}",
+        f"处理结果：{_resolution_label(task)}",
+        f"结论：{_conclusion(task)}",
+        f"暂停原因：{task.pause_reason or '无'}",
         f"复核：{task.review or '无'}",
         "残余风险：",
         *_list_or_none(task.residual_risks),
         "未验证项：",
-        *_list_or_none(task.unverified_items),
+        *_unverified_lines(task),
     ]
     return "\n".join(sections).rstrip() + "\n"
 
@@ -97,6 +99,38 @@ def _evidence_lines(task: TaskState) -> list[str]:
         f"- {item.source}：{item.observation}"
         for item in task.evidence
     ]
+
+
+def _conclusion(task: TaskState) -> str:
+    if task.pause_reason and task.successful_changed_files:
+        paths = "、".join(task.successful_changed_files)
+        verification = {
+            "pending": "最新修改尚未经过测试验证",
+            "passed": "最新修改已经通过测试验证",
+            "failed": "最新修改后的测试仍然失败",
+            "not_applicable": "最新修改缺少验证状态",
+        }[task.latest_change_verification]
+        return (
+            f"代码修改已成功写入：{paths}；{verification}；"
+            f"Agent 流程已暂停"
+        )
+    return task.final_summary or "无"
+
+
+def _resolution_label(task: TaskState) -> str:
+    return {
+        "fixed": "已修复（fixed）",
+        "not_reproduced": "未复现（not_reproduced）",
+    }.get(task.resolution, "无")
+
+
+def _unverified_lines(task: TaskState) -> list[str]:
+    items = list(task.unverified_items)
+    if task.latest_change_verification == "pending":
+        pending = "最新成功修改尚未运行后续验证"
+        if pending not in items:
+            items.append(pending)
+    return _list_or_none(items)
 
 
 def _test_lines(task: TaskState) -> list[str]:

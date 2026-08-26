@@ -14,6 +14,9 @@ _MODEL_ENV_NAMES = (
     "DEEPFIX_MAIN_MODEL",
     "DEEPFIX_COMPACTION_MODEL",
     "DEEPSEEK_BASE_URL",
+    "DEEPFIX_DIAGNOSTIC_TIMEOUT_SECONDS",
+    "DEEPFIX_VERIFICATION_TIMEOUT_SECONDS",
+    "DEEPFIX_MAX_GRAPH_STEPS",
 )
 
 
@@ -57,6 +60,49 @@ def test_load_config_resolves_project_and_state_paths(tmp_path, monkeypatch):
     assert config.main_model.model_name == "deepseek-v4-pro"
     assert config.compaction_model.model_name == "deepseek-v4-flash"
     assert config.approval_mode is ApprovalMode.MANUAL
+    assert config.diagnostic_timeout_seconds == 10
+    assert config.verification_timeout_seconds == 120
+
+
+def test_load_config_accepts_separate_shell_timeout_limits(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_DIAGNOSTIC_TIMEOUT_SECONDS", "3")
+    monkeypatch.setenv("DEEPFIX_VERIFICATION_TIMEOUT_SECONDS", "45")
+
+    config = load_isolated(tmp_path, ApprovalMode.MANUAL, tmp_path)
+
+    assert config.diagnostic_timeout_seconds == 3
+    assert config.verification_timeout_seconds == 45
+
+
+def test_load_config_accepts_graph_step_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_MAX_GRAPH_STEPS", "24")
+
+    config = load_isolated(tmp_path, ApprovalMode.MANUAL, tmp_path)
+
+    assert config.max_graph_steps == 24
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("DEEPFIX_DIAGNOSTIC_TIMEOUT_SECONDS", "0"),
+        ("DEEPFIX_DIAGNOSTIC_TIMEOUT_SECONDS", "abc"),
+        ("DEEPFIX_VERIFICATION_TIMEOUT_SECONDS", "-1"),
+    ],
+)
+def test_load_config_rejects_invalid_shell_timeout_limits(
+    tmp_path,
+    monkeypatch,
+    name,
+    value,
+):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        load_isolated(tmp_path, ApprovalMode.MANUAL, tmp_path)
 
 
 def test_load_config_rejects_missing_project(tmp_path, monkeypatch):

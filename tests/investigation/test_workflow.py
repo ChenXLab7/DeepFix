@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from deepagents.backends import FilesystemBackend
 from langchain.agents.middleware import ToolCallRequest
 from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
@@ -46,13 +45,11 @@ class ScriptStep:
 class OfflineRepairHarness:
     def __init__(self, tmp_path: Path) -> None:
         self.investigation = coordinator_fixture(tmp_path)
-        backend = FilesystemBackend(
-            root_dir=tmp_path / "artifacts",
-            virtual_mode=True,
-        )
         self.middleware = InvestigationMiddleware(
             self.investigation,
-            ToolExecutionReceiptStore(backend),
+            ToolExecutionReceiptStore(
+                tmp_path / "artifacts" / "investigation_receipts"
+            ),
             {
                 "read_file": InvestigationCapability.READ,
                 "grep": InvestigationCapability.SEARCH,
@@ -279,7 +276,7 @@ def test_bfs_repository_scan_is_stopped_before_context_growth(tmp_path: Path) ->
     assert harness.investigation.state("task-a").stagnation_level == 1
 
 
-def test_gcd_repeat_gets_one_permit_then_pauses(tmp_path: Path) -> None:
+def test_gcd_exact_repeat_is_corrected_then_pauses_before_permit(tmp_path: Path) -> None:
     harness = OfflineRepairHarness(tmp_path)
     hypothesis = harness.investigation.record_hypothesis(
         "task-a",
@@ -293,15 +290,15 @@ def test_gcd_repeat_gets_one_permit_then_pauses(tmp_path: Path) -> None:
         source_id="hyp-gcd-call",
     )
 
-    with pytest.raises(InvestigationStagnationError):
+    with pytest.raises(InvestigationStagnationError) as caught:
         harness.run(_repeated_pytest_steps(hypothesis.hypothesis_id))
 
     events = harness.investigation.store.list_events("task-a")
     assert sum(
         event.event_type == "investigation_permit_granted" for event in events
-    ) == 1
-    assert harness.execution_counts.total() == 5
-    assert harness.investigation.state("task-a").stagnation_level == 2
+    ) == 0
+    assert harness.execution_counts.total() == 1
+    assert caught.value.recovery.error_code == "duplicate_execute_ignored"
 
 
 def test_store_failure_after_tool_execution_does_not_rerun_tool(
@@ -340,10 +337,7 @@ def test_store_failure_after_tool_execution_does_not_rerun_tool(
     middleware = InvestigationMiddleware(
         coordinator,
         ToolExecutionReceiptStore(
-            FilesystemBackend(
-                root_dir=tmp_path / "artifacts",
-                virtual_mode=True,
-            )
+            tmp_path / "artifacts" / "investigation_receipts"
         ),
         {"edit_file": InvestigationCapability.MODIFY},
     )

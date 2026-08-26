@@ -21,10 +21,21 @@ DEEPFIX_MAIN_API_KEY=
 DEEPFIX_COMPACTION_MODEL=deepseek-v4-flash
 DEEPFIX_COMPACTION_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPFIX_DIAGNOSTIC_TIMEOUT_SECONDS=10
+DEEPFIX_VERIFICATION_TIMEOUT_SECONDS=120
+DEEPFIX_MAX_GRAPH_STEPS=40
 ```
 
 进程环境变量优先于这个文件。不要把真实 API Key 写进源码、配置样例、测试或 Git 历史，也不要提交
 `src/deepfix/.env`。
+
+Shell 执行有两级不可突破的硬上限：普通诊断命令默认 10 秒，直接 pytest 验证默认
+120 秒。模型提供的 `timeout` 只能缩短、不能提高上限。超时会终止整个进程树，并以
+`exit_code=124` 和 `timed_out=true` 返回给 Agent，供其判断死循环或阻塞原因。
+
+单次 Agent Graph 执行默认最多 40 个步骤。达到上限通常表示模型陷入重复工具调用，
+DeepFix 会暂停任务并保留恢复状态，而不是继续消耗模型调用。可以通过
+`DEEPFIX_MAX_GRAPH_STEPS` 调低或调高该上限。
 
 如果目标项目使用的不是当前终端里的 Python，显式传入它的解释器。DeepFix 会把该路径保存在任务中，恢复任务时继续使用同一个环境：
 

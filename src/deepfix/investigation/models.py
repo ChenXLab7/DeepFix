@@ -230,9 +230,21 @@ class InvestigationState(StrictModel):
     reevaluation_required: bool = False
     stagnation_level: Literal[0, 1, 2] = 0
     diagnostic_decision_required: bool = False
+    diagnostic_test_count_since_decision: int = 0
+    repair_reevaluation_required: bool = False
     decision_correction_used: bool = False
     permit: InvestigationPermit | None = None
     post_permit_review_pending: bool = False
+    memory_save_failure_count: int = 0
+    memory_save_blocked_generation: int | None = None
+    memory_saved_generation: int | None = None
+    last_execute_signature: str | None = None
+    last_execute_generation: int | None = None
+    duplicate_execute_correction_signature: str | None = None
+    duplicate_hypothesis_correction_ids: list[str] = Field(
+        default_factory=list,
+        max_length=16,
+    )
 
     @classmethod
     def new(cls, task_id: str) -> InvestigationState:
@@ -249,3 +261,6 @@ class InvestigationRecoveryMetadata(StrictModel):
     permit_id: str | None = None
     checkpoint_available: bool
     recovery_action: str = Field(min_length=1)
+    error_type: str | None = Field(default=None, max_length=120)
+    error_detail: str | None = Field(default=None, max_length=500)
+    error_fingerprint: str | None = Field(default=None, max_length=80)

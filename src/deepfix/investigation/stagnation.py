@@ -38,6 +38,7 @@ class StagnationDetector:
                 "stagnation_level": 0,
                 "permit": None,
                 "post_permit_review_pending": False,
+                "duplicate_hypothesis_correction_ids": [],
             }
         )
 

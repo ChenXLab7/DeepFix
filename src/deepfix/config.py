@@ -36,11 +36,13 @@ class AppConfig:
     approval_mode: ApprovalMode
     project_python: Path
     search_provider: str | None = None
-    shell_timeout_seconds: int = 120
+    diagnostic_timeout_seconds: int = 10
+    verification_timeout_seconds: int = 120
     max_shell_calls: int = 20
     max_changed_files: int = 10
     max_agent_invocations: int = 30
     max_consecutive_test_failures: int = 3
+    max_graph_steps: int = 40
 
 
 def load_config(
@@ -80,6 +82,15 @@ def load_config(
     if not python_executable.is_file():
         raise ValueError(f"Python 解释器不存在: {python_executable}")
     search_provider = _load_search_provider()
+    diagnostic_timeout_seconds = _positive_int(
+        "DEEPFIX_DIAGNOSTIC_TIMEOUT_SECONDS",
+        10,
+    )
+    verification_timeout_seconds = _positive_int(
+        "DEEPFIX_VERIFICATION_TIMEOUT_SECONDS",
+        120,
+    )
+    max_graph_steps = _positive_int("DEEPFIX_MAX_GRAPH_STEPS", 40)
     database_path = state_database_path()
     artifacts_path = database_path.parent / "artifacts"
     artifacts_path.mkdir(parents=True, exist_ok=True)
@@ -100,6 +111,9 @@ def load_config(
         approval_mode=approval_mode,
         project_python=python_executable,
         search_provider=search_provider,
+        diagnostic_timeout_seconds=diagnostic_timeout_seconds,
+        verification_timeout_seconds=verification_timeout_seconds,
+        max_graph_steps=max_graph_steps,
     )
 
 
@@ -115,6 +129,19 @@ def _model_name(name: str, default: str) -> str:
     if name in os.environ and not os.environ[name].strip():
         raise ValueError(f"{name} 不能为空")
     return _configured(name) or default
+
+
+def _positive_int(name: str, default: int) -> int:
+    raw_value = _configured(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} 必须是正整数") from error
+    if value <= 0:
+        raise ValueError(f"{name} 必须是正整数")
+    return value
 
 
 def _base_url() -> str:

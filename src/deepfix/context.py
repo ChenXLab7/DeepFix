@@ -25,6 +25,8 @@ from deepfix.compaction.models import (
     ProvenanceRef,
     SnapshotCoverage,
 )
+from deepfix.compaction.store import CompactionStore
+from deepfix.compaction.work_units import partition_work_units
 from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import WorkingMemoryStore, WorkingMemoryVersion
 from deepfix.models import Evidence
@@ -35,7 +37,15 @@ from deepfix.research.store import ResearchEvidenceStore
 _TRUNCATION_MARKER = "…[truncated]"
 
 
-def build_save_progress_tool(store: WorkingMemoryStore) -> BaseTool:
+def build_save_progress_tool(
+    store: WorkingMemoryStore,
+    *,
+    compaction_store: CompactionStore | None = None,
+    investigation_store: InvestigationStore | None = None,
+) -> BaseTool:
+    evidence_store = compaction_store or CompactionStore(store.database_path)
+    investigation = investigation_store or InvestigationStore(store.database_path)
+
     def save_progress(
         phase: Literal[
             "clarifying",
@@ -72,9 +82,51 @@ def build_save_progress_tool(store: WorkingMemoryStore) -> BaseTool:
         try:
             state_messages = list(runtime.state.get("messages", []))
             identities = ensure_message_ids(thread_id, state_messages)
-            valid_source_ids = {
-                str(message.id) for message in identities.messages if message.id
+            work_unit_ids = {
+                unit.unit_id
+                for unit in partition_work_units(identities.messages, set()).units
             }
+            user_message_ids = {
+                str(message.id)
+                for message in identities.messages
+                if isinstance(message, HumanMessage) and message.id
+            }
+            deterministic_evidence_ids = {
+                item.evidence_id for item in evidence_store.list_evidence(thread_id)
+            }
+            latest_memory = store.latest(thread_id)
+            memory_ids = set()
+            if latest_memory is not None:
+                memory_ids.update(
+                    item.claim_id for item in latest_memory.snapshot.facts
+                )
+                memory_ids.update(
+                    item.hypothesis_id
+                    for item in latest_memory.snapshot.all_hypotheses()
+                )
+            investigation_state = investigation.load(thread_id)
+            seed_hypotheses = []
+            if investigation_state is not None:
+                for item in investigation_state.hypotheses:
+                    sources = [
+                        ProvenanceRef(kind="system_evidence", ref_id=evidence_id)
+                        for evidence_id in item.evidence_ids
+                    ]
+                    seed_hypotheses.append(
+                        HypothesisRecord(
+                            hypothesis_id=item.hypothesis_id,
+                            text=item.statement,
+                            state=(
+                                "rejected"
+                                if item.state == "rejected"
+                                else "active"
+                            ),
+                            reason=item.reason,
+                            sources=sources,
+                            updated_in_version=1,
+                        )
+                    )
+                    memory_ids.add(item.hypothesis_id)
             last_user_message_id = next(
                 (
                     str(message.id)
@@ -102,7 +154,15 @@ def build_save_progress_tool(store: WorkingMemoryStore) -> BaseTool:
                         if message.id
                     ],
                 ),
-                valid_source_ids=valid_source_ids,
+                valid_sources={
+                    "user_message": user_message_ids,
+                    "work_unit": work_unit_ids,
+                    "working_memory": memory_ids,
+                    "system_evidence": deterministic_evidence_ids,
+                    "artifact": set(),
+                    "snapshot_record": set(),
+                },
+                seed_hypotheses=seed_hypotheses,
             )
         except (ValidationError, ValueError) as exc:
             return ToolMessage(

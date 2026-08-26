@@ -39,6 +39,21 @@ def invalid_supported_call(call_id: str) -> dict[str, object]:
     }
 
 
+def valid_candidate_call(call_id: str) -> dict[str, object]:
+    return {
+        "name": "record_hypothesis",
+        "id": call_id,
+        "type": "tool_call",
+        "args": {
+            "statement": "capacity=0 may expose a boundary bug",
+            "evidence_ids": [],
+            "checked_locations": [],
+            "target_state": "candidate",
+            "reason": "needs a targeted test",
+        },
+    }
+
+
 def valid_continue_call(call_id: str) -> dict[str, object]:
     return {
         "name": "continue_investigation",
@@ -74,6 +89,17 @@ def test_invalid_hypothesis_returns_stable_error_tool_message(tmp_path):
         "call-1",
         "hypothesis_validation_error",
     )
+
+
+def test_candidate_receipt_exposes_id_and_next_action_to_model(tmp_path):
+    tool = build_record_hypothesis_tool(coordinator_fixture(tmp_path))
+
+    result = invoke_tool(tool, valid_candidate_call("candidate-call"), "task-a")
+
+    hypothesis_id = result.artifact["hypothesis_id"]
+    assert result.status == "success"
+    assert hypothesis_id in result.text
+    assert "continue_investigation" in result.text
 
 
 def test_continue_tool_returns_bound_permit(tmp_path):

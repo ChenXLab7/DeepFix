@@ -1,3 +1,6 @@
+import sys
+import time
+
 from deepagents.backends import CompositeBackend, LocalShellBackend
 
 from deepfix.backend import build_backend
@@ -43,6 +46,70 @@ def test_backend_shell_uses_project_cwd_without_exposing_api_key(tmp_path, monke
     assert str(tmp_path.resolve()) in result.output
     assert all(secret not in result.output for secret in secrets.values())
     assert result.output.count("None") == 3
+
+
+def test_backend_hard_caps_diagnostic_command_and_reports_timeout(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("DEEPFIX_DIAGNOSTIC_TIMEOUT_SECONDS", "1")
+    backend = build_backend(load_config(tmp_path, ApprovalMode.MANUAL))
+
+    started_at = time.monotonic()
+    result = backend.execute(
+        f'"{sys.executable}" -c "while True: pass"',
+        timeout=60,
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert result.exit_code == 124
+    assert elapsed < 5
+    assert "timed_out: true" in result.output
+    assert "command_kind: diagnostic" in result.output
+    assert "timeout_seconds: 1" in result.output
+    assert "不要原样重试" in result.output
+
+
+def test_backend_uses_separate_verification_timeout_for_pytest(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "test_slow.py").write_text(
+        "import time\n\ndef test_slow():\n    time.sleep(1.25)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("DEEPFIX_DIAGNOSTIC_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("DEEPFIX_VERIFICATION_TIMEOUT_SECONDS", "3")
+    backend = build_backend(load_config(tmp_path, ApprovalMode.MANUAL))
+
+    result = backend.execute(
+        f'"{sys.executable}" -m pytest test_slow.py -q',
+        timeout=60,
+    )
+
+    assert result.exit_code == 0
+    assert "1 passed" in result.output
+
+
+def test_backend_timeout_terminates_the_child_process_tree(tmp_path, monkeypatch):
+    marker = tmp_path / "orphan-process-finished.txt"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("DEEPFIX_DIAGNOSTIC_TIMEOUT_SECONDS", "1")
+    backend = build_backend(load_config(tmp_path, ApprovalMode.MANUAL))
+
+    result = backend.execute(
+        f'"{sys.executable}" -c "import time, pathlib; time.sleep(2); '
+        "pathlib.Path('orphan-process-finished.txt').write_text('alive')\""
+    )
+    time.sleep(1.5)
+
+    assert result.exit_code == 124
+    assert not marker.exists()
 
 
 def test_backend_routes_context_artifacts_outside_target_project(tmp_path, monkeypatch):

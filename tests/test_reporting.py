@@ -85,6 +85,47 @@ def test_report_uses_exit_code_not_success_wording_to_mark_test_result(tmp_path)
     assert "[通过] `pytest -q`" not in report
 
 
+def test_report_labels_not_reproduced_resolution(tmp_path):
+    task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
+    task.resolution = "not_reproduced"
+    task.final_summary = (
+        "未复现用户描述的问题：当前环境中所运行的 pytest 测试通过，且未修改代码。"
+    )
+
+    report = render_report(task)
+
+    assert "处理结果：未复现（not_reproduced）" in report
+    assert "结论：未复现用户描述的问题" in report
+
+
+def test_paused_report_preserves_successful_unverified_change(tmp_path):
+    task = TaskState.create(tmp_path, "查找首个元素失败", ApprovalMode.MANUAL)
+    task.changed_files.append("python_programs/find_first_in_sorted.py")
+    task.successful_changed_files.append(
+        "python_programs/find_first_in_sorted.py"
+    )
+    task.latest_change_verification = "pending"
+    task.pause_reason = "调查协调需要恢复：investigation_state_commit_failed"
+    task.final_summary = task.pause_reason
+
+    report = render_report(task)
+
+    assert "代码修改已成功写入：python_programs/find_first_in_sorted.py" in report
+    assert "最新修改尚未经过测试验证" in report
+    assert "暂停原因：调查协调需要恢复：investigation_state_commit_failed" in report
+
+
+def test_approved_change_without_success_evidence_is_not_reported_as_written(tmp_path):
+    task = TaskState.create(tmp_path, "查找首个元素失败", ApprovalMode.MANUAL)
+    task.changed_files.append("python_programs/find_first_in_sorted.py")
+    task.pause_reason = "编辑前暂停"
+    task.final_summary = task.pause_reason
+
+    report = render_report(task)
+
+    assert "代码修改已成功写入" not in report
+
+
 def test_report_renders_deterministic_context_metrics_and_artifacts(tmp_path):
     task = TaskState.create(tmp_path, "超长修复任务", ApprovalMode.MANUAL)
     task.working_memory_version = 3

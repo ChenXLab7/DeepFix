@@ -81,11 +81,19 @@ def build_record_hypothesis_tool(
                 f"记录假设失败：{_safe_validation_error(exc)}",
                 "record_hypothesis",
             )
+        next_action = (
+            "；需要收集新证据时，调用 continue_investigation 并引用该 hypothesis_id"
+            if record.state == "candidate"
+            else ""
+        )
         return _success_message(
             task_id,
             call_id,
             "hypothesis_recorded",
-            "调查假设已记录",
+            (
+                f"调查假设已记录：hypothesis_id={record.hypothesis_id}，"
+                f"state={record.state}{next_action}"
+            ),
             "record_hypothesis",
             {
                 "hypothesis_id": record.hypothesis_id,

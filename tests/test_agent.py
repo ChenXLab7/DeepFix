@@ -203,6 +203,9 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     investigation_middleware = next(
         item for item in middleware if type(item).__name__ == "InvestigationMiddleware"
     )
+    assert investigation_middleware.receipts.root_dir == (
+        config.artifacts_path / "investigation_receipts"
+    ).resolve()
     assert investigation_middleware.capabilities["search_diagnostic_artifacts"] is (
         InvestigationCapability.READ
     )

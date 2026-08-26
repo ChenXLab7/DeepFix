@@ -121,6 +121,37 @@ def test_file_success_requires_paired_system_artifact(tmp_path):
     ]
 
 
+def test_deepagents_edit_success_receipt_without_artifact_is_file_evidence(tmp_path):
+    collector = _collector(tmp_path)
+    task = _task(tmp_path)
+    call = {
+        "name": "edit_file",
+        "args": {
+            "file_path": "python_programs/find_first_in_sorted.py",
+            "old_string": "hi = len(arr)",
+            "new_string": "hi = len(arr) - 1",
+        },
+        "id": "edit-deepagents-1",
+        "type": "tool_call",
+    }
+    result = ToolMessage(
+        id="msg-edit-deepagents-1",
+        content=(
+            "Successfully replaced 1 instance(s) of the string in "
+            "'/python_programs/find_first_in_sorted.py'"
+        ),
+        name="edit_file",
+        tool_call_id="edit-deepagents-1",
+    )
+
+    evidence = collector.collect_pair(task.task_id, call, result, task)
+
+    assert evidence is not None
+    assert evidence.operation == "edit"
+    assert evidence.status == "succeeded"
+    assert evidence.path == "python_programs/find_first_in_sorted.py"
+
+
 def test_approvals_and_research_are_task_scoped_and_store_authoritative(tmp_path):
     database = tmp_path / "deepfix.sqlite3"
     research = ResearchEvidenceStore(database)

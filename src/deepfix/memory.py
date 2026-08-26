@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -180,16 +181,28 @@ class WorkingMemoryStore:
         next_steps: list[str],
         unresolved_questions: list[str],
         coverage: SnapshotCoverage,
-        valid_source_ids: set[str],
+        valid_source_ids: set[str] | None = None,
+        valid_sources: Mapping[str, set[str]] | None = None,
+        seed_hypotheses: list[HypothesisRecord] | None = None,
     ) -> WorkingMemoryVersion:
         normalized_task_id = self._normalize_task_id(task_id)
-        self._validate_sources(facts, hypotheses, valid_source_ids)
+        self._validate_sources(
+            facts,
+            hypotheses,
+            valid_source_ids=valid_source_ids,
+            valid_sources=valid_sources,
+        )
         latest = self.latest(normalized_task_id)
         next_version = (latest.version if latest else 0) + 1
         existing = {
             item.hypothesis_id: item
             for item in (latest.snapshot.all_hypotheses() if latest else [])
         }
+        for hypothesis in seed_hypotheses or []:
+            existing.setdefault(
+                hypothesis.hypothesis_id,
+                hypothesis.model_copy(update={"updated_in_version": next_version}),
+            )
         for update in hypotheses:
             self._apply_hypothesis_update(
                 normalized_task_id,
@@ -414,14 +427,23 @@ class WorkingMemoryStore:
     def _validate_sources(
         facts: list[FactCandidate],
         hypotheses: list[HypothesisProgressInput],
-        valid_source_ids: set[str],
+        *,
+        valid_source_ids: set[str] | None,
+        valid_sources: Mapping[str, set[str]] | None,
     ) -> None:
+        if valid_sources is None and valid_source_ids is None:
+            raise ValueError("必须提供当前任务的合法 source registry")
         for source in (
             source
             for item in [*facts, *hypotheses]
             for source in item.sources
         ):
-            if source.ref_id not in valid_source_ids:
+            allowed = (
+                valid_sources.get(source.kind, set())
+                if valid_sources is not None
+                else valid_source_ids or set()
+            )
+            if source.ref_id not in allowed:
                 raise ValueError(f"source ref_id 不属于当前任务: {source.ref_id}")
 
     @staticmethod

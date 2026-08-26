@@ -11,6 +11,9 @@ from langgraph.runtime import ExecutionInfo, Runtime
 
 from deepfix.agent import build_main_model
 from deepfix.backend import build_backend
+from deepfix.compaction.models import SystemTestEvidence
+from deepfix.compaction.store import CompactionStore
+from deepfix.compaction.work_units import partition_work_units
 from deepfix.config import ApprovalMode, load_config
 from deepfix.context import (
     ContextMemoryMiddleware,
@@ -18,6 +21,8 @@ from deepfix.context import (
     build_save_progress_tool,
     render_working_memory,
 )
+from deepfix.investigation.identity import stable_investigation_id
+from deepfix.investigation.models import InvestigationHypothesis, NewInvestigationEvent
 from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore, WorkingMemoryVersion
 from deepfix.prompting import PromptPolicyMiddleware
@@ -141,6 +146,177 @@ def test_save_progress_rejects_invalid_snapshot_without_writing_version(tmp_path
     assert result.status == "error"
     assert "hypothesis_id" in result.text
     assert store.latest("task-invalid") is None
+
+
+def test_save_progress_accepts_current_task_evidence_and_investigation_hypothesis(
+    tmp_path,
+):
+    database = tmp_path / "deepfix.sqlite3"
+    memory = WorkingMemoryStore(database)
+    compaction = CompactionStore(database)
+    investigation = InvestigationStore(database)
+    task_id = "task-a"
+    evidence_id = "evidence-test-failure"
+    hypothesis_id = "hyp-supported-root-cause"
+    compaction.save_evidence(
+        task_id,
+        SystemTestEvidence(
+            evidence_id=evidence_id,
+            command="python -m pytest test_mergesort.py -q",
+            exit_code=1,
+            summary="RecursionError",
+            tool_call_id="pytest-before",
+            source_message_id="pytest-result-before",
+        ),
+    )
+    state = investigation.ensure_started(task_id)
+    supported = InvestigationHypothesis(
+        hypothesis_id=hypothesis_id,
+        statement="单元素数组缺少递归终止条件",
+        state="supported",
+        evidence_ids=[evidence_id],
+        checked_locations=[],
+        reason="失败测试和源码共同支持",
+    )
+    investigation.commit(
+        state.version,
+        [
+            NewInvestigationEvent(
+                event_id=stable_investigation_id(
+                    "event", task_id, "supported-hypothesis-fixture"
+                ),
+                task_id=task_id,
+                event_type="hypothesis_supported",
+                phase_before=state.agent_phase,
+                phase_after=state.agent_phase,
+            )
+        ],
+        state.model_copy(
+            update={
+                "hypotheses": [supported],
+                "supported_hypothesis_ids": [hypothesis_id],
+            }
+        ),
+    )
+    tool = build_save_progress_tool(
+        memory,
+        compaction_store=compaction,
+        investigation_store=investigation,
+    )
+    call = progress_call(
+        "save-supported",
+        facts=[
+            {
+                "text": "单元素输入会无限递归",
+                "sources": [
+                    {"kind": "system_evidence", "ref_id": evidence_id}
+                ],
+            }
+        ],
+        hypotheses=[
+            {
+                "hypothesis_id": hypothesis_id,
+                "text": "单元素数组缺少递归终止条件",
+                "target_state": "confirmed",
+                "reason": "最小修复后测试通过",
+                "sources": [
+                    {"kind": "system_evidence", "ref_id": evidence_id}
+                ],
+            }
+        ],
+    )
+
+    result = invoke_tool(tool, call, task_id)
+
+    assert result.status == "success"
+    saved = memory.latest(task_id).snapshot
+    assert saved.facts[0].sources[0].ref_id == evidence_id
+    assert saved.confirmed_hypotheses[0].hypothesis_id == hypothesis_id
+
+
+def test_save_progress_validates_work_unit_sources_by_work_unit_id(tmp_path):
+    task_id = "task-work-unit"
+    memory = WorkingMemoryStore(tmp_path / "deepfix.sqlite3")
+    tool = build_save_progress_tool(memory)
+    call = progress_call("save-work-unit")
+    work_unit_seed = "pending-work-unit-id"
+    call["args"]["facts"] = [
+        {
+            "text": "已形成完整工作单元",
+            "sources": [{"kind": "work_unit", "ref_id": work_unit_seed}],
+        }
+    ]
+    ai_message = AIMessage(
+        id="message-save-work-unit",
+        content="",
+        tool_calls=[call],
+    )
+    messages = [HumanMessage(id="message-user", content="修复问题"), ai_message]
+    work_unit_id = partition_work_units(messages, set()).units[-1].unit_id
+    ai_message.tool_calls[0]["args"]["facts"][0]["sources"][0]["ref_id"] = (
+        work_unit_id
+    )
+    node = ToolNode([tool])
+
+    result = node.invoke(
+        {"messages": messages},
+        {"configurable": {"thread_id": task_id}},
+        runtime=Runtime(),
+    )["messages"][-1]
+
+    assert result.status == "success"
+    assert memory.latest(task_id).snapshot.facts[0].sources[0].ref_id == work_unit_id
+
+
+def test_save_progress_accepts_supported_as_investigation_alias(tmp_path):
+    database = tmp_path / "deepfix.sqlite3"
+    memory = WorkingMemoryStore(database)
+    investigation = InvestigationStore(database)
+    task_id = "task-supported-alias"
+    hypothesis_id = "hyp-supported-alias"
+    state = investigation.ensure_started(task_id)
+    hypothesis = InvestigationHypothesis(
+        hypothesis_id=hypothesis_id,
+        statement="边界条件错误",
+        state="supported",
+        evidence_ids=[],
+        checked_locations=[],
+        reason="已由调查工具验证",
+    )
+    investigation.commit(
+        state.version,
+        [
+            NewInvestigationEvent(
+                event_id=stable_investigation_id(
+                    "event", task_id, "supported-alias-fixture"
+                ),
+                task_id=task_id,
+                event_type="hypothesis_supported",
+                phase_before=state.agent_phase,
+                phase_after=state.agent_phase,
+            )
+        ],
+        state.model_copy(update={"hypotheses": [hypothesis]}),
+    )
+    tool = build_save_progress_tool(memory, investigation_store=investigation)
+    call = progress_call(
+        "save-supported-alias",
+        hypotheses=[
+            {
+                "hypothesis_id": hypothesis_id,
+                "text": "边界条件错误",
+                "target_state": "supported",
+                "reason": "沿用 Investigation 的操作状态",
+                "sources": [],
+            }
+        ],
+    )
+
+    result = invoke_tool(tool, call, task_id)
+
+    assert result.status == "success"
+    saved = memory.latest(task_id).snapshot
+    assert saved.active_hypotheses[0].hypothesis_id == hypothesis_id
 
 
 def test_context_middleware_injects_only_latest_task_memory_and_records_peak(tmp_path):

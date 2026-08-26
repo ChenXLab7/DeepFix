@@ -72,10 +72,10 @@ class PhaseResolver:
         if resolved is phase:
             return PhaseResolution(phase, None)
         trigger_identity = (
-            event.result_fingerprint
-            or event.hypothesis_id
-            or event.tool_call_id
+            event.tool_call_id
             or event.source_message_id
+            or event.hypothesis_id
+            or event.result_fingerprint
             or event.event_type.value
         )
         phase_event = NewInvestigationEvent(
@@ -97,4 +97,3 @@ class PhaseResolver:
             payload={"trigger": event.event_type.value},
         )
         return PhaseResolution(resolved, phase_event)
-

@@ -55,6 +55,8 @@ class ToolAuthorization:
     allowed: bool
     permit_id: str | None = None
     correction_required: bool = False
+    correction_kind: str | None = None
+    correction_ref_id: str | None = None
 
 
 _PHASE_CAPABILITIES: dict[AgentPhase, frozenset[InvestigationCapability]] = {
@@ -192,7 +194,7 @@ class InvestigationCoordinator:
             permit = state.permit
             if permit is not None and not permit.consumed:
                 allowed.add(permit.tool_name)
-            return allowed & set(capabilities)
+            return self._filter_memory_tool(state, allowed & set(capabilities))
         if state.stagnation_level > 0 or state.reevaluation_required:
             allowed = set(_REEVALUATION_TOOL_NAMES)
             permit = state.permit
@@ -202,13 +204,25 @@ class InvestigationCoordinator:
                 and not permit.consumed
             ):
                 allowed.add(permit.tool_name)
-            return allowed & set(capabilities)
+            return self._filter_memory_tool(state, allowed & set(capabilities))
         allowed_capabilities = _PHASE_CAPABILITIES[state.agent_phase]
-        return {
+        return self._filter_memory_tool(state, {
             name
             for name, capability in capabilities.items()
             if capability in allowed_capabilities
-        }
+        })
+
+    @staticmethod
+    def _filter_memory_tool(
+        state: InvestigationState,
+        allowed: set[str],
+    ) -> set[str]:
+        if state.progress_generation in {
+            state.memory_save_blocked_generation,
+            state.memory_saved_generation,
+        }:
+            allowed.discard("save_progress")
+        return allowed
 
     def state(self, task_id: str) -> InvestigationState:
         try:
@@ -240,6 +254,12 @@ class InvestigationCoordinator:
         args = args_value if isinstance(args_value, Mapping) else {}
         signature = tool_signature(name, args)
         fingerprint = result_fingerprint(result)
+        artifact = result.artifact if isinstance(result.artifact, Mapping) else {}
+        tool_payload = {
+            "tool_name": name,
+            "status": result.status,
+            "result_type": str(artifact.get("result_type", "")),
+        }
         diagnostic = _diagnostic_artifact_observation(
             name,
             call_id,
@@ -264,6 +284,7 @@ class InvestigationCoordinator:
                         result,
                         signature,
                         fingerprint,
+                        payload=tool_payload,
                     ),
                 )
             if state.agent_phase is AgentPhase.EDITING:
@@ -275,6 +296,7 @@ class InvestigationCoordinator:
                         result,
                         signature,
                         fingerprint,
+                        payload=tool_payload,
                     ),
                 )
             event_type = (
@@ -292,6 +314,7 @@ class InvestigationCoordinator:
                     fingerprint,
                     evidence_id=evidence.evidence_id,
                     exit_code=evidence.exit_code,
+                    payload=tool_payload,
                 ),
             )
 
@@ -309,6 +332,7 @@ class InvestigationCoordinator:
                     fingerprint,
                     path=path,
                     payload={
+                        **tool_payload,
                         "start_line": offset + 1,
                         "end_line": offset + line_count,
                         "content_fingerprint": fingerprint,
@@ -332,6 +356,7 @@ class InvestigationCoordinator:
                     fingerprint,
                     evidence_id=evidence.evidence_id,
                     path=evidence.path,
+                    payload=tool_payload,
                 ),
             )
 
@@ -343,6 +368,7 @@ class InvestigationCoordinator:
                 result,
                 signature,
                 fingerprint,
+                payload=tool_payload,
             ),
         )
 
@@ -442,8 +468,56 @@ class InvestigationCoordinator:
                 updated,
                 effective_observation,
             )
+        if observation.payload.get("tool_name") == "save_progress":
+            if observation.payload.get("status") == "success":
+                updated = updated.model_copy(
+                    update={
+                        "memory_save_failure_count": 0,
+                        "memory_save_blocked_generation": None,
+                        "memory_saved_generation": updated.progress_generation,
+                    }
+                )
+            else:
+                failures = state.memory_save_failure_count + 1
+                updated = updated.model_copy(
+                    update={
+                        "memory_save_failure_count": failures,
+                        "memory_save_blocked_generation": (
+                            updated.progress_generation if failures >= 2 else None
+                        ),
+                    }
+                )
         updated = updated.model_copy(update={"agent_phase": resolution.phase})
-        if observation.event_type is InvestigationEventType.ARTIFACT_READ:
+        if observation.event_type is InvestigationEventType.TEST_OBSERVED:
+            diagnostic_tests = (
+                state.diagnostic_test_count_since_decision + 1
+                if observation.exit_code != 0
+                else 0
+            )
+            updated = updated.model_copy(
+                update={
+                    "diagnostic_test_count_since_decision": diagnostic_tests,
+                    "diagnostic_decision_required": diagnostic_tests >= 2,
+                    "decision_correction_used": False,
+                }
+            )
+        if (
+            observation.event_type is InvestigationEventType.POST_EDIT_TEST_OBSERVED
+            and observation.exit_code != 0
+        ):
+            updated = updated.model_copy(
+                update={
+                    "diagnostic_decision_required": True,
+                    "diagnostic_test_count_since_decision": 0,
+                    "repair_reevaluation_required": True,
+                    "decision_correction_used": False,
+                    "reevaluation_required": False,
+                    "stagnation_level": 0,
+                    "permit": None,
+                    "post_permit_review_pending": False,
+                }
+            )
+        elif observation.event_type is InvestigationEventType.ARTIFACT_READ:
             updated = updated.model_copy(
                 update={
                     "diagnostic_decision_required": True,
@@ -459,6 +533,7 @@ class InvestigationCoordinator:
                 updated = updated.model_copy(
                     update={
                         "diagnostic_decision_required": True,
+                        "diagnostic_test_count_since_decision": 0,
                         "decision_correction_used": False,
                     }
                 )
@@ -469,7 +544,21 @@ class InvestigationCoordinator:
             updated = updated.model_copy(
                 update={
                     "diagnostic_decision_required": False,
+                    "diagnostic_test_count_since_decision": 0,
+                    "repair_reevaluation_required": False,
                     "decision_correction_used": False,
+                }
+            )
+        if (
+            observation.payload.get("tool_name") == "execute"
+            and observation.payload.get("result_type")
+            != "duplicate_execute_correction"
+        ):
+            updated = updated.model_copy(
+                update={
+                    "last_execute_signature": observation.signature,
+                    "last_execute_generation": updated.progress_generation,
+                    "duplicate_execute_correction_signature": None,
                 }
             )
         events = [origin]
@@ -496,21 +585,37 @@ class InvestigationCoordinator:
             for item in command.checked_locations
         ):
             raise ValueError("假设位置尚未被当前任务检查")
-        first_source = command.evidence_ids[0] if command.evidence_ids else source_id
-        hypothesis_id = command.hypothesis_id or stable_investigation_id(
-            "hyp",
-            task_id,
-            first_source,
-            command.statement,
+        semantic_statement = _semantic_statement(command.statement)
+        hypothesis_id = command.hypothesis_id or (
+            stable_investigation_id(
+                "hyp",
+                task_id,
+                command.evidence_ids[0],
+                semantic_statement,
+            )
+            if command.evidence_ids
+            else _candidate_hypothesis_id(task_id, semantic_statement)
         )
         existing = self._hypothesis(state, hypothesis_id)
         if command.hypothesis_id and existing is None:
             raise ValueError("hypothesis_id 不存在于当前任务")
-        if existing is not None and existing.statement != command.statement:
+        if (
+            existing is not None
+            and _semantic_statement(existing.statement) != semantic_statement
+        ):
             raise ValueError("hypothesis_id 不能更换假设陈述")
+        if (
+            state.repair_reevaluation_required
+            and existing is not None
+            and existing.state == "supported"
+            and command.target_state == "supported"
+        ):
+            raise ValueError(
+                "修改后验证失败，不能再次支持同一假设；请先排除旧假设或建立新假设"
+            )
         record = InvestigationHypothesis(
             hypothesis_id=hypothesis_id,
-            statement=command.statement,
+            statement=semantic_statement,
             state={
                 "candidate": "candidate",
                 "rejected": "rejected",
@@ -565,6 +670,8 @@ class InvestigationCoordinator:
                 "reevaluation_required": False,
                 "stagnation_level": 0,
                 "diagnostic_decision_required": False,
+                "diagnostic_test_count_since_decision": 0,
+                "repair_reevaluation_required": False,
                 "decision_correction_used": False,
                 "permit": None,
             }
@@ -735,6 +842,87 @@ class InvestigationCoordinator:
     ) -> ToolAuthorization:
         state = self.state(task_id)
         normalized_tool = tool_name.strip().lower()
+        signature = tool_signature(normalized_tool, arguments)
+        duplicate_hypothesis_id = _duplicate_candidate_id(
+            task_id,
+            normalized_tool,
+            arguments,
+            state,
+        )
+        if duplicate_hypothesis_id is not None:
+            if duplicate_hypothesis_id in state.duplicate_hypothesis_correction_ids:
+                raise InvestigationStagnationError(
+                    self.recovery(
+                        task_id,
+                        "duplicate_hypothesis_ignored",
+                        state=state,
+                        tool_call_id=tool_call_id,
+                        checkpoint_available=True,
+                        recovery_action="pause_and_change_investigation_action",
+                    )
+                )
+            source_id = tool_call_id or stable_investigation_id(
+                "duplicate-hypothesis-correction",
+                task_id,
+                duplicate_hypothesis_id,
+            )
+            self._record_lifecycle(
+                state,
+                state.model_copy(
+                    update={
+                        "duplicate_hypothesis_correction_ids": list(
+                            dict.fromkeys(
+                                [
+                                    *state.duplicate_hypothesis_correction_ids,
+                                    duplicate_hypothesis_id,
+                                ]
+                            )
+                        )[-16:]
+                    }
+                ),
+                InvestigationEventType.REEVALUATION_REQUIRED,
+                source_id,
+            )
+            return ToolAuthorization(
+                allowed=False,
+                correction_required=True,
+                correction_kind="duplicate_hypothesis",
+                correction_ref_id=duplicate_hypothesis_id,
+            )
+        if (
+            normalized_tool == "execute"
+            and state.last_execute_signature == signature
+            and state.last_execute_generation == state.progress_generation
+        ):
+            if state.duplicate_execute_correction_signature == signature:
+                raise InvestigationStagnationError(
+                    self.recovery(
+                        task_id,
+                        "duplicate_execute_ignored",
+                        state=state,
+                        tool_call_id=tool_call_id,
+                        checkpoint_available=True,
+                        recovery_action="pause_and_change_investigation_action",
+                    )
+                )
+            source_id = tool_call_id or stable_investigation_id(
+                "duplicate-execute-correction",
+                task_id,
+                signature,
+            )
+            self._record_lifecycle(
+                state,
+                state.model_copy(
+                    update={"duplicate_execute_correction_signature": signature}
+                ),
+                InvestigationEventType.REEVALUATION_REQUIRED,
+                source_id,
+            )
+            return ToolAuthorization(
+                allowed=False,
+                correction_required=True,
+                correction_kind="duplicate_execute",
+            )
         if (
             not state.diagnostic_decision_required
             and state.stagnation_level == 0
@@ -805,6 +993,7 @@ class InvestigationCoordinator:
                 return ToolAuthorization(
                     allowed=False,
                     correction_required=True,
+                    correction_kind="diagnostic_decision",
                 )
             raise InvestigationStagnationError(
                 self.recovery(
@@ -837,6 +1026,9 @@ class InvestigationCoordinator:
         permit_id: str | None = None,
         checkpoint_available: bool,
         recovery_action: str,
+        error_type: str | None = None,
+        error_detail: str | None = None,
+        error_fingerprint: str | None = None,
     ) -> InvestigationRecoveryMetadata:
         current = state
         if current is None:
@@ -860,6 +1052,9 @@ class InvestigationCoordinator:
             permit_id=permit_id,
             checkpoint_available=checkpoint_available,
             recovery_action=recovery_action,
+            error_type=error_type,
+            error_detail=error_detail,
+            error_fingerprint=error_fingerprint,
         )
 
     @staticmethod
@@ -915,8 +1110,15 @@ class InvestigationCoordinator:
         task_id: str,
         observation: ToolObservation,
     ) -> str:
+        hypothesis_events = {
+            InvestigationEventType.HYPOTHESIS_RECORDED,
+            InvestigationEventType.HYPOTHESIS_REJECTED,
+            InvestigationEventType.HYPOTHESIS_SUPPORTED,
+        }
         identity = (
-            observation.tool_call_id
+            observation.hypothesis_id
+            if observation.event_type in hypothesis_events
+            else observation.tool_call_id
             or observation.source_message_id
             or observation.hypothesis_id
             or observation.signature
@@ -930,7 +1132,6 @@ class InvestigationCoordinator:
             identity,
             result,
         )
-
     @staticmethod
     def _event_payload(observation: ToolObservation) -> dict[str, Any]:
         payload = dict(observation.payload)
@@ -994,6 +1195,42 @@ class InvestigationCoordinator:
                 )
             )[-64:]
         return state.model_copy(update=updates) if updates else state
+
+
+def _semantic_statement(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _candidate_hypothesis_id(task_id: str, statement: str) -> str:
+    return stable_investigation_id(
+        "hyp",
+        task_id,
+        "candidate-statement",
+        _semantic_statement(statement),
+    )
+
+
+def _duplicate_candidate_id(
+    task_id: str,
+    tool_name: str,
+    arguments: Mapping[str, object],
+    state: InvestigationState,
+) -> str | None:
+    if (
+        tool_name != "record_hypothesis"
+        or str(arguments.get("target_state", "")) != "candidate"
+        or str(arguments.get("hypothesis_id", "")).strip()
+    ):
+        return None
+    statement = _semantic_statement(str(arguments.get("statement", "")))
+    if not statement:
+        return None
+    hypothesis_id = _candidate_hypothesis_id(task_id, statement)
+    return (
+        hypothesis_id
+        if any(item.hypothesis_id == hypothesis_id for item in state.hypotheses)
+        else None
+    )
 
 
 def _merge_checked_file(

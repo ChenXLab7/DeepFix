@@ -150,6 +150,7 @@ class ContextMetrics:
 
 class RepairOutcome(BaseModel):
     status: Literal["needs_input", "completed", "blocked"]
+    resolution: Literal["fixed", "not_reproduced"] | None = None
     question: str | None = None
     diagnosis: str | None = None
     hypotheses: list[str] = Field(default_factory=list)
@@ -171,16 +172,22 @@ class TaskState:
         default_factory=lambda: str(Path(sys.executable).resolve())
     )
     status: TaskStatus = TaskStatus.CREATED
+    resolution: Literal["fixed", "not_reproduced"] | None = None
     conversation: list[dict[str, str]] = field(default_factory=list)
     evidence: list[Evidence] = field(default_factory=list)
     hypotheses: list[str] = field(default_factory=list)
     diagnosis: str | None = None
     repair_plan: list[str] = field(default_factory=list)
     changed_files: list[str] = field(default_factory=list)
+    successful_changed_files: list[str] = field(default_factory=list)
+    latest_change_verification: Literal[
+        "not_applicable", "pending", "passed", "failed"
+    ] = "not_applicable"
     test_results: list[TestResult] = field(default_factory=list)
     approvals: list[ApprovalRecord] = field(default_factory=list)
     review: str | None = None
     final_summary: str | None = None
+    pause_reason: str | None = None
     residual_risks: list[str] = field(default_factory=list)
     unverified_items: list[str] = field(default_factory=list)
     pending_question: str | None = None
@@ -232,6 +239,7 @@ class TaskState:
             raise ValueError("只有已暂停任务才能恢复")
         self.status = self.paused_from
         self.paused_from = None
+        self.pause_reason = None
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)

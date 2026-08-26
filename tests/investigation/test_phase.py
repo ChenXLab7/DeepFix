@@ -29,6 +29,32 @@ def test_phase_changed_never_carries_progress_kind():
     assert result.phase_event.progress_kind is None
 
 
+def test_matching_edit_results_from_distinct_tool_calls_get_distinct_phase_ids():
+    resolver = PhaseResolver()
+    first = resolver.transition(
+        "task-a",
+        AgentPhase.PLANNING,
+        event(
+            "file_changed",
+            tool_call_id="edit-call-1",
+            result_fingerprint="same-artifactless-edit-result",
+        ),
+    )
+    second = resolver.transition(
+        "task-a",
+        AgentPhase.PLANNING,
+        event(
+            "file_changed",
+            tool_call_id="edit-call-2",
+            result_fingerprint="same-artifactless-edit-result",
+        ),
+    )
+
+    assert first.phase_event is not None
+    assert second.phase_event is not None
+    assert first.phase_event.event_id != second.phase_event.event_id
+
+
 @pytest.mark.parametrize(
     ("phase", "event_type", "exit_code", "expected"),
     [
@@ -60,4 +86,3 @@ def test_editing_does_not_enter_testing_on_generic_tool_completion():
         AgentPhase.EDITING,
         event("tool_completed"),
     ) is AgentPhase.EDITING
-

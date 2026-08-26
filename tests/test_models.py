@@ -188,9 +188,20 @@ def test_task_round_trip_preserves_nested_types(tmp_path):
 def test_repair_outcome_converts_evidence_payload():
     outcome = RepairOutcome(
         status="completed",
+        resolution="not_reproduced",
         diagnosis="除法运算符使用错误",
         evidence=[{"source": "src/calc.py:4", "observation": "使用了加法运算符"}],
         summary="已修复并通过测试",
     )
 
     assert outcome.evidence == [Evidence("src/calc.py:4", "使用了加法运算符")]
+    assert outcome.resolution == "not_reproduced"
+
+
+def test_task_round_trip_preserves_resolution(tmp_path):
+    task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
+    task.resolution = "not_reproduced"
+
+    restored = TaskState.from_dict(task.to_dict())
+
+    assert restored.resolution == "not_reproduced"

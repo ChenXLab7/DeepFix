@@ -59,7 +59,7 @@ class EvidenceCollector:
                 if test is not None:
                     collected.append(test)
                 continue
-            file_change = _file_evidence(task_id, call_id, name, result)
+            file_change = _file_evidence(task_id, call_id, name, args, result)
             if file_change is not None:
                 collected.append(file_change)
                 actual_paths.add(file_change.path)
@@ -190,15 +190,23 @@ def _file_evidence(
     task_id: str,
     call_id: str,
     tool_name: str,
+    args: Mapping[str, object],
     result: ToolMessage,
 ) -> FileChangeEvidence | None:
     expected_operation = _FILE_TO_OPERATION.get(tool_name)
     artifact = result.artifact
-    if expected_operation is None or not isinstance(artifact, Mapping):
+    if expected_operation is None:
         return None
-    operation = artifact.get("operation")
-    status = artifact.get("status")
-    path = artifact.get("path")
+    if isinstance(artifact, Mapping):
+        operation = artifact.get("operation")
+        status = artifact.get("status")
+        path = artifact.get("path")
+    elif _is_deepagents_edit_success(tool_name, result):
+        operation = "edit"
+        status = "succeeded"
+        path = args.get("file_path")
+    else:
+        return None
     if (
         operation != expected_operation
         or status not in {"succeeded", "failed"}
@@ -222,6 +230,14 @@ def _file_evidence(
         status=status,
         tool_call_id=call_id,
         source_message_id=str(result.id),
+    )
+
+
+def _is_deepagents_edit_success(tool_name: str, result: ToolMessage) -> bool:
+    return (
+        tool_name == "edit_file"
+        and result.status != "error"
+        and _message_text(result).startswith("Successfully replaced ")
     )
 
 

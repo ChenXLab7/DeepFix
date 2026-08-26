@@ -63,6 +63,54 @@ def test_supported_hypothesis_unlocks_planning_with_stable_id(tmp_path):
     assert coordinator.state("task-a").diagnostic_decision_required is False
 
 
+def test_failed_post_edit_test_cannot_resupport_same_hypothesis(tmp_path):
+    coordinator = coordinator_fixture(tmp_path)
+    seed_evidence(coordinator.compaction_store, "task-a", "evidence-a")
+    seed_checked_location(coordinator.store, "task-a", "src/sign.py", 1, 20)
+    supported = coordinator.record_hypothesis(
+        "task-a",
+        supported_input(evidence_ids=["evidence-a"]),
+        source_id="tool-hyp-supported",
+    )
+    coordinator.record_tool_result(
+        "task-a",
+        {
+            "name": "edit_file",
+            "id": "edit-artifactless",
+            "args": {"file_path": "src/sign.py"},
+        },
+        ToolMessage(
+            id="msg-edit-artifactless",
+            content="Successfully replaced 1 instance(s) of the string in '/src/sign.py'",
+            tool_call_id="edit-artifactless",
+        ),
+    )
+    coordinator.record_tool_result(
+        "task-a",
+        {
+            "name": "execute",
+            "id": "pytest-post-edit",
+            "args": {"command": "python -m pytest -q"},
+        },
+        ToolMessage(
+            id="msg-pytest-post-edit",
+            content="1 failed",
+            tool_call_id="pytest-post-edit",
+            artifact={"exit_code": 1},
+        ),
+    )
+    command = supported_input(evidence_ids=["evidence-a"]).model_copy(
+        update={"hypothesis_id": supported.hypothesis_id}
+    )
+
+    with pytest.raises(ValueError, match="修改后验证失败"):
+        coordinator.record_hypothesis(
+            "task-a",
+            command,
+            source_id="tool-hyp-resupported",
+        )
+
+
 def test_candidate_hypothesis_does_not_unlock_planning(tmp_path):
     coordinator = coordinator_fixture(tmp_path)
     coordinator.record_observation(
@@ -86,6 +134,101 @@ def test_candidate_hypothesis_does_not_unlock_planning(tmp_path):
 
     assert coordinator.state("task-a").agent_phase is AgentPhase.INVESTIGATING
     assert coordinator.state("task-a").diagnostic_decision_required is True
+
+
+def test_repeated_candidate_without_evidence_reuses_semantic_identity(tmp_path):
+    coordinator = coordinator_fixture(tmp_path)
+    command = RecordHypothesisInput(
+        statement="  capacity=0   may expose a boundary bug  ",
+        evidence_ids=[],
+        checked_locations=[],
+        target_state="candidate",
+        reason="needs a targeted test",
+    )
+
+    first = coordinator.record_hypothesis(
+        "task-a",
+        command,
+        source_id="candidate-call-1",
+    )
+    version_after_first = coordinator.state("task-a").version
+    replay = coordinator.record_hypothesis(
+        "task-a",
+        command.model_copy(
+            update={"statement": "capacity=0 may expose a boundary bug"}
+        ),
+        source_id="candidate-call-2",
+    )
+    state = coordinator.state("task-a")
+
+    assert replay.hypothesis_id == first.hypothesis_id
+    assert state.hypotheses == [first]
+    assert state.version == version_after_first
+
+
+def test_candidate_hypothesis_resets_diagnostic_test_counter(tmp_path):
+    coordinator = coordinator_fixture(tmp_path)
+    for index in range(2):
+        coordinator.record_observation(
+            "task-a",
+            ToolObservation(
+                event_type="test_observed",
+                tool_call_id=f"diagnostic-test-{index}",
+                result_fingerprint=f"diagnostic-result-{index}",
+                exit_code=1,
+            ),
+        )
+    command = RecordHypothesisInput(
+        statement="the midpoint update may skip the remaining interval",
+        evidence_ids=[],
+        checked_locations=[],
+        target_state="candidate",
+        reason="needs a targeted experiment",
+    )
+
+    coordinator.record_hypothesis("task-a", command, source_id="tool-hyp-new")
+
+    state = coordinator.state("task-a")
+    assert state.diagnostic_test_count_since_decision == 0
+    assert state.diagnostic_decision_required is True
+
+
+def test_user_information_clears_diagnostic_repair_checkpoint(tmp_path):
+    coordinator = coordinator_fixture(tmp_path)
+    coordinator.record_observation(
+        "task-a",
+        ToolObservation(
+            event_type="file_changed",
+            tool_call_id="edit-before-user",
+            result_fingerprint="edit-before-user-result",
+        ),
+    )
+    coordinator.record_observation(
+        "task-a",
+        ToolObservation(
+            event_type="post_edit_test_observed",
+            tool_call_id="failed-test-before-user",
+            result_fingerprint="failed-test-before-user-result",
+            exit_code=1,
+        ),
+    )
+    for index in range(2):
+        coordinator.record_observation(
+            "task-a",
+            ToolObservation(
+                event_type="test_observed",
+                tool_call_id=f"extra-test-before-user-{index}",
+                result_fingerprint=f"extra-test-before-user-result-{index}",
+                exit_code=1,
+            ),
+        )
+
+    coordinator.record_user_information("task-a", "user-message-2")
+
+    state = coordinator.state("task-a")
+    assert state.diagnostic_test_count_since_decision == 0
+    assert state.diagnostic_decision_required is False
+    assert state.repair_reevaluation_required is False
 
 
 def test_state_read_failure_becomes_typed_recovery_error(tmp_path, monkeypatch):
