@@ -1,7 +1,7 @@
 # DeepFix 能力导向 Agent Loop 设计
 
 日期：2026-08-26  
-状态：根据首轮审阅修订，待复审
+状态：根据第二轮审阅修订，待复审
 适用范围：DeepFix Python Bug 修复 Agent 的调查、修改、验证与结论生成流程
 
 ## 1. 背景
@@ -195,6 +195,44 @@ Experiment 是执行前定义的目标和预算。以下名称是可组合的意
 - `RESEARCH`：查询外部权威资料；
 - `REVIEW`：检查修改范围、风险、冲突和证据充分性。
 
+### 8.1.1 `SuccessCriterion`
+
+Experiment 在执行前就必须声明每个成功条件由什么类型的证据验证，Evaluator 不在执行后临时猜测验证
+方式。SuccessCriterion 使用带判别字段的联合类型：
+
+```python
+class DeterministicSuccessCriterion(StrictModel):
+    criterion_id: str
+    kind: Literal["deterministic"]
+    description: str
+    check: DeterministicCriterionCheck
+    required: bool = True
+
+
+class SemanticSuccessCriterion(StrictModel):
+    criterion_id: str
+    kind: Literal["semantic"]
+    description: str
+    question: str
+    required_evidence_types: set[EvidenceType]
+    minimum_source_count: int = 1
+    required: bool = True
+
+
+SuccessCriterion = Annotated[
+    DeterministicSuccessCriterion | SemanticSuccessCriterion,
+    Field(discriminator="kind"),
+]
+```
+
+确定性条件包括 pytest exit code、指定文件是否改变、禁止路径是否保持未修改、命令是否超时，以及 Receipt、
+审批和 Workspace hash 是否完整。`DeterministicCriterionCheck` 必须是系统支持的声明式检查类型和参数，
+不能接受模型生成的可执行表达式。
+
+语义条件包括“现有证据是否支持 foo() 是根因”或“H2 是否比 H1 更符合观察”。它必须声明问题、所需证据
+类型和最少来源数；EvidenceEvaluator 只有在来源校验通过后才调用主模型判断。一个 Criterion 的 kind 在
+Experiment 执行期间不能由 Executor 修改。
+
 ```python
 class ExperimentSpec(BaseModel):
     experiment_id: str
@@ -247,21 +285,32 @@ class ExperimentExecutor(Protocol):
 Experiment Prompt 中执行多个工具，并返回：
 
 ```python
+class ExecutorNarrativeResult(BaseModel):
+    claimed_completed_criterion_ids: list[str]
+    evidence_candidates: list[EvidenceCandidate]
+    hypothesis_updates: list[HypothesisUpdateCandidate]
+    remaining_questions: list[str]
+    executor_recommendation: str
+
+
 class ExperimentResult(BaseModel):
     experiment_id: str
     status: ExperimentResultStatus
-    completed_criteria: list[str]
+    executor_narrative: ExecutorNarrativeResult
     tool_receipt_ids: list[str]
     observation_ids: list[str]
-    evidence_candidates: list[EvidenceCandidate]
-    hypothesis_updates: list[HypothesisUpdateCandidate]
-    changed_files: list[str]
+    changed_file_evidence_ids: list[str]
     test_evidence_ids: list[str]
-    remaining_questions: list[str]
-    executor_recommendation: str
 ```
 
-Executor 不得直接修改 Investigation State，也不得宣布任务完成。
+模型只生成 `ExecutorNarrativeResult`。其中 `claimed_completed_criterion_ids` 表示“Executor 认为这些条件已
+完成”，只能引用 ExperimentSpec 中已有的 `criterion_id`，不能自由填写 `pytest passed` 一类事实文本。
+`ExperimentResultBuilder` 根据本次实验的真实 Receipt、Observation 和 Deterministic Evidence 构造外层
+`ExperimentResult`；`status` 也由运行时结果确定。模型不能填写或追加 `status`、`tool_receipt_ids`、
+`observation_ids`、`changed_file_evidence_ids` 和 `test_evidence_ids`。
+
+Executor 不得直接修改 Investigation State，也不得宣布任务完成。`executor_recommendation` 只作为下一轮
+Planner 的非权威参考；“建议结束”不提高任何 Criterion、Assessment 或 Outcome 的权重。
 
 ### 8.4 自主权和硬边界
 
@@ -279,9 +328,18 @@ Store，直接确认命令、exit code、超时、文件哈希、修改范围、
 的问题才调用主模型。语义层只能输出带来源的候选；规则已经能决定的字段不允许模型重判。
 
 ```python
+class CriterionAssessment(BaseModel):
+    criterion_id: str
+    criterion_kind: Literal["deterministic", "semantic"]
+    completed: bool
+    evidence_ids: list[str]
+    explanation: str
+
+
 class ExperimentAssessment(BaseModel):
     experiment_id: str
     outcome: ExperimentAssessmentOutcome
+    criterion_assessments: list[CriterionAssessment]
     deterministic_evidence_ids: list[str]
     accepted_claims: list[ProvenancedClaim]
     rejected_claims: list[RejectedClaim]
@@ -293,6 +351,11 @@ class ExperimentAssessment(BaseModel):
     progress_kind: ExperimentProgressKind
     recommended_strategy_change: str | None
 ```
+
+只有 EvidenceEvaluator 可以把 Criterion 标为 completed。对于 deterministic Criterion，它只执行声明式
+系统检查；对于 semantic Criterion，它校验来源后调用主模型，并把采用的 evidence ID 固化到
+CriterionAssessment。Executor 的 claimed ID 只帮助 Evaluator 定位待检查条件，既不是完成证明，也不能
+跳过未声明但 required 的 Criterion。
 
 Assessment outcome 为 `SUCCEEDED`、`PARTIALLY_SUCCEEDED`、`INCONCLUSIVE`、`FAILED`、`TIMED_OUT`、
 `POLICY_BLOCKED` 或 `BUDGET_EXHAUSTED`。命令失败不等于实验没有价值；例如 pytest 超时可以成为死循环
@@ -526,7 +589,7 @@ Planner 或 Evaluator Store。旧任务没有活动 Experiment 时由 Blackboard
 2. 先实现 Task Workspace、Operation Journal 和增强 Test Evidence，补齐副作用与裁决可信度；
 3. 实现最小纵向 Experiment Loop：Blackboard → 单次最佳策略 → 自适应 Experiment → 确定性优先评估
    → Reducer → Outcome；
-4. 只在评测 Harness 中临时保留旧/新 Loop 选择，使用同一模型和相近预算进行 A/B；
+4. 只在评测 Harness 中临时保留旧/新 Loop 选择，使用同一模型和预先登记的相同硬资源上限进行 A/B；
 5. 若能力和结论可信度达到第 19 节门禁，再迁移现有入口并删除被替代的 Tool 级策略；
 6. 若没有明显改善，先分析轨迹并删减无效结构，不继续增加 Controller、模型角色或 Multi-Agent。
 
@@ -538,6 +601,8 @@ Planner 或 Evaluator Store。旧任务没有活动 Experiment 时由 Blackboard
 
 - Blackboard 权威投影、任务隔离、去重和冲突；
 - StrategyDecision、ExperimentSpec、Result 和 Assessment 校验；
+- Executor 只能声明已有 criterion ID，不能注入 status、文件修改或测试证据；
+- deterministic Criterion 不调用模型，semantic Criterion 缺少有效来源时拒绝评估；
 - Executor 工具、模型、Token 和时间预算；
 - Evaluator 确定性证据优先、Claim 来源校验和进展分类；
 - Reducer 幂等、并发、假设与 Evidence Gap 迁移；
@@ -555,6 +620,7 @@ Planner 或 Evaluator Store。旧任务没有活动 Experiment 时由 Blackboard
 - 修改后允许重复运行同一测试；
 - 未变化状态下拒绝相同无效实验；
 - 证据不足的 CONCLUDE 重新产生 Evidence Gap；
+- Executor 声称 Criterion 完成但证据不满足时，Evaluator 保持未完成；
 - 程序本来正确时输出 NOT_REPRODUCED；
 - 修改范围违规阻止 FIXED；
 - 连续实验失败进入 REFLECT 而不是工具循环；
@@ -569,13 +635,36 @@ Planner 或 Evaluator Store。旧任务没有活动 Experiment 时由 Blackboard
 模型和预算。不得让一个 Task 同时修复整个 QuixBugs 项目。评测集覆盖单文件条件、边界、递归、数据结构、
 跨函数调用、死循环、正常代码对照、干扰文件、大 Artifact 和首次假设错误。
 
-相同模型、API、Bug、初始仓库和相近预算下对比旧 Tool-Call Loop 与新 Experiment Loop。代表性任务至少
-运行三次，记录修复成功率、错误 FIXED 率、NOT_REPRODUCED 准确率、根因准确率、初始假设错误后的恢复
-率、无效重复调用率、Experiment/Tool/Model Call 数量、Token、耗时和 Artifact Retrieval 次数。
+相同模型、API、模型参数、Bug、初始仓库和硬资源上限下对比旧 Tool-Call Loop 与新 Experiment Loop。
+Harness 在运行新 Loop 前固定每个任务的最大总 input token、最大总 output token、wall time、工具调用、
+命令超时和副作用操作上限；不要求两个架构拥有相同 Model Call 次数，因为单次 Planner 和 Executor 调用的
+上下文长度不同。代表性任务至少运行三次。
+
+每次运行同时记录：
+
+- 修复成功率、false FIXED rate、NOT_REPRODUCED 准确率和根因准确率；
+- 初始假设错误后的恢复率和无效重复调用率；
+- 总 input token、总 output token、模型调用数和工具调用数；
+- wall time、Experiment 数量和 Artifact Retrieval 次数；
+- 每 100k 总 Token 的成功修复数量，以及每个成功任务的 Token 中位数。
+
+`false FIXED` 定义为任务报告 FIXED，但用户指定 Oracle 未通过、要求的仓库测试未通过、存在未处理范围
+违规，或只有 Agent 生成测试/最小复现支持成功。报告同时给出 `false FIXED / FIXED claims` 和
+`false FIXED / all tasks`，避免分母掩盖问题。Token 优先采用 Provider usage；缺失时使用统一估算器并在
+结果中标记 estimated。
 
 A/B 结论必须结合轨迹解释改善来自哪里。如果新架构没有明显提升复杂 Bug 调查、错误假设恢复或结论
 可信度，或者只是以不可接受的调用与 Token 增长换取偶然成功，则暂停全面迁移，优先删除无效抽象并定位
 真实瓶颈，而不是继续扩展架构。
+
+### 17.4 工程不变量与模型指标
+
+工程不变量使用确定性测试和 crash/fault injection 验证，覆盖的场景必须零违规：不得重复副作用、越界
+写入、丢失已确认 Receipt、把 unknown 操作当作成功证据，或在基础设施失败时丢失恢复元数据。
+
+真实模型 Benchmark 不要求长期随机运行中错误次数绝对为零，而使用 false FIXED rate、范围违规率和恢复
+失败率。旧 Loop 基线完成后、运行新 Loop 评测前，必须预先登记这些 Rate 的接受门槛和资源上限；新 Loop
+需要在成功率提升的同时让 false FIXED rate 显著低于旧 Loop，不能在看到结果后移动门槛。
 
 ## 18. 可观测性
 
@@ -595,11 +684,14 @@ Debug 记录稳定 task/decision/experiment/evidence ID、预算变化和清洗�
 5. 超时、测试失败和假设被反驳会反馈给模型，不直接终止整个任务。
 6. 每个新 Loop Task 在独立 Workspace 运行，并可依据 Baseline、Journal 和真实 hash 恢复已发生副作用。
 7. 所有 Task 都能在预算内结束或以恢复元数据暂停，不需要人工强制中断。
-8. 评测中错误 `FIXED`、越界修改、重复副作用、丢失 Receipt 和无恢复元数据的基础设施失败均为零。
-9. 测试证据包含 origin、scope 和 timing；Agent 生成测试或最小复现不能单独证明 FIXED。
-10. 正确识别修改前已通过的任务为 `NOT_REPRODUCED`。
-11. 至少解决三个当前架构稳定失败的代表性 Bug，总体修复成功率明显高于相同模型的现有基线。
-12. 连续失败时可观察到假设、证据来源或 Experiment 意图的实质变化，而不是只改变工具表面参数。
-13. Working Memory、Compaction、Artifact Retrieval、Research、审批和 CLI Progress 联合测试无回归。
-14. 只有 A/B 门禁通过才替换生产入口并删除旧 Tool 级策略；不长期维护两套 Loop。
-15. 第一阶段不实现 Multi-Agent、独立角色模型或复杂 Token 调度。
+8. 覆盖的 fault-injection 测试中，越界修改、重复副作用、丢失已确认 Receipt、错误采信 unknown 操作和
+   丢失恢复元数据均为零。
+9. 模型 Benchmark 报告 false FIXED rate；其门槛在新 Loop 评测前登记，并显著低于旧 Loop 基线。
+10. 测试证据包含 origin、scope 和 timing；Agent 生成测试或最小复现不能单独证明 FIXED。
+11. 正确识别修改前已通过的任务为 `NOT_REPRODUCED`。
+12. 至少解决三个当前架构稳定失败的代表性 Bug，总体修复成功率明显高于相同模型的现有基线。
+13. A/B 使用相同硬资源上限，并报告 input/output Token、Model/Tool Call、wall time 和成功修复/100k Token。
+14. 连续失败时可观察到假设、证据来源或 Experiment 意图的实质变化，而不是只改变工具表面参数。
+15. Working Memory、Compaction、Artifact Retrieval、Research、审批和 CLI Progress 联合测试无回归。
+16. 只有 A/B 门禁通过才替换生产入口并删除旧 Tool 级策略；不长期维护两套 Loop。
+17. 第一阶段不实现 Multi-Agent、独立角色模型或复杂 Token 调度。
