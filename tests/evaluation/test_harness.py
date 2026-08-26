@@ -3,13 +3,14 @@ import stat
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import SecretStr
 
 from deepfix.config import AppConfig, ApprovalMode, ModelRoleConfig
 from deepfix.evaluation.harness import EvaluationHarness
-from deepfix.evaluation.legacy import LegacyLoopRunner
+from deepfix.evaluation.legacy import LegacyLoopRunner, _run_oracle
 from deepfix.evaluation.models import (
     EvaluationBudget,
     EvaluationCase,
@@ -139,6 +140,7 @@ def test_correct_control_is_copied_before_gold_material_is_removed(tmp_path) -> 
     (source / "python_programs").mkdir(parents=True)
     (source / "correct_python_programs").mkdir()
     (source / "correct_java_programs").mkdir()
+    (source / "nested" / "answers").mkdir(parents=True)
     (source / "python_programs" / "sample.py").write_text(
         "VALUE = 'buggy'\n",
         encoding="utf-8",
@@ -152,6 +154,10 @@ def test_correct_control_is_copied_before_gold_material_is_removed(tmp_path) -> 
         encoding="utf-8",
     )
     (source / "answer.patch").write_text("secret patch", encoding="utf-8")
+    (source / "nested" / "answers" / "solution.py").write_text(
+        "SECRET = True\n",
+        encoding="utf-8",
+    )
     harness = EvaluationHarness(tmp_path / "runs", RecordingRunner())
     control = case(
         case_id="sample-correct-control",
@@ -167,6 +173,7 @@ def test_correct_control_is_copied_before_gold_material_is_removed(tmp_path) -> 
     ) == "VALUE = 'correct'\n"
     assert not (execution.workspace / "correct_python_programs").exists()
     assert not (execution.workspace / "correct_java_programs").exists()
+    assert not (execution.workspace / "nested" / "answers").exists()
     assert not (execution.workspace / "answer.patch").exists()
     assert (source / "correct_python_programs" / "sample.py").is_file()
 
@@ -203,6 +210,25 @@ def test_source_subdirectory_cannot_escape_source_root(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="source_subdir"):
         harness.run_case(unsafe, source, run_index=1, budget=BUDGET)
+
+
+def test_source_symlink_is_rejected_before_workspace_copy(tmp_path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    link = source / "outside-link.txt"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    harness = EvaluationHarness(tmp_path / "runs", RecordingRunner())
+
+    with pytest.raises(ValueError, match="link or junction"):
+        harness.run_case(case(), source, run_index=1, budget=BUDGET)
+
+    assert not (tmp_path / "runs" / "sample-buggy" / "001").exists()
 
 
 def _app_config(workspace: Path, run_dir: Path) -> AppConfig:
@@ -276,15 +302,20 @@ def test_legacy_runner_invokes_service_oracle_and_trace_summary(tmp_path) -> Non
     service = FakeService(
         _task(workspace, status=TaskStatus.COMPLETED, resolution="fixed")
     )
-    seen_oracles: list[tuple[str, Path, int]] = []
+    seen_oracles: list[tuple[str, Path, int, Path]] = []
 
     @contextmanager
     def service_factory(received_config):
         assert received_config is config
         yield service
 
-    def oracle_runner(command: str, root: Path, timeout: int) -> int:
-        seen_oracles.append((command, root, timeout))
+    def oracle_runner(
+        command: str,
+        root: Path,
+        timeout: int,
+        project_python: Path,
+    ) -> int:
+        seen_oracles.append((command, root, timeout, project_python))
         return 0
 
     times = iter([10.0, 12.5])
@@ -299,7 +330,9 @@ def test_legacy_runner_invokes_service_oracle_and_trace_summary(tmp_path) -> Non
     run = runner.run(case(), workspace, run_dir, BUDGET)
 
     assert service.problems == ["repair the sample"]
-    assert seen_oracles == [("python -m pytest -q", workspace, 600)]
+    assert seen_oracles == [
+        ("python -m pytest -q", workspace, 600, Path(sys.executable).resolve())
+    ]
     assert run.conclusion == "fixed"
     assert run.oracle_exit_code == 0
     assert run.usage.input_tokens == 30
@@ -307,6 +340,33 @@ def test_legacy_runner_invokes_service_oracle_and_trace_summary(tmp_path) -> Non
     assert run.usage.model_calls == 1
     assert run.usage.tool_calls == 2
     assert run.usage.wall_seconds == 2.5
+
+
+def test_default_oracle_binds_python_command_to_selected_interpreter(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    selected_python = tmp_path / "Selected Python" / "python.exe"
+    selected_python.parent.mkdir()
+    selected_python.touch()
+    captured: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("deepfix.evaluation.legacy.subprocess.run", fake_run)
+
+    exit_code = _run_oracle(
+        "python -m pytest tests/test_sample.py -q",
+        tmp_path,
+        30,
+        selected_python,
+    )
+
+    assert exit_code == 0
+    assert str(captured["command"]).startswith(f'"{selected_python}" -m pytest')
 
 
 def test_legacy_runner_does_not_approve_manual_actions(tmp_path) -> None:

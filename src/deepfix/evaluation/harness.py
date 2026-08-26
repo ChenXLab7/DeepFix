@@ -77,6 +77,7 @@ class EvaluationHarness:
             raise ValueError("source_subdir escapes source root") from error
         if not source_directory.is_dir():
             raise ValueError(f"source directory does not exist: {source_directory}")
+        _reject_links_and_junctions(source_directory)
 
         allowed_paths = {_normalized_relative(path) for path in case.allowed_paths}
         run_dir = self.runs_root / case.case_id / f"{run_index:03d}"
@@ -167,9 +168,25 @@ def _prepare_correct_control(workspace: Path, allowed_paths: set[str]) -> None:
 def _remove_gold_material(workspace: Path) -> None:
     for name in _GOLD_DIRECTORIES | {".git"}:
         _remove_path(workspace / name)
-    for path in list(workspace.rglob("*")):
+    paths = sorted(
+        workspace.rglob("*"),
+        key=lambda path: len(path.relative_to(workspace).parts),
+        reverse=True,
+    )
+    for path in paths:
+        if path.is_dir() and path.name in _GOLD_DIRECTORIES:
+            _remove_path(path)
+            continue
         if path.is_file() and path.suffix.lower() in _GOLD_FILE_SUFFIXES:
             path.unlink()
+
+
+def _reject_links_and_junctions(source: Path) -> None:
+    for path in (source, *source.rglob("*")):
+        is_junction = getattr(path, "is_junction", lambda: False)
+        if path.is_symlink() or is_junction():
+            relative = path.relative_to(source) if path != source else Path(".")
+            raise ValueError(f"source contains link or junction: {relative}")
 
 
 def _remove_path(path: Path) -> None:

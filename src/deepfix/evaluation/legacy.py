@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import threading
 import time
@@ -24,7 +25,7 @@ ConfigFactory = Callable[
     AppConfig,
 ]
 ServiceFactory = Callable[[AppConfig], AbstractContextManager[BugfixService]]
-OracleRunner = Callable[[str, Path, int], int]
+OracleRunner = Callable[[str, Path, int, Path], int]
 
 _CONFIG_ENV_LOCK = threading.Lock()
 
@@ -75,6 +76,7 @@ class LegacyLoopRunner:
                     case.required_command,
                     workspace,
                     budget.max_wall_seconds,
+                    self.project_python,
                 )
             )
         except Exception:  # noqa: BLE001 - never persist command exception details
@@ -188,10 +190,16 @@ def _build_run_config(
     )
 
 
-def _run_oracle(command: str, workspace: Path, timeout_seconds: int) -> int:
+def _run_oracle(
+    command: str,
+    workspace: Path,
+    timeout_seconds: int,
+    project_python: Path,
+) -> int:
+    bound_command = _bind_python_command(command, project_python)
     try:
         completed = subprocess.run(
-            command,
+            bound_command,
             cwd=workspace,
             shell=True,
             capture_output=True,
@@ -206,6 +214,15 @@ def _run_oracle(command: str, workspace: Path, timeout_seconds: int) -> int:
     except OSError:
         return 127
     return completed.returncode
+
+
+def _bind_python_command(command: str, project_python: Path) -> str:
+    stripped = command.lstrip()
+    match = re.match(r"(?i)python(?:\.exe)?(?=\s|$)", stripped)
+    if match is None:
+        return command
+    executable = subprocess.list2cmdline([str(project_python)])
+    return f"{executable}{stripped[match.end():]}"
 
 
 @contextmanager
