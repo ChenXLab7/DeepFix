@@ -25,6 +25,28 @@ def test_create_normalizes_task_input(tmp_path):
     assert task.status is TaskStatus.CREATED
 
 
+def test_create_records_source_and_active_workspace_identity(tmp_path):
+    source = tmp_path / "source"
+    workspace = tmp_path / "workspaces" / "task-1"
+    source.mkdir()
+    workspace.mkdir(parents=True)
+
+    task = TaskState.create(
+        workspace,
+        "修复错误",
+        ApprovalMode.GUARDED,
+        source_project_root=source,
+        workspace_baseline_id="baseline-1",
+    )
+
+    assert task.project_root == str(workspace.resolve())
+    assert task.source_project_root == str(source.resolve())
+    assert task.workspace_root == str(workspace.resolve())
+    assert task.workspace_baseline_id == "baseline-1"
+
+    assert TaskState.from_dict(task.to_dict()) == task
+
+
 def test_create_rejects_empty_problem(tmp_path):
     with pytest.raises(ValueError, match="问题描述不能为空"):
         TaskState.create(tmp_path, "   ", ApprovalMode.MANUAL)
@@ -114,6 +136,21 @@ def test_task_from_old_payload_uses_context_defaults(tmp_path):
     assert restored.context_metrics == ContextMetrics()
     assert restored.offloaded_artifacts == []
     assert restored.context_recovery is None
+
+
+def test_task_from_old_payload_uses_project_root_as_workspace_alias(tmp_path):
+    task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
+    payload = task.to_dict()
+    payload.pop("source_project_root")
+    payload.pop("workspace_root")
+    payload.pop("workspace_baseline_id")
+
+    restored = TaskState.from_dict(payload)
+
+    assert restored.project_root == str(tmp_path.resolve())
+    assert restored.source_project_root == restored.project_root
+    assert restored.workspace_root == restored.project_root
+    assert restored.workspace_baseline_id is None
 
 
 def test_old_conversation_entries_receive_stable_ids(tmp_path):

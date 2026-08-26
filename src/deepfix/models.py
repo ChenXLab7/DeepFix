@@ -168,6 +168,9 @@ class TaskState:
     project_root: str
     user_problem: str
     approval_mode: str
+    source_project_root: str | None = None
+    workspace_root: str | None = None
+    workspace_baseline_id: str | None = None
     project_python: str = field(
         default_factory=lambda: str(Path(sys.executable).resolve())
     )
@@ -206,6 +209,15 @@ class TaskState:
     context_recovery: ContextRecoveryMetadata | None = None
     investigation_recovery: InvestigationRecoveryMetadata | None = None
 
+    def __post_init__(self) -> None:
+        self.project_root = str(Path(self.project_root).expanduser().resolve())
+        self.source_project_root = str(
+            Path(self.source_project_root or self.project_root).expanduser().resolve()
+        )
+        self.workspace_root = str(
+            Path(self.workspace_root or self.project_root).expanduser().resolve()
+        )
+
     @classmethod
     def create(
         cls,
@@ -213,13 +225,22 @@ class TaskState:
         problem: str,
         approval_mode: ApprovalMode,
         project_python: str | Path | None = None,
+        *,
+        source_project_root: str | Path | None = None,
+        workspace_baseline_id: str | None = None,
     ) -> TaskState:
         normalized_problem = problem.strip()
         if not normalized_problem:
             raise ValueError("问题描述不能为空")
+        active_root = Path(project_root).expanduser().resolve()
         return cls(
             task_id=uuid4().hex,
-            project_root=str(Path(project_root).expanduser().resolve()),
+            project_root=str(active_root),
+            source_project_root=str(
+                Path(source_project_root or active_root).expanduser().resolve()
+            ),
+            workspace_root=str(active_root),
+            workspace_baseline_id=workspace_baseline_id,
             user_problem=normalized_problem,
             approval_mode=approval_mode.value,
             project_python=str(
