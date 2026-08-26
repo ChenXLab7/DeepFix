@@ -1,4 +1,5 @@
 import json
+import stat
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -98,6 +99,39 @@ def test_existing_run_directory_is_never_reused(tmp_path) -> None:
 
     with pytest.raises(FileExistsError):
         harness.run_case(case(), source, run_index=1, budget=BUDGET)
+
+
+def test_git_metadata_is_not_copied_even_when_it_contains_read_only_files(
+    tmp_path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    git_pack = source / ".git" / "objects" / "pack" / "readonly.idx"
+    git_pack.parent.mkdir(parents=True)
+    git_pack.write_bytes(b"git metadata")
+    git_pack.chmod(stat.S_IREAD)
+    harness = EvaluationHarness(tmp_path / "runs", RecordingRunner())
+
+    try:
+        execution = harness.run_case(case(), source, run_index=1, budget=BUDGET)
+    finally:
+        git_pack.chmod(stat.S_IREAD | stat.S_IWRITE)
+        copied_pack = (
+            tmp_path
+            / "runs"
+            / "sample-buggy"
+            / "001"
+            / "workspace"
+            / ".git"
+            / "objects"
+            / "pack"
+            / "readonly.idx"
+        )
+        if copied_pack.exists():
+            copied_pack.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    assert not (execution.workspace / ".git").exists()
 
 
 def test_correct_control_is_copied_before_gold_material_is_removed(tmp_path) -> None:

@@ -79,7 +79,12 @@ class EvaluationHarness:
         run_dir.parent.mkdir(parents=True, exist_ok=True)
         run_dir.mkdir()
         workspace = run_dir / "workspace"
-        shutil.copytree(source_directory, workspace, symlinks=True)
+        shutil.copytree(
+            source_directory,
+            workspace,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(".git"),
+        )
 
         if case.source_variant == "correct_control":
             _prepare_correct_control(workspace, allowed_paths)
