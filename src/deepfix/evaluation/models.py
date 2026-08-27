@@ -60,6 +60,12 @@ class EvaluationRun(StrictModel):
     verdict: EvaluationVerdict | None = None
     sanitized_error_code: str | None = None
     budget_violations: list[str] = Field(default_factory=list)
+    wrong_hypothesis_recovery: Literal[
+        "recovered",
+        "not_recovered",
+        "not_applicable",
+        "unknown",
+    ] = "unknown"
 
 
 class AggregateMetrics(StrictModel):
