@@ -1,12 +1,19 @@
 import pytest
 
 from deepfix.investigation.errors import InvestigationStagnationError
+from deepfix.investigation.experiments import StrategyDecision
 from deepfix.investigation.models import (
     InvestigationState,
     NewInvestigationEvent,
     ToolObservation,
 )
-from deepfix.investigation.stagnation import StagnationDetector, matching_cycle_size
+from deepfix.investigation.stagnation import (
+    ExperimentStagnationDetector,
+    StagnationDetector,
+    matching_cycle_size,
+    progress_fingerprint,
+    strategy_signature,
+)
 from investigation.helpers import continue_input, stagnated_coordinator
 
 
@@ -30,6 +37,82 @@ def state_with_no_progress_count(count: int) -> InvestigationState:
             "recent_tool_signatures": [f"old-{index}" for index in range(count)],
         }
     )
+
+
+def test_memory_and_audit_updates_do_not_change_progress_fingerprint():
+    state = InvestigationState.new("task-a")
+    changed = state.model_copy(
+        update={
+            "version": state.version + 1,
+            "memory_saved_generation": 9,
+            "last_progress_event_id": "audit-only-event",
+        }
+    )
+
+    assert progress_fingerprint(changed) == progress_fingerprint(state)
+
+
+def test_closed_gap_changes_progress_fingerprint():
+    state = InvestigationState.new("task-a")
+    changed = state.model_copy(update={"closed_evidence_gap_ids": ["gap-1"]})
+
+    assert progress_fingerprint(changed) != progress_fingerprint(state)
+
+
+def test_strategy_signature_ignores_identity_and_blackboard_version():
+    values = {
+        "task_id": "task-a",
+        "decision_type": "ask_user",
+        "current_assessment": "Need one user-only fact",
+        "evidence_gap_ids": ["gap-1"],
+        "uncertainty": 0.8,
+        "rationale_refs": [],
+        "question_for_user": "Which behavior is intended?",
+    }
+    first = StrategyDecision(
+        decision_id="decision-1",
+        blackboard_fingerprint="blackboard-1",
+        **values,
+    )
+    second = StrategyDecision(
+        decision_id="decision-2",
+        blackboard_fingerprint="blackboard-2",
+        **values,
+    )
+
+    assert strategy_signature(first) == strategy_signature(second)
+
+
+def test_experiment_stagnation_requires_repeated_strategy_without_progress():
+    decision = StrategyDecision(
+        decision_id="decision-1",
+        task_id="task-a",
+        blackboard_fingerprint="blackboard-1",
+        decision_type="ask_user",
+        current_assessment="Need one user-only fact",
+        evidence_gap_ids=["gap-1"],
+        uncertainty=0.8,
+        rationale_refs=[],
+        question_for_user="Which behavior is intended?",
+    )
+    signature = strategy_signature(decision)
+    state = InvestigationState.new("task-a").model_copy(
+        update={"last_strategy_signature": signature, "no_progress_count": 1}
+    )
+    before = progress_fingerprint(state)
+
+    stalled = ExperimentStagnationDetector().after_experiment(
+        state, decision, before
+    )
+    progressed = ExperimentStagnationDetector().after_experiment(
+        state.model_copy(update={"closed_evidence_gap_ids": ["gap-1"]}),
+        decision,
+        before,
+    )
+
+    assert stalled.reevaluation_required is True
+    assert stalled.stagnation_level == 1
+    assert progressed.no_progress_count == 0
 
 
 def test_exact_repeat_triggers_on_third_result():

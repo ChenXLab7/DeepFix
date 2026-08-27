@@ -241,6 +241,8 @@ class InvestigationState(StrictModel):
     )
     experiment_progress_fingerprint: str | None = None
     last_strategy_signature: str | None = None
+    code_state_hash: str | None = None
+    user_information_ids: list[str] = Field(default_factory=list, max_length=64)
     supported_hypothesis_ids: list[str] = Field(default_factory=list, max_length=64)
     seen_progress_fingerprints: list[str] = Field(default_factory=list, max_length=64)
     progress_generation: int = 0
