@@ -40,6 +40,13 @@ from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
 from deepfix.models import Evidence, RepairOutcome, TaskState, TaskStatus
 from deepfix.models import TestResult as RepairTestResult
+from deepfix.operations import (
+    NewOperationEntry,
+    OperationJournalStore,
+    OperationKind,
+    OperationReconciler,
+    OperationStateSnapshot,
+)
 from deepfix.persistence import TaskRepository
 from deepfix.research.models import ExternalEvidence, SearchCandidate
 from deepfix.research.store import ResearchEvidenceStore
@@ -216,6 +223,7 @@ def make_service(
     memory_store=None,
     research_store=None,
     investigation=None,
+    operation_reconciler=None,
 ):
     repository = TaskRepository(config.database_path)
     memory_store = memory_store or WorkingMemoryStore(config.database_path)
@@ -229,9 +237,57 @@ def make_service(
             memory_store,
             research_store,
             investigation=investigation,
+            operation_reconciler=operation_reconciler,
         ),
         repository,
     )
+
+
+def test_unresolved_operation_pauses_before_agent_invocation(app_config):
+    fake_agent = FakeAgent(outcome())
+    journal = OperationJournalStore(app_config.database_path)
+    receipts = ToolExecutionReceiptStore(
+        app_config.artifacts_path / "investigation_receipts"
+    )
+    reconciler = OperationReconciler(journal, receipts)
+    service, repository = make_service(
+        app_config,
+        fake_agent,
+        operation_reconciler=reconciler,
+    )
+    task = TaskState.create(
+        app_config.project_root,
+        "recover interrupted edit",
+        app_config.approval_mode,
+        workspace_baseline_id="baseline-1",
+    )
+    task.transition_to(TaskStatus.INVESTIGATING)
+    repository.save(task)
+    target = app_config.project_root / "value.py"
+    target.write_text("third-party\n", encoding="utf-8")
+    entry = NewOperationEntry(
+        operation_id="operation-conflict",
+        task_id=task.task_id,
+        experiment_id="legacy-task",
+        tool_call_id="edit-conflict",
+        operation_kind=OperationKind.FILE_EDIT,
+        call_hash="a" * 64,
+        workspace_baseline_id="baseline-1",
+        pre_state=OperationStateSnapshot(
+            target_path="value.py", target_exists=True, file_hash="b" * 64
+        ),
+        expected_post_state=OperationStateSnapshot(
+            target_path="value.py", target_exists=True, file_hash="c" * 64
+        ),
+    )
+    journal.prepare(entry)
+    journal.mark_started(entry.operation_id)
+
+    result = service._invoke(task, {"messages": []})
+
+    assert result.status is TaskStatus.PAUSED
+    assert "operation-conflict" in result.pause_reason
+    assert fake_agent.invoke_calls == []
 
 
 def service_coordinator(config):

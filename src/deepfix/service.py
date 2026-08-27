@@ -25,6 +25,7 @@ from deepfix.investigation.models import InvestigationRecoveryMetadata
 from deepfix.investigation.receipts import receipt_task_segment
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus, TestResult
+from deepfix.operations import OperationReconciler
 from deepfix.persistence import TaskRepository
 from deepfix.research.store import ResearchEvidenceStore
 
@@ -40,6 +41,7 @@ class BugfixService:
         research_evidence_store: ResearchEvidenceStore,
         compaction_store: CompactionStore | None = None,
         investigation: InvestigationCoordinator | None = None,
+        operation_reconciler: OperationReconciler | None = None,
     ) -> None:
         self.agent = agent
         self.repository = repository
@@ -51,6 +53,7 @@ class BugfixService:
             config.database_path
         )
         self.investigation = investigation
+        self.operation_reconciler = operation_reconciler
 
     def start(self, problem: str) -> TaskState:
         task = TaskState.create(
@@ -141,6 +144,27 @@ class BugfixService:
         return self._resume_actions(task, decisions)
 
     def _invoke(self, task: TaskState, value: object) -> TaskState:
+        if self.operation_reconciler is not None:
+            try:
+                reconciliation = self.operation_reconciler.reconcile_task(
+                    task.task_id,
+                    task.workspace_root or task.project_root,
+                )
+            except Exception as exc:  # noqa: BLE001 - recovery boundary
+                safe_error = redact_config_secrets(str(exc), self.config)
+                return self._pause(
+                    task,
+                    f"副作用恢复检查失败：{type(exc).__name__}: {safe_error}",
+                )
+            if reconciliation.blocks_agent_invocation:
+                unresolved = [
+                    *reconciliation.conflict_operation_ids,
+                    *reconciliation.unknown_operation_ids,
+                ]
+                return self._pause(
+                    task,
+                    "副作用操作需要人工恢复：" + ", ".join(dict.fromkeys(unresolved)),
+                )
         if task.agent_invocations >= self.config.max_agent_invocations:
             return self._pause(task, "已达到 Agent 最大调用次数")
 

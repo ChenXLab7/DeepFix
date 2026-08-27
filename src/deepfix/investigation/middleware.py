@@ -397,7 +397,9 @@ class InvestigationMiddleware(AgentMiddleware):
         return pre_state.model_copy(
             update={
                 "target_exists": True,
-                "file_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "file_hash": hashlib.sha256(
+                    content.replace("\n", os.linesep).encode("utf-8")
+                ).hexdigest(),
                 "code_state_hash": None,
             }
         )

@@ -148,6 +148,24 @@ class ToolExecutionReceiptStore:
                 raise RuntimeError("tool result artifact 校验失败")
         return relative.as_posix()
 
+    def load_result_artifact(
+        self,
+        task_id: str,
+        tool_call_id: str,
+    ) -> tuple[str, ToolResultArtifact] | None:
+        relative = Path("operation_results") / receipt_task_segment(task_id) / (
+            hashlib.sha256(tool_call_id.strip().encode()).hexdigest()[:32] + ".json"
+        )
+        path = self.root_dir.parent / relative
+        if not path.exists():
+            return None
+        if not path.is_file():
+            raise RuntimeError("tool result artifact 缺少内容")
+        return (
+            relative.as_posix(),
+            ToolResultArtifact.model_validate_json(path.read_text(encoding="utf-8")),
+        )
+
     def _path(self, task_id: str, tool_call_id: str) -> Path:
         task_segment = receipt_task_segment(task_id)
         call_segment = hashlib.sha256(tool_call_id.strip().encode()).hexdigest()[:32]

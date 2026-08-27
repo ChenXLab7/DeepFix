@@ -3,12 +3,15 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from langchain_core.messages import ToolMessage
 
+from deepfix.investigation.receipts import ToolExecutionReceiptStore
 from deepfix.operations import (
     NewOperationEntry,
     OperationConflictError,
     OperationJournalStore,
     OperationKind,
+    OperationReconciler,
     OperationStateSnapshot,
     OperationStatus,
     OperationTransitionError,
@@ -163,3 +166,162 @@ def test_parallel_identical_prepare_creates_one_row(
 
     assert all(result == results[0] for result in results)
     assert store.list_incomplete("task-1") == [results[0]]
+
+
+def test_file_post_hash_reconstructs_observed_receipt(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    target = workspace / "src" / "value.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("broken\n", encoding="utf-8")
+    store = OperationJournalStore(tmp_path / "state.db")
+    receipts = ToolExecutionReceiptStore(tmp_path / "artifacts" / "receipts")
+    prepared = NewOperationEntry(
+        operation_id="operation-recover",
+        task_id="task-1",
+        experiment_id="legacy-task-1",
+        tool_call_id="call-recover",
+        operation_kind=OperationKind.FILE_EDIT,
+        call_hash="a" * 64,
+        workspace_baseline_id="baseline-1",
+        pre_state=OperationStateSnapshot(
+            target_path="src/value.py",
+            target_exists=True,
+            file_hash=_hash(target),
+        ),
+        expected_post_state=OperationStateSnapshot(
+            target_path="src/value.py",
+            target_exists=True,
+            file_hash=_text_hash("fixed\n"),
+        ),
+    )
+    store.prepare(prepared)
+    store.mark_started(prepared.operation_id)
+    target.write_text("fixed\n", encoding="utf-8")
+
+    result = OperationReconciler(store, receipts).reconcile_task(
+        "task-1", workspace
+    )
+
+    assert result.reconstructed_operation_ids == [prepared.operation_id]
+    assert result.conflict_operation_ids == []
+    assert receipts.load("task-1", "call-recover") is not None
+    assert store.load(prepared.operation_id).status is OperationStatus.OBSERVED
+
+
+def test_unexpected_file_hash_pauses_recovery(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    target = workspace / "src" / "value.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("broken\n", encoding="utf-8")
+    store = OperationJournalStore(tmp_path / "state.db")
+    prepared = NewOperationEntry(
+        operation_id="operation-conflict",
+        task_id="task-1",
+        experiment_id="legacy-task-1",
+        tool_call_id="call-conflict",
+        operation_kind=OperationKind.FILE_EDIT,
+        call_hash="b" * 64,
+        workspace_baseline_id="baseline-1",
+        pre_state=OperationStateSnapshot(
+            target_path="src/value.py",
+            target_exists=True,
+            file_hash=_hash(target),
+        ),
+        expected_post_state=OperationStateSnapshot(
+            target_path="src/value.py",
+            target_exists=True,
+            file_hash=_text_hash("fixed\n"),
+        ),
+    )
+    store.prepare(prepared)
+    store.mark_started(prepared.operation_id)
+    target.write_text("third-party change\n", encoding="utf-8")
+
+    result = OperationReconciler(
+        store,
+        ToolExecutionReceiptStore(tmp_path / "artifacts" / "receipts"),
+    ).reconcile_task("task-1", workspace)
+
+    assert result.conflict_operation_ids == [prepared.operation_id]
+    assert store.load(prepared.operation_id).status is OperationStatus.UNKNOWN
+
+
+def test_command_artifact_with_exit_status_reconstructs_receipt(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = OperationJournalStore(tmp_path / "state.db")
+    receipts = ToolExecutionReceiptStore(tmp_path / "artifacts" / "receipts")
+    prepared = NewOperationEntry(
+        operation_id="operation-command",
+        task_id="task-1",
+        experiment_id="legacy-task-1",
+        tool_call_id="execute-1",
+        operation_kind=OperationKind.COMMAND,
+        call_hash="d" * 64,
+        workspace_baseline_id="baseline-1",
+        pre_state=OperationStateSnapshot(command_hash="e" * 64),
+    )
+    store.prepare(prepared)
+    store.mark_started(prepared.operation_id)
+    receipts.save_result_artifact(
+        "task-1",
+        "execute-1",
+        "execute",
+        ToolMessage(
+            content="1 failed",
+            name="execute",
+            tool_call_id="execute-1",
+            artifact={"exit_code": 1},
+        ),
+    )
+
+    result = OperationReconciler(store, receipts).reconcile_task(
+        "task-1", workspace
+    )
+
+    assert result.reconstructed_operation_ids == [prepared.operation_id]
+    assert receipts.load("task-1", "execute-1").tool_message.artifact["exit_code"] == 1
+    assert store.load(prepared.operation_id).status is OperationStatus.OBSERVED
+
+
+def test_command_without_verified_exit_status_is_unknown_and_terminated(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = OperationJournalStore(tmp_path / "state.db")
+    receipts = ToolExecutionReceiptStore(tmp_path / "artifacts" / "receipts")
+    prepared = NewOperationEntry(
+        operation_id="operation-command-unknown",
+        task_id="task-1",
+        experiment_id="legacy-task-1",
+        tool_call_id="execute-unknown",
+        operation_kind=OperationKind.COMMAND,
+        call_hash="f" * 64,
+        workspace_baseline_id="baseline-1",
+        pre_state=OperationStateSnapshot(command_hash="1" * 64),
+    )
+    store.prepare(prepared)
+    store.mark_started(prepared.operation_id)
+    terminated: list[str] = []
+
+    result = OperationReconciler(
+        store,
+        receipts,
+        terminate_process_group=lambda entry: terminated.append(entry.operation_id),
+    ).reconcile_task("task-1", workspace)
+
+    assert result.unknown_operation_ids == [prepared.operation_id]
+    assert terminated == [prepared.operation_id]
+    assert store.load(prepared.operation_id).status is OperationStatus.UNKNOWN
+
+
+def _hash(path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _text_hash(content: str) -> str:
+    import hashlib
+    import os
+
+    return hashlib.sha256(content.replace("\n", os.linesep).encode("utf-8")).hexdigest()
