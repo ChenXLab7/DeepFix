@@ -127,3 +127,22 @@ class EvaluationSummary(StrictModel):
         if any(run.case_id not in self.case_ids for run in self.runs):
             raise ValueError("summary run references an unknown case_id")
         return self
+
+
+class GateThresholds(StrictModel):
+    minimum_newly_solved_stable_failures: int = Field(ge=0)
+    minimum_success_rate_delta: float = Field(ge=-1, le=1)
+    maximum_false_fixed_rate: float = Field(ge=0, le=1)
+    maximum_false_fixed_rate_ratio_to_legacy: float = Field(ge=0)
+    minimum_wrong_hypothesis_recovery_delta: float = Field(ge=-1, le=1)
+    maximum_token_multiplier: float = Field(gt=0)
+    fault_invariant_violations: int = Field(ge=0)
+
+
+class GateDefinition(StrictModel):
+    schema_version: Literal[1] = 1
+    case_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    historical_legacy_summary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    runs_per_case: int = Field(gt=0)
+    budget: EvaluationBudget
+    thresholds: GateThresholds

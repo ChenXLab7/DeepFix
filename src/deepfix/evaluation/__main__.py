@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sys
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,8 @@ from deepfix.evaluation.models import (
     EvaluationProvenanceBatch,
     EvaluationRun,
     EvaluationSummary,
+    GateDefinition,
+    GateThresholds,
 )
 from deepfix.evaluation.provenance import build_provenance_batch
 
@@ -61,6 +64,19 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--output", required=True)
     merge.add_argument("--manifest")
     merge.add_argument("--historical-provenance", action="append")
+
+    preregister = subparsers.add_parser("preregister")
+    preregister.add_argument("--manifest", required=True)
+    preregister.add_argument("--baseline", required=True)
+    preregister.add_argument("--output", required=True)
+
+    validate_gate_parser = subparsers.add_parser("validate-gate")
+    validate_gate_parser.add_argument("path")
+    validate_gate_parser.add_argument("--baseline", required=True)
+    validate_gate_parser.add_argument(
+        "--manifest",
+        default="evaluations/quixbugs-python.json",
+    )
     return parser
 
 
@@ -70,6 +86,27 @@ def main(
     runner_factory: RunnerFactory | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "preregister":
+        return _preregister_gate(
+            Path(args.manifest),
+            Path(args.baseline),
+            Path(args.output),
+        )
+    if args.command == "validate-gate":
+        try:
+            gate, case_count = validate_gate(
+                Path(args.path),
+                baseline_path=Path(args.baseline),
+                manifest_path=Path(args.manifest),
+            )
+        except (OSError, TypeError, ValueError) as error:
+            print(f"invalid immutable gate: {error}", file=sys.stderr)
+            return 2
+        print(
+            f"valid immutable gate: runs={gate.runs_per_case} "
+            f"cases={case_count} fingerprint={_sha256_file(Path(args.path))}"
+        )
+        return 0
     if args.command == "validate-summary":
         try:
             summary = validate_summary(Path(args.path))
@@ -214,6 +251,115 @@ def validate_summary(path: Path) -> EvaluationSummary:
     summary = EvaluationSummary.model_validate(raw)
     _validate_summary_integrity(summary)
     return summary
+
+
+def validate_gate(
+    path: Path,
+    *,
+    baseline_path: Path,
+    manifest_path: Path,
+) -> tuple[GateDefinition, int]:
+    resolved_path = path.expanduser().resolve()
+    resolved_baseline = baseline_path.expanduser().resolve()
+    resolved_manifest = manifest_path.expanduser().resolve()
+    gate = GateDefinition.model_validate_json(
+        resolved_path.read_text(encoding="utf-8")
+    )
+    baseline = validate_summary(resolved_baseline)
+    manifest = load_manifest(resolved_manifest)
+    manifest_hash = _sha256_file(resolved_manifest)
+    baseline_hash = _sha256_file(resolved_baseline)
+    if gate.case_manifest_sha256 != manifest_hash:
+        raise ValueError("case manifest hash does not match")
+    if gate.historical_legacy_summary_sha256 != baseline_hash:
+        raise ValueError("historical baseline hash does not match")
+    if baseline.manifest_sha256 != manifest_hash:
+        raise ValueError("historical baseline is bound to a different manifest")
+    if gate.budget != baseline.budget:
+        raise ValueError("gate budget differs from historical baseline")
+    if gate.runs_per_case != baseline.expected_runs_per_case:
+        raise ValueError("gate run count differs from historical baseline")
+    manifest_case_ids = [case.case_id for case in manifest.cases]
+    if baseline.case_ids != manifest_case_ids:
+        raise ValueError("historical baseline cases differ from manifest")
+    if gate.thresholds != _registered_thresholds():
+        raise ValueError("gate thresholds differ from preregistered values")
+    return gate, len(manifest.cases)
+
+
+def _preregister_gate(
+    manifest_path: Path,
+    baseline_path: Path,
+    output_path: Path,
+) -> int:
+    resolved_manifest = manifest_path.expanduser().resolve()
+    resolved_baseline = baseline_path.expanduser().resolve()
+    resolved_output = output_path.expanduser().resolve()
+    try:
+        baseline = validate_summary(resolved_baseline)
+        manifest = load_manifest(resolved_manifest)
+        manifest_hash = _sha256_file(resolved_manifest)
+        if baseline.status != "complete":
+            raise ValueError("historical baseline is not complete")
+        if baseline.manifest_sha256 != manifest_hash:
+            raise ValueError("historical baseline is bound to a different manifest")
+        if baseline.case_ids != [case.case_id for case in manifest.cases]:
+            raise ValueError("historical baseline cases differ from manifest")
+        gate = GateDefinition(
+            case_manifest_sha256=manifest_hash,
+            historical_legacy_summary_sha256=_sha256_file(resolved_baseline),
+            runs_per_case=baseline.expected_runs_per_case,
+            budget=baseline.budget,
+            thresholds=_registered_thresholds(),
+        )
+        payload = gate.model_dump_json(indent=2) + "\n"
+        if resolved_output.exists():
+            if resolved_output.read_text(encoding="utf-8") != payload:
+                raise ValueError("immutable gate already exists with different content")
+        else:
+            _write_text_atomic(resolved_output, payload)
+        validate_gate(
+            resolved_output,
+            baseline_path=resolved_baseline,
+            manifest_path=resolved_manifest,
+        )
+    except (OSError, TypeError, ValueError) as error:
+        print(f"cannot preregister immutable gate: {error}", file=sys.stderr)
+        return 2
+    print(
+        f"wrote immutable gate: {output_path} "
+        f"fingerprint={_sha256_file(resolved_output)}"
+    )
+    return 0
+
+
+def _registered_thresholds() -> GateThresholds:
+    return GateThresholds(
+        minimum_newly_solved_stable_failures=3,
+        minimum_success_rate_delta=0.15,
+        maximum_false_fixed_rate=0.05,
+        maximum_false_fixed_rate_ratio_to_legacy=0.5,
+        minimum_wrong_hypothesis_recovery_delta=0.15,
+        maximum_token_multiplier=1.5,
+        fault_invariant_violations=0,
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.expanduser().resolve().read_bytes()).hexdigest()
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8", newline="") as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _merge_summaries(

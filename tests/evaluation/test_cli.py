@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -116,6 +117,78 @@ def test_evaluation_cli_has_experiment_command_but_production_cli_has_no_loop_fl
     production_help = build_production_parser().format_help()
     assert "--loop" not in production_help
     assert "experiment" not in production_help
+
+
+def test_gate_rejects_resource_caps_different_from_baseline(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    baseline = _write_batch_summary(tmp_path, monkeypatch, run_start=1, runs=3)
+    manifest = baseline.parent / "cases.json"
+    gate = _valid_gate(manifest, baseline)
+    gate["budget"]["max_input_tokens"] += 1
+    gate_path = tmp_path / "gate.json"
+    gate_path.write_text(json.dumps(gate), encoding="utf-8")
+
+    code = main(
+        [
+            "validate-gate",
+            str(gate_path),
+            "--baseline",
+            str(baseline),
+            "--manifest",
+            str(manifest),
+        ]
+    )
+
+    assert code == 2
+    assert "budget" in capsys.readouterr().err
+
+
+def test_preregister_writes_hash_bound_gate_and_refuses_changed_overwrite(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    baseline = _write_batch_summary(tmp_path, monkeypatch, run_start=1, runs=3)
+    manifest = baseline.parent / "cases.json"
+    gate_path = tmp_path / "experiment-loop-gate.json"
+
+    code = main(
+        [
+            "preregister",
+            "--manifest",
+            str(manifest),
+            "--baseline",
+            str(baseline),
+            "--output",
+            str(gate_path),
+        ]
+    )
+
+    assert code == 0
+    raw = json.loads(gate_path.read_text(encoding="utf-8"))
+    assert raw["case_manifest_sha256"] == _sha256(manifest)
+    assert raw["historical_legacy_summary_sha256"] == _sha256(baseline)
+    assert raw["runs_per_case"] == 3
+    raw["thresholds"]["maximum_token_multiplier"] = 9.0
+    gate_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    second = main(
+        [
+            "preregister",
+            "--manifest",
+            str(manifest),
+            "--baseline",
+            str(baseline),
+            "--output",
+            str(gate_path),
+        ]
+    )
+
+    assert second == 2
+    assert "immutable gate" in capsys.readouterr().err
 
 
 def test_cli_refuses_model_execution_without_online_opt_in(
@@ -572,3 +645,27 @@ def _write_batch_summary(
     )
     assert code == 0
     return summary
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _valid_gate(manifest: Path, baseline: Path) -> dict:
+    summary = validate_summary(baseline)
+    return {
+        "schema_version": 1,
+        "case_manifest_sha256": _sha256(manifest),
+        "historical_legacy_summary_sha256": _sha256(baseline),
+        "runs_per_case": summary.expected_runs_per_case,
+        "budget": summary.budget.model_dump(mode="json"),
+        "thresholds": {
+            "minimum_newly_solved_stable_failures": 3,
+            "minimum_success_rate_delta": 0.15,
+            "maximum_false_fixed_rate": 0.05,
+            "maximum_false_fixed_rate_ratio_to_legacy": 0.5,
+            "minimum_wrong_hypothesis_recovery_delta": 0.15,
+            "maximum_token_multiplier": 1.5,
+            "fault_invariant_violations": 0,
+        },
+    }
