@@ -41,6 +41,8 @@ from deepfix.context import build_save_progress_tool
 from deepfix.debug import LLMTraceMiddleware
 from deepfix.extensions import AgentExtensions, merge_extensions
 from deepfix.investigation.coordinator import InvestigationCoordinator
+from deepfix.investigation.experiments import ExecutorNarrativeResult
+from deepfix.investigation.loop import EXPERIMENT_EXECUTOR_SYSTEM_PROMPT
 from deepfix.investigation.middleware import InvestigationMiddleware
 from deepfix.investigation.migration import (
     InvestigationMigrationMiddleware,
@@ -103,6 +105,7 @@ def build_agent(
     allowed_skill_roots: tuple[str | Path, ...] = (),
     backend=None,
     compaction_model_callbacks: tuple[object, ...] = (),
+    _experiment_mode: bool = False,
 ):
     register_harness_profile(
         f"deepseek:{config.main_model.model_name}",
@@ -220,9 +223,16 @@ def build_agent(
         "delete": True,
         "execute": True,
     }
+    prompt_policy_middleware = (
+        [] if _experiment_mode else [PromptPolicyMiddleware(investigation_store)]
+    )
     return create_deep_agent(
         model=main_model,
-        system_prompt=CORE_REPAIR_PROMPT,
+        system_prompt=(
+            EXPERIMENT_EXECUTOR_SYSTEM_PROMPT
+            if _experiment_mode
+            else CORE_REPAIR_PROMPT
+        ),
         tools=[
             save_progress,
             compact_conversation,
@@ -254,7 +264,7 @@ def build_agent(
                 capabilities,
                 operation_journal=OperationJournalStore(config.database_path),
             ),
-            PromptPolicyMiddleware(investigation_store),
+            *prompt_policy_middleware,
             ProtectedContextMiddleware(protected_builder),
             DeepFixCompactionMiddleware(
                 protected_builder,
@@ -270,8 +280,18 @@ def build_agent(
         backend=resolved_backend,
         subagents=[],
         skills=list(resolved.skill_sources),
-        response_format=RepairOutcome,
+        response_format=(ExecutorNarrativeResult if _experiment_mode else RepairOutcome),
         interrupt_on=merge_interrupt_on(core_interrupts, resolved.tools),
         checkpointer=checkpointer,
-        name="deepfix_repair_agent",
+        name=(
+            "deepfix_experiment_executor"
+            if _experiment_mode
+            else "deepfix_repair_agent"
+        ),
     )
+
+
+def build_experiment_agent(*args, **kwargs):
+    """Build the opt-in local executor without changing the production default."""
+    kwargs["_experiment_mode"] = True
+    return build_agent(*args, **kwargs)

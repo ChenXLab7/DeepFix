@@ -7,7 +7,12 @@ from langchain_core.tools import StructuredTool
 from langchain_deepseek import ChatDeepSeek
 from langgraph.checkpoint.memory import InMemorySaver
 
-from deepfix.agent import build_agent, build_compaction_model, build_main_model
+from deepfix.agent import (
+    build_agent,
+    build_compaction_model,
+    build_experiment_agent,
+    build_main_model,
+)
 from deepfix.approval import PolicyAction, RiskLevel
 from deepfix.compaction.middleware import (
     DeepFixCompactionMiddleware,
@@ -21,6 +26,7 @@ from deepfix.extensions import (
 )
 from deepfix.investigation.models import InvestigationCapability
 from deepfix.memory import WorkingMemoryStore
+from deepfix.models import RepairOutcome
 from deepfix.prompting import PromptPolicyMiddleware
 from deepfix.protected_context import ProtectedContextMiddleware
 
@@ -223,6 +229,39 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert registered["key"] == f"deepseek:{config.main_model.model_name}"
     assert registered["profile"].excluded_middleware == frozenset(
         {"SummarizationMiddleware"}
+    )
+
+
+def test_experiment_builder_is_opt_in_and_legacy_builder_defaults_are_unchanged(
+    config,
+    monkeypatch,
+):
+    captured = []
+
+    def fake_create_deep_agent(**kwargs):
+        captured.append(kwargs)
+        return kwargs["name"]
+
+    monkeypatch.setattr("deepfix.agent.create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr("deepfix.agent.build_main_model", lambda _config: object())
+    monkeypatch.setattr("deepfix.agent.build_compaction_model", lambda _config: object())
+    kwargs = {
+        "config": config,
+        "checkpointer": InMemorySaver(),
+        "working_memory_store": WorkingMemoryStore(config.database_path),
+    }
+
+    assert build_agent(**kwargs) == "deepfix_repair_agent"
+    assert build_experiment_agent(**kwargs) == "deepfix_experiment_executor"
+
+    legacy, experiment = captured
+    assert legacy["response_format"] is RepairOutcome
+    assert any(
+        isinstance(item, PromptPolicyMiddleware) for item in legacy["middleware"]
+    )
+    assert experiment["response_format"].__name__ == "ExecutorNarrativeResult"
+    assert not any(
+        isinstance(item, PromptPolicyMiddleware) for item in experiment["middleware"]
     )
 
 

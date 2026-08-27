@@ -206,6 +206,28 @@ class InvestigationMiddleware(AgentMiddleware):
                 "inspect_workspace_and_reconcile_operation_without_reexecution",
             )
 
+        experiment_allowed = _experiment_allowed_capabilities(request)
+        capability = self.capabilities.get(name)
+        if (
+            experiment_allowed is not None
+            and capability is not None
+            and capability not in experiment_allowed
+        ):
+            return (
+                task_id,
+                None,
+                ToolMessage(
+                    content=(
+                        f"Tool '{name}' is not allowed by this experiment; "
+                        "return this constraint to the Experiment Planner."
+                    ),
+                    name=name,
+                    tool_call_id=call_id,
+                    status="error",
+                ),
+                None,
+            )
+
         shell_correction = _windows_shell_correction(
             task_id,
             request,
@@ -588,6 +610,17 @@ def _runtime_task_id(request: ToolCallRequest) -> str:
     return str(
         request.runtime.config.get("configurable", {}).get("thread_id", "")
     ).strip()
+
+
+def _experiment_allowed_capabilities(
+    request: ToolCallRequest,
+) -> set[InvestigationCapability] | None:
+    raw = request.runtime.config.get("configurable", {}).get(
+        "allowed_capabilities"
+    )
+    if raw is None:
+        return None
+    return {InvestigationCapability(item) for item in raw}
 
 
 def _tool_arguments(tool_call: Mapping[str, Any]) -> Mapping[str, object]:

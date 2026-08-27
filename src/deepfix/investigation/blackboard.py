@@ -74,6 +74,8 @@ class CaseBlackboardView(StrictModel):
     verification_policy: VerificationPolicy | None = None
     incomplete_operation_ids: list[str]
     budget: LoopBudgetView
+    stagnation_level: int = Field(default=0, ge=0)
+    reevaluation_required: bool = False
 
     @property
     def test_results(self) -> list[SystemTestEvidence]:
@@ -207,6 +209,16 @@ class CaseBlackboardBuilder:
                 self._budget_loader(task_id)
                 if self._budget_loader
                 else LoopBudgetView()
+            ),
+            "stagnation_level": (
+                context.investigation_state.stagnation_level
+                if context.investigation_state is not None
+                else 0
+            ),
+            "reevaluation_required": (
+                context.investigation_state.reevaluation_required
+                if context.investigation_state is not None
+                else False
             ),
         }
         fingerprint = stable_investigation_id(

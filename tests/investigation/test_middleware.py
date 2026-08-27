@@ -91,12 +91,23 @@ def tool_request(
     name: str,
     call_id: str,
     args: dict[str, object],
+    *,
+    allowed_capabilities: list[str] | None = None,
 ) -> ToolCallRequest:
     tool = named_tools(name)[0]
     runtime = ToolRuntime(
         state={"messages": []},
         context=None,
-        config={"configurable": {"thread_id": "task-a"}},
+        config={
+            "configurable": {
+                "thread_id": "task-a",
+                **(
+                    {"allowed_capabilities": allowed_capabilities}
+                    if allowed_capabilities is not None
+                    else {}
+                ),
+            }
+        },
         stream_writer=lambda value: None,
         tool_call_id=call_id,
         store=None,
@@ -320,6 +331,32 @@ def middleware_fixture(
             else None
         ),
     )
+
+
+def test_experiment_capability_boundary_blocks_tool_before_execution(tmp_path):
+    middleware = middleware_fixture(tmp_path)
+    request = tool_request(
+        "edit_file",
+        "blocked-edit",
+        {"file_path": "target.py", "old_string": "a", "new_string": "b"},
+        allowed_capabilities=["read", "search"],
+    )
+    executed = False
+
+    def handler(_request):
+        nonlocal executed
+        executed = True
+        return ToolMessage(
+            content="edited",
+            name="edit_file",
+            tool_call_id="blocked-edit",
+        )
+
+    result = middleware.wrap_tool_call(request, handler)
+
+    assert executed is False
+    assert result.status == "error"
+    assert "not allowed by this experiment" in result.content
 
 
 def test_diagnosing_request_hides_modify_tools_and_renders_bounded_state(tmp_path):
