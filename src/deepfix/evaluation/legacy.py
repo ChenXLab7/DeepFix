@@ -36,6 +36,9 @@ _CONFIG_ENV_LOCK = threading.Lock()
 
 
 class LegacyLoopRunner:
+    budget_enforcement = "pre_call_reservation"
+    model_accounting = "all_model_roles"
+
     def __init__(
         self,
         *,

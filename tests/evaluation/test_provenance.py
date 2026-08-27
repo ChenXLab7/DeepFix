@@ -55,7 +55,13 @@ def test_runtime_provenance_reports_pre_call_all_role_accounting(
         lambda _value: "d" * 64,
     )
 
-    provenance = build_provenance_batch(project, python, ["run-1"])
+    provenance = build_provenance_batch(
+        project,
+        python,
+        ["run-1"],
+        budget_enforcement="pre_call_reservation",
+        model_accounting="all_model_roles",
+    )
 
     assert provenance.budget_enforcement == "pre_call_reservation"
     assert provenance.model_accounting == "all_model_roles"

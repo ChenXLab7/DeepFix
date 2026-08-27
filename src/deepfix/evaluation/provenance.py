@@ -4,6 +4,7 @@ import hashlib
 import os
 import subprocess
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from deepfix.evaluation.models import EvaluationProvenanceBatch
@@ -18,6 +19,13 @@ def build_provenance_batch(
     project: Path,
     project_python: Path,
     run_ids: list[str],
+    *,
+    budget_enforcement: Literal[
+        "post_run_observation", "pre_call_reservation"
+    ] = "post_run_observation",
+    model_accounting: Literal[
+        "main_model_trace_only", "all_model_roles"
+    ] = "main_model_trace_only",
 ) -> EvaluationProvenanceBatch:
     source_root = project.expanduser().resolve()
     python_executable = project_python.expanduser().resolve()
@@ -59,8 +67,8 @@ def build_provenance_batch(
         ),
         python_version=_python_version(python_executable),
         python_executable_sha256=_file_sha256(python_executable),
-        budget_enforcement="pre_call_reservation",
-        model_accounting="all_model_roles",
+        budget_enforcement=budget_enforcement,
+        model_accounting=model_accounting,
     )
 
 

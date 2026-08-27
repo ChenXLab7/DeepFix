@@ -136,10 +136,8 @@ def main(
     resolved_runner_factory = runner_factory or (
         lambda python: LegacyLoopRunner(project_python=python)
     )
-    harness = EvaluationHarness(
-        Path(args.output),
-        resolved_runner_factory(project_python),
-    )
+    runner = resolved_runner_factory(project_python)
+    harness = EvaluationHarness(Path(args.output), runner)
     graded_runs: list[EvaluationRun] = []
     stopped_budget = False
     for case in cases:
@@ -186,6 +184,16 @@ def main(
                 project,
                 project_python,
                 [run.run_id for run in canonical_runs],
+                budget_enforcement=getattr(
+                    runner,
+                    "budget_enforcement",
+                    "post_run_observation",
+                ),
+                model_accounting=getattr(
+                    runner,
+                    "model_accounting",
+                    "main_model_trace_only",
+                ),
             )
         ],
         aggregate=aggregate_runs(canonical_runs),
