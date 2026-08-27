@@ -36,6 +36,7 @@ class OperationKind(StrEnum):
 
 class OperationStateSnapshot(StrictModel):
     target_path: str | None = None
+    target_exists: bool | None = None
     file_hash: str | None = None
     code_state_hash: str | None = None
     command_hash: str | None = None

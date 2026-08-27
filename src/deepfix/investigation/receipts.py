@@ -37,6 +37,15 @@ class ToolExecutionReceipt(StrictModel):
         return restored
 
 
+class ToolResultArtifact(StrictModel):
+    task_id: str = Field(min_length=1)
+    tool_call_id: str = Field(min_length=1)
+    tool_name: str = Field(min_length=1)
+    output: str
+    exit_code: int | None = None
+    result_fingerprint: str = Field(min_length=1)
+
+
 class ToolExecutionReceiptStore:
     def __init__(self, root_dir: str | Path) -> None:
         self.root_dir = Path(root_dir).expanduser().resolve()
@@ -77,6 +86,67 @@ class ToolExecutionReceiptStore:
     ) -> ToolExecutionReceipt | None:
         path = self._path(task_id, tool_call_id)
         return self._load_path(path)
+
+    def save_result_artifact(
+        self,
+        task_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        result: ToolMessage,
+        *,
+        max_output_bytes: int = 100_000,
+    ) -> str:
+        if max_output_bytes <= 0:
+            raise ValueError("max_output_bytes must be positive")
+        content = str(result.content)
+        encoded = content.encode("utf-8")
+        if len(encoded) > max_output_bytes:
+            content = encoded[:max_output_bytes].decode("utf-8", errors="ignore")
+        raw_artifact = result.artifact
+        exit_code = (
+            raw_artifact.get("exit_code")
+            if isinstance(raw_artifact, Mapping)
+            else None
+        )
+        artifact = ToolResultArtifact(
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            output=content,
+            exit_code=exit_code if isinstance(exit_code, int) else None,
+            result_fingerprint=result_fingerprint(result),
+        )
+        relative = Path("operation_results") / receipt_task_segment(task_id) / (
+            hashlib.sha256(tool_call_id.strip().encode()).hexdigest()[:32] + ".json"
+        )
+        path = self.root_dir.parent / relative
+        payload = artifact.model_dump_json(indent=2)
+        with self._lock_for(path):
+            existing = (
+                ToolResultArtifact.model_validate_json(path.read_text(encoding="utf-8"))
+                if path.exists()
+                else None
+            )
+            if existing is not None:
+                if existing != artifact:
+                    raise RuntimeError("tool result artifact 冲突")
+                return relative.as_posix()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".a-{uuid.uuid4().hex[:28]}.tmp")
+            try:
+                with temporary.open("x", encoding="utf-8", newline="") as file:
+                    file.write(payload)
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+            restored = ToolResultArtifact.model_validate_json(
+                path.read_text(encoding="utf-8")
+            )
+            if restored != artifact:
+                raise RuntimeError("tool result artifact 校验失败")
+        return relative.as_posix()
 
     def _path(self, task_id: str, tool_call_id: str) -> Path:
         task_segment = receipt_task_segment(task_id)

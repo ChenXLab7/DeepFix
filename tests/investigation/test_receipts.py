@@ -7,6 +7,7 @@ from langchain_core.messages import ToolMessage
 from deepfix.investigation.receipts import (
     ToolExecutionReceipt,
     ToolExecutionReceiptStore,
+    ToolResultArtifact,
     receipt_from_result,
 )
 
@@ -97,3 +98,28 @@ def test_receipt_save_uses_a_windows_safe_temporary_path(tmp_path):
 
     assert store.load("task-a", "read-1") == expected
     assert not list(root.rglob("*.tmp"))
+
+
+def test_command_result_artifact_is_bounded_durable_and_idempotent(tmp_path):
+    root = tmp_path / "deepfix-artifacts" / "investigation_receipts"
+    store = ToolExecutionReceiptStore(root)
+    result = ToolMessage(
+        content="x" * 200,
+        name="execute",
+        tool_call_id="execute-1",
+        artifact={"exit_code": 7},
+    )
+
+    first = store.save_result_artifact(
+        "task-a", "execute-1", "execute", result, max_output_bytes=32
+    )
+    second = store.save_result_artifact(
+        "task-a", "execute-1", "execute", result, max_output_bytes=32
+    )
+
+    assert first == second
+    path = root.parent / first
+    artifact = ToolResultArtifact.model_validate_json(path.read_text(encoding="utf-8"))
+    assert artifact.exit_code == 7
+    assert len(artifact.output.encode("utf-8")) <= 32
+    assert not list(root.parent.rglob("*.tmp"))

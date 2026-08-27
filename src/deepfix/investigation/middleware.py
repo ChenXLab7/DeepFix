@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from html import escape
+from pathlib import Path
 from typing import Any
 
 from langchain.agents.middleware import (
@@ -33,9 +35,24 @@ from deepfix.investigation.receipts import (
     receipt_from_result,
     tool_call_hash,
 )
+from deepfix.operations import (
+    NewOperationEntry,
+    OperationJournalEntry,
+    OperationJournalStore,
+    OperationKind,
+    OperationStateSnapshot,
+    OperationStatus,
+)
 from deepfix.prompting import model_request_task_id
+from deepfix.workspace import WorkspacePathPolicy, compute_code_state_hash
 
 _PLATFORM_NAME = os.name
+_SIDE_EFFECT_KINDS = {
+    "write_file": OperationKind.FILE_WRITE,
+    "edit_file": OperationKind.FILE_EDIT,
+    "delete": OperationKind.FILE_DELETE,
+    "execute": OperationKind.COMMAND,
+}
 
 
 class InvestigationMiddleware(AgentMiddleware):
@@ -44,10 +61,12 @@ class InvestigationMiddleware(AgentMiddleware):
         coordinator: InvestigationCoordinator,
         receipts: ToolExecutionReceiptStore,
         capabilities: Mapping[str, InvestigationCapability],
+        operation_journal: OperationJournalStore | None = None,
     ) -> None:
         self.coordinator = coordinator
         self.receipts = receipts
         self.capabilities = dict(capabilities)
+        self.operation_journal = operation_journal
 
     def wrap_model_call(
         self,
@@ -68,16 +87,18 @@ class InvestigationMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
-        task_id, receipt, correction = self._prepare_tool(request)
+        task_id, receipt, correction, operation = self._prepare_tool(request)
         if correction is not None:
             result = correction
         elif receipt is None:
             result = _diagnostic_artifact_redirect(task_id, request)
             if result is None:
+                if operation is not None:
+                    self.operation_journal.mark_started(operation.operation_id)
                 result = handler(request)
         else:
             result = receipt.tool_message
-        return self._finish_tool(task_id, request, result, receipt)
+        return self._finish_tool(task_id, request, result, receipt, operation)
 
     async def awrap_tool_call(
         self,
@@ -87,16 +108,18 @@ class InvestigationMiddleware(AgentMiddleware):
             Awaitable[ToolMessage | Command[Any]],
         ],
     ) -> ToolMessage | Command[Any]:
-        task_id, receipt, correction = self._prepare_tool(request)
+        task_id, receipt, correction, operation = self._prepare_tool(request)
         if correction is not None:
             result = correction
         elif receipt is None:
             result = _diagnostic_artifact_redirect(task_id, request)
             if result is None:
+                if operation is not None:
+                    self.operation_journal.mark_started(operation.operation_id)
                 result = await handler(request)
         else:
             result = receipt.tool_message
-        return self._finish_tool(task_id, request, result, receipt)
+        return self._finish_tool(task_id, request, result, receipt, operation)
 
     def _model_request(self, request: ModelRequest) -> ModelRequest:
         task_id = model_request_task_id(request)
@@ -123,12 +146,27 @@ class InvestigationMiddleware(AgentMiddleware):
     def _prepare_tool(
         self,
         request: ToolCallRequest,
-    ) -> tuple[str, ToolExecutionReceipt | None, ToolMessage | None]:
+    ) -> tuple[
+        str,
+        ToolExecutionReceipt | None,
+        ToolMessage | None,
+        OperationJournalEntry | None,
+    ]:
         task_id = _runtime_task_id(request)
         call_id = str(request.tool_call.get("id", "")).strip()
         name = str(request.tool_call.get("name", "")).strip()
         if not task_id or not call_id or not name:
             raise ValueError("Tool hook 缺少 task_id、tool_call_id 或 tool name")
+        operation = self._load_operation(task_id, call_id, name)
+        if operation is not None and operation.call_hash != tool_call_hash(
+            task_id, request.tool_call
+        ):
+            raise self._state_error(
+                task_id,
+                "operation_call_mismatch",
+                call_id,
+                "pause_and_inspect_operation_journal",
+            )
         try:
             receipt = self.receipts.load(task_id, call_id)
         except Exception as exc:
@@ -148,7 +186,25 @@ class InvestigationMiddleware(AgentMiddleware):
                     call_id,
                     "pause_and_inspect_tool_receipt",
                 )
-            return task_id, receipt, None
+            return task_id, receipt, None, operation
+        if operation is not None and operation.status is OperationStatus.COMMITTED:
+            raise self._state_error(
+                task_id,
+                "committed_operation_receipt_missing",
+                call_id,
+                "restore_receipt_from_internal_artifact_without_reexecution",
+            )
+        if operation is not None and operation.status in {
+            OperationStatus.STARTED,
+            OperationStatus.OBSERVED,
+            OperationStatus.UNKNOWN,
+        }:
+            raise self._state_error(
+                task_id,
+                "operation_reconciliation_required",
+                call_id,
+                "inspect_workspace_and_reconcile_operation_without_reexecution",
+            )
 
         shell_correction = _windows_shell_correction(
             task_id,
@@ -156,7 +212,7 @@ class InvestigationMiddleware(AgentMiddleware):
             self.coordinator.project_python(task_id),
         )
         if shell_correction is not None:
-            return task_id, None, shell_correction
+            return task_id, None, shell_correction, None
 
         authorization = self.coordinator.authorize_tool(
             task_id,
@@ -166,14 +222,14 @@ class InvestigationMiddleware(AgentMiddleware):
         )
         if authorization.correction_required:
             if authorization.correction_kind == "duplicate_execute":
-                return task_id, None, _duplicate_execute_message(task_id, call_id)
+                return task_id, None, _duplicate_execute_message(task_id, call_id), None
             if authorization.correction_kind == "duplicate_hypothesis":
                 return task_id, None, _duplicate_hypothesis_message(
                     task_id,
                     call_id,
                     authorization.correction_ref_id or "unknown",
-                )
-            return task_id, None, _decision_correction_message(task_id, call_id)
+                ), None
+            return task_id, None, _decision_correction_message(task_id, call_id), None
         state = self.coordinator.state(task_id)
         allowed = self.coordinator.allowed_tool_names(state, self.capabilities)
         if name not in allowed and authorization.permit_id is None:
@@ -183,7 +239,9 @@ class InvestigationMiddleware(AgentMiddleware):
                 call_id,
                 "return_to_a_phase_that_allows_the_tool",
             )
-        return task_id, None, None
+        if operation is None:
+            operation = self._prepare_operation(task_id, request)
+        return task_id, None, None, operation
 
     def _finish_tool(
         self,
@@ -191,8 +249,16 @@ class InvestigationMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         result: ToolMessage | Command[Any],
         receipt: ToolExecutionReceipt | None,
+        operation: OperationJournalEntry | None,
     ) -> ToolMessage | Command[Any]:
         if not isinstance(result, ToolMessage):
+            if operation is not None:
+                raise self._state_error(
+                    task_id,
+                    "operation_result_not_durable",
+                    str(request.tool_call.get("id", "")),
+                    "pause_and_reconcile_operation",
+                )
             return result
         call_id = str(request.tool_call.get("id", "")).strip()
         if str(result.tool_call_id) != call_id:
@@ -202,8 +268,27 @@ class InvestigationMiddleware(AgentMiddleware):
                 call_id,
                 "pause_and_inspect_tool_result",
             )
+        artifact_references = list(operation.artifact_references) if operation else []
         if receipt is None:
             receipt = receipt_from_result(task_id, request.tool_call, result)
+            if operation is not None and operation.operation_kind is OperationKind.COMMAND:
+                try:
+                    artifact_references.append(
+                        self.receipts.save_result_artifact(
+                            task_id,
+                            call_id,
+                            str(request.tool_call.get("name", "")),
+                            result,
+                        )
+                    )
+                except Exception as exc:
+                    raise self._state_error(
+                        task_id,
+                        "tool_result_artifact_persistence_failed",
+                        call_id,
+                        "do_not_retry_tool_without_operation_reconciliation",
+                        cause=exc,
+                    ) from exc
             try:
                 self.receipts.save(receipt)
             except Exception as exc:
@@ -214,8 +299,138 @@ class InvestigationMiddleware(AgentMiddleware):
                     "do_not_retry_tool_without_manual_recovery",
                     cause=exc,
                 ) from exc
+        if operation is not None and operation.status is OperationStatus.COMMITTED:
+            return result
+        if operation is not None:
+            post_state = self._operation_snapshot(task_id, request, result=result)
+            operation = self.operation_journal.observe(
+                operation.operation_id,
+                post_state=post_state,
+                receipt_id=receipt.result_fingerprint,
+                artifact_references=artifact_references,
+            )
         self.coordinator.record_tool_result(task_id, request.tool_call, result)
+        if operation is not None:
+            self.operation_journal.commit(operation.operation_id)
         return result
+
+    def _load_operation(
+        self,
+        task_id: str,
+        call_id: str,
+        name: str,
+    ) -> OperationJournalEntry | None:
+        if self.operation_journal is None or name not in _SIDE_EFFECT_KINDS:
+            return None
+        return self.operation_journal.load(
+            stable_investigation_id("operation", task_id, call_id)
+        )
+
+    def _prepare_operation(
+        self,
+        task_id: str,
+        request: ToolCallRequest,
+    ) -> OperationJournalEntry | None:
+        name = str(request.tool_call.get("name", "")).strip()
+        if self.operation_journal is None or name not in _SIDE_EFFECT_KINDS:
+            return None
+        call_id = str(request.tool_call.get("id", "")).strip()
+        task = self.coordinator.tasks.get(task_id)
+        if not task.workspace_root or not task.workspace_baseline_id:
+            raise self._state_error(
+                task_id,
+                "operation_workspace_identity_missing",
+                call_id,
+                "pause_and_restore_workspace_identity",
+            )
+        pre_state = self._operation_snapshot(task_id, request)
+        return self.operation_journal.prepare(
+            NewOperationEntry(
+                operation_id=stable_investigation_id(
+                    "operation", task_id, call_id
+                ),
+                task_id=task_id,
+                experiment_id=stable_investigation_id(
+                    "experiment", task_id, call_id
+                ),
+                tool_call_id=call_id,
+                operation_kind=_SIDE_EFFECT_KINDS[name],
+                call_hash=tool_call_hash(task_id, request.tool_call),
+                workspace_baseline_id=task.workspace_baseline_id,
+                pre_state=pre_state,
+                expected_post_state=self._expected_post_state(
+                    task_id, request, pre_state
+                ),
+            )
+        )
+
+    def _expected_post_state(
+        self,
+        task_id: str,
+        request: ToolCallRequest,
+        pre_state: OperationStateSnapshot,
+    ) -> OperationStateSnapshot | None:
+        name = str(request.tool_call.get("name", "")).strip()
+        if name == "execute":
+            return None
+        arguments = _tool_arguments(request.tool_call)
+        if name == "delete":
+            return pre_state.model_copy(
+                update={"target_exists": False, "file_hash": None, "code_state_hash": None}
+            )
+        content: str | None = None
+        if name == "write_file":
+            value = arguments.get("content")
+            if isinstance(value, str):
+                content = value
+        elif name == "edit_file" and pre_state.target_path:
+            task = self.coordinator.tasks.get(task_id)
+            target = Path(task.workspace_root or task.project_root) / pre_state.target_path
+            old = arguments.get("old_string")
+            new = arguments.get("new_string")
+            if target.is_file() and isinstance(old, str) and isinstance(new, str):
+                original = target.read_text(encoding="utf-8")
+                if old in original:
+                    content = original.replace(old, new)
+        if content is None:
+            return None
+        return pre_state.model_copy(
+            update={
+                "target_exists": True,
+                "file_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "code_state_hash": None,
+            }
+        )
+
+    def _operation_snapshot(
+        self,
+        task_id: str,
+        request: ToolCallRequest,
+        *,
+        result: ToolMessage | None = None,
+    ) -> OperationStateSnapshot:
+        task = self.coordinator.tasks.get(task_id)
+        workspace = Path(task.workspace_root or task.project_root)
+        name = str(request.tool_call.get("name", "")).strip()
+        arguments = _tool_arguments(request.tool_call)
+        if name == "execute":
+            artifact = result.artifact if result is not None else None
+            exit_code = artifact.get("exit_code") if isinstance(artifact, Mapping) else None
+            return OperationStateSnapshot(
+                code_state_hash=compute_code_state_hash(workspace),
+                command_hash=tool_call_hash(task_id, request.tool_call),
+                exit_code=exit_code if isinstance(exit_code, int) else None,
+            )
+        raw_path = str(arguments.get("file_path", arguments.get("path", ""))).strip()
+        relative_path = raw_path.replace("\\", "/").lstrip("/")
+        target = WorkspacePathPolicy(workspace).resolve_allowed(relative_path)
+        exists = target.is_file()
+        return OperationStateSnapshot(
+            target_path=target.relative_to(workspace.resolve()).as_posix(),
+            target_exists=exists,
+            file_hash=_sha256_file(target) if exists else None,
+            code_state_hash=compute_code_state_hash(workspace),
+        )
 
     def _state_error(
         self,
@@ -376,6 +591,14 @@ def _runtime_task_id(request: ToolCallRequest) -> str:
 def _tool_arguments(tool_call: Mapping[str, Any]) -> Mapping[str, object]:
     value = tool_call.get("args", {})
     return value if isinstance(value, Mapping) else {}
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _diagnostic_artifact_redirect(

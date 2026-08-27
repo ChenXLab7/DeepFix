@@ -33,6 +33,7 @@ from deepfix.investigation.models import (
     ToolObservation,
 )
 from deepfix.investigation.receipts import ToolExecutionReceiptStore
+from deepfix.operations import OperationJournalStore, OperationStatus
 from investigation.helpers import coordinator_fixture, force_phase
 
 
@@ -233,8 +234,15 @@ def middleware_fixture(
     phase: str = "investigating",
     stagnation_level: int = 0,
     fail_next_event_commit: bool = False,
+    with_journal: bool = False,
 ) -> InvestigationMiddleware:
     coordinator = coordinator_fixture(tmp_path)
+    if with_journal:
+        task = coordinator.tasks.get("task-a")
+        task.workspace_root = str(tmp_path.resolve())
+        task.project_root = task.workspace_root
+        task.workspace_baseline_id = "baseline-task-a"
+        coordinator.tasks.save(task)
     state = coordinator.store.ensure_started("task-a")
     state = force_phase(coordinator.store, state, AgentPhase(phase))
     candidate = InvestigationHypothesis(
@@ -306,6 +314,11 @@ def middleware_fixture(
         coordinator,
         ToolExecutionReceiptStore(tmp_path / "artifacts" / "investigation_receipts"),
         capabilities,
+        operation_journal=(
+            OperationJournalStore(tmp_path / "deepfix.sqlite3")
+            if with_journal
+            else None
+        ),
     )
 
 
@@ -953,6 +966,103 @@ def test_committed_tool_receipt_prevents_side_effect_reexecution(tmp_path):
     receipt = middleware.receipts.load("task-a", "edit-1")
     assert receipt is not None
     assert receipt.tool_message.tool_call_id == "edit-1"
+
+
+def test_receipt_failure_after_edit_does_not_reexecute_handler(
+    tmp_path,
+    monkeypatch,
+):
+    target = tmp_path / "src" / "sign.py"
+    target.parent.mkdir()
+    target.write_text("return -value\n", encoding="utf-8")
+    middleware = middleware_fixture(
+        tmp_path,
+        phase="planning",
+        with_journal=True,
+    )
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        target.write_text("return value\n", encoding="utf-8")
+        return edit_result("journal-edit-1")
+
+    def fail_save(_receipt):
+        raise OSError("simulated receipt disk failure")
+
+    monkeypatch.setattr(middleware.receipts, "save", fail_save)
+
+    with pytest.raises(InvestigationStateError) as first:
+        middleware.wrap_tool_call(edit_request("journal-edit-1"), handler)
+    with pytest.raises(InvestigationStateError) as second:
+        middleware.wrap_tool_call(edit_request("journal-edit-1"), handler)
+
+    assert first.value.recovery.error_code == "tool_receipt_persistence_failed"
+    assert second.value.recovery.error_code == "operation_reconciliation_required"
+    assert calls == 1
+    entries = middleware.operation_journal.list_incomplete("task-a")
+    assert len(entries) == 1
+    assert entries[0].status is OperationStatus.STARTED
+
+
+def test_successful_edit_commits_journal_after_receipt_and_evidence(tmp_path):
+    target = tmp_path / "src" / "sign.py"
+    target.parent.mkdir()
+    target.write_text("return -value\n", encoding="utf-8")
+    middleware = middleware_fixture(
+        tmp_path,
+        phase="planning",
+        with_journal=True,
+    )
+
+    def handler(request):
+        target.write_text("return value\n", encoding="utf-8")
+        return edit_result("journal-edit-success")
+
+    result = middleware.wrap_tool_call(
+        edit_request("journal-edit-success"),
+        handler,
+    )
+
+    assert result.status == "success"
+    assert middleware.operation_journal.list_incomplete("task-a") == []
+    entry = middleware.operation_journal.load(
+        stable_investigation_id(
+            "operation",
+            "task-a",
+            "journal-edit-success",
+        )
+    )
+    assert entry is not None
+    assert entry.status is OperationStatus.COMMITTED
+    assert entry.pre_state.file_hash != entry.post_state.file_hash
+
+
+def test_committed_edit_with_missing_receipt_is_never_reexecuted(tmp_path):
+    target = tmp_path / "src" / "sign.py"
+    target.parent.mkdir()
+    target.write_text("return -value\n", encoding="utf-8")
+    middleware = middleware_fixture(tmp_path, phase="planning", with_journal=True)
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        target.write_text("return value\n", encoding="utf-8")
+        return edit_result("journal-edit-missing-receipt")
+
+    request = edit_request("journal-edit-missing-receipt")
+    middleware.wrap_tool_call(request, handler)
+    receipt_files = list(middleware.receipts.root_dir.rglob("*.json"))
+    assert len(receipt_files) == 1
+    receipt_files[0].unlink()
+
+    with pytest.raises(InvestigationStateError) as error:
+        middleware.wrap_tool_call(request, handler)
+
+    assert error.value.recovery.error_code == "committed_operation_receipt_missing"
+    assert calls == 1
 
 
 def test_async_tool_hook_calls_handler_at_most_once_on_replay(tmp_path):
