@@ -54,6 +54,30 @@ def test_report_contains_evidence_changes_tests_approvals_and_risks(tmp_path):
     assert "Windows 3.11" in report
 
 
+def test_report_exposes_trusted_execution_and_oracle_state(tmp_path):
+    task = TaskState.create(tmp_path, "修复失败测试", ApprovalMode.MANUAL)
+    task.source_project_root = str(tmp_path / "source")
+    task.workspace_root = str(tmp_path / "workspaces" / task.task_id)
+    task.workspace_baseline_id = "baseline-a"
+    task.confinement_level = "guarded_local"
+    task.verification_policy_id = "policy-a"
+    task.verification_policy_version = 1
+    task.required_oracle_count = 2
+    task.passed_required_oracle_count = 1
+    task.supplemental_failure_count = 1
+    task.unresolved_operation_ids = ["operation-a"]
+
+    report = render_report(task)
+
+    assert "## 可信执行" in report
+    assert f"源项目：{task.source_project_root}" in report
+    assert f"任务 Workspace：{task.workspace_root}" in report
+    assert "隔离级别：guarded_local" in report
+    assert "Required Oracle：1/2 通过" in report
+    assert "Supplemental 失败：1" in report
+    assert "未完成 Operation：operation-a" in report
+
+
 def test_report_sections_have_stable_order_and_empty_collections_are_explicit(tmp_path):
     task = TaskState.create(tmp_path, "排序结果不稳定", ApprovalMode.GUARDED)
 

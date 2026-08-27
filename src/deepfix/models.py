@@ -173,6 +173,11 @@ class TaskState:
     workspace_baseline_id: str | None = None
     verification_policy_id: str | None = None
     verification_policy_version: int | None = None
+    confinement_level: str = "legacy_local"
+    required_oracle_count: int = 0
+    passed_required_oracle_count: int = 0
+    supplemental_failure_count: int = 0
+    unresolved_operation_ids: list[str] = field(default_factory=list)
     project_python: str = field(
         default_factory=lambda: str(Path(sys.executable).resolve())
     )

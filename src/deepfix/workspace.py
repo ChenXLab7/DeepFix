@@ -92,7 +92,12 @@ class WorkspaceFactory:
         if target.exists():
             raise FileExistsError(target)
         self.root.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source, target, symlinks=True, ignore=_copy_ignore)
+        shutil.copytree(
+            source,
+            target,
+            symlinks=True,
+            ignore=_copy_ignore_for_target(source, self.root),
+        )
         hashes = _managed_file_hashes(target)
         baseline = WorkspaceBaseline(
             baseline_id=_baseline_id(task_id, source, hashes),
@@ -215,6 +220,21 @@ def _copy_ignore(_directory: str, names: list[str]) -> set[str]:
         or name in _IGNORED_FILES
         or Path(name).suffix.lower() in _IGNORED_SUFFIXES
     }
+
+
+def _copy_ignore_for_target(source: Path, target_root: Path):
+    try:
+        internal_top_level = target_root.relative_to(source).parts[0]
+    except (ValueError, IndexError):
+        internal_top_level = None
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        ignored = _copy_ignore(directory, names)
+        if Path(directory).resolve() == source and internal_top_level in names:
+            ignored.add(internal_top_level)
+        return ignored
+
+    return ignore
 
 
 def _atomic_write_json(path: Path, content: str) -> None:

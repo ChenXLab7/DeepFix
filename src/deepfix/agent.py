@@ -55,6 +55,7 @@ from deepfix.investigation.tools import (
 )
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import RepairOutcome
+from deepfix.operations import OperationJournalStore
 from deepfix.persistence import TaskRepository
 from deepfix.prompting import PromptPolicyMiddleware
 from deepfix.prompts import CORE_REPAIR_PROMPT
@@ -246,6 +247,7 @@ def build_agent(
                     config.artifacts_path / "investigation_receipts"
                 ),
                 capabilities,
+                operation_journal=OperationJournalStore(config.database_path),
             ),
             PromptPolicyMiddleware(investigation_store),
             ProtectedContextMiddleware(protected_builder),

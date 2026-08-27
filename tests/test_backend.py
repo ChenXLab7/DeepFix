@@ -6,6 +6,7 @@ from deepagents.backends import CompositeBackend, LocalShellBackend
 from deepfix.backend import build_backend
 from deepfix.compaction.adapter import DeepAgentsArtifactAdapter
 from deepfix.config import ApprovalMode, load_config
+from deepfix.workspace import WorkspaceFactory
 
 
 def test_backend_is_rooted_at_target_project(tmp_path, monkeypatch):
@@ -22,6 +23,50 @@ def test_backend_is_rooted_at_target_project(tmp_path, monkeypatch):
     assert backend.default.cwd == tmp_path.resolve()
     assert backend.artifacts_root == "/.deepfix-artifacts"
     assert "project marker" in backend.read("/marker.txt").file_data["content"]
+
+
+def test_task_workspace_backend_is_confined_and_uses_workspace_root(
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    config = load_config(project, ApprovalMode.MANUAL)
+    workspace = WorkspaceFactory(tmp_path / "workspaces").create("task-a", project)
+
+    backend = build_backend(config, workspace)
+    denied = backend.execute('python -c "print(1)"')
+
+    assert backend.default.cwd == workspace.root
+    assert denied.exit_code == 126
+    assert denied.output.startswith("Denied:")
+    assert "VALUE = 1" in backend.read("/value.py").file_data["content"]
+
+
+def test_task_workspace_backend_runs_scoped_pytest_with_project_python(
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "test_value.py").write_text(
+        "def test_value(): assert True\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    config = load_config(project, ApprovalMode.MANUAL)
+    workspace = WorkspaceFactory(tmp_path / "workspaces").create("task-a", project)
+
+    result = build_backend(config, workspace).execute(
+        "python -m pytest test_value.py -q"
+    )
+
+    assert result.exit_code == 0
+    assert "1 passed" in result.output
 
 
 def test_backend_shell_uses_project_cwd_without_exposing_api_key(tmp_path, monkeypatch):

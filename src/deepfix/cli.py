@@ -15,9 +15,11 @@ from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config, state_database_path
 from deepfix.extensions import AgentExtensions, build_research_extensions
 from deepfix.investigation.coordinator import InvestigationCoordinator
+from deepfix.investigation.receipts import ToolExecutionReceiptStore
 from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import TaskState, TaskStatus
+from deepfix.operations import OperationJournalStore, OperationReconciler
 from deepfix.persistence import TaskRepository
 from deepfix.reporting import render_report
 from deepfix.research.dependency import DependencyInspector
@@ -37,6 +39,8 @@ from deepfix.research.tools import (
     build_search_technical_sources_tool,
 )
 from deepfix.service import BugfixService
+from deepfix.verification import VerificationPolicyStore
+from deepfix.workspace import WorkspaceFactory
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -129,7 +133,8 @@ def print_task_list(
         return
     for task in tasks:
         output_fn(
-            f"{task.task_id}\t{task.status.value}\t{task.project_root}\t{task.user_problem}"
+            f"{task.task_id}\t{task.status.value}\t"
+            f"{task.source_project_root or task.project_root}\t{task.user_problem}"
         )
 
 
@@ -162,7 +167,7 @@ def main(
             write_output(f"任务不存在: {args.task_id}")
             return 2
         config = load_config(
-            stored_task.project_root,
+            stored_task.source_project_root or stored_task.project_root,
             ApprovalMode(stored_task.approval_mode),
             project_python=stored_task.project_python or None,
         )
@@ -179,6 +184,14 @@ def main(
         ),
     )
     artifact_backend = build_backend(config)
+    operation_journal = OperationJournalStore(config.database_path)
+    receipt_store = ToolExecutionReceiptStore(
+        config.artifacts_path / "investigation_receipts"
+    )
+    workspace_factory = WorkspaceFactory(
+        config.workspaces_path or config.database_path.parent / "workspaces"
+    )
+    verification_policy_store = VerificationPolicyStore(config.database_path)
     with build_research_client() as client:
         extensions = build_cli_research_extensions(
             config,
@@ -208,6 +221,13 @@ def main(
                 research_evidence_store,
                 compaction_store,
                 investigation,
+                operation_reconciler=OperationReconciler(
+                    operation_journal,
+                    receipt_store,
+                ),
+                workspace_factory=workspace_factory,
+                verification_policy_store=verification_policy_store,
+                execution_backend=artifact_backend,
             )
             if args.command == "new":
                 task = service.start(args.problem)

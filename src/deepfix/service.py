@@ -28,6 +28,12 @@ from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus,
 from deepfix.operations import OperationReconciler
 from deepfix.persistence import TaskRepository
 from deepfix.research.store import ResearchEvidenceStore
+from deepfix.verification import (
+    VerificationPolicyBuilder,
+    VerificationPolicyStore,
+    evaluate_required_oracles,
+)
+from deepfix.workspace import WorkspaceFactory
 
 
 class BugfixService:
@@ -42,6 +48,9 @@ class BugfixService:
         compaction_store: CompactionStore | None = None,
         investigation: InvestigationCoordinator | None = None,
         operation_reconciler: OperationReconciler | None = None,
+        workspace_factory: WorkspaceFactory | None = None,
+        verification_policy_store: VerificationPolicyStore | None = None,
+        execution_backend: object | None = None,
     ) -> None:
         self.agent = agent
         self.repository = repository
@@ -54,6 +63,9 @@ class BugfixService:
         )
         self.investigation = investigation
         self.operation_reconciler = operation_reconciler
+        self.workspace_factory = workspace_factory
+        self.verification_policy_store = verification_policy_store
+        self.execution_backend = execution_backend
 
     def start(self, problem: str) -> TaskState:
         task = TaskState.create(
@@ -62,6 +74,22 @@ class BugfixService:
             self.config.approval_mode,
             self.config.project_python,
         )
+        if self.workspace_factory is not None:
+            workspace = self.workspace_factory.create(
+                task.task_id,
+                self.config.project_root,
+            )
+            task.source_project_root = workspace.baseline.source_root
+            task.workspace_root = str(workspace.root)
+            task.project_root = str(workspace.root)
+            task.workspace_baseline_id = workspace.baseline.baseline_id
+            task.confinement_level = "guarded_local"
+            if self.verification_policy_store is not None:
+                verification = VerificationPolicyBuilder().build(task, workspace)
+                self.verification_policy_store.save(verification)
+                task.verification_policy_id = verification.policy_id
+                task.verification_policy_version = verification.version
+                task.required_oracle_count = len(verification.required_oracles)
         message_id = stable_conversation_message_id(
             task.task_id,
             len(task.conversation),
@@ -144,6 +172,16 @@ class BugfixService:
         return self._resume_actions(task, decisions)
 
     def _invoke(self, task: TaskState, value: object) -> TaskState:
+        activate = getattr(self.execution_backend, "activate_workspace", None)
+        if callable(activate):
+            try:
+                activate(task)
+            except Exception as exc:  # noqa: BLE001 - trusted execution boundary
+                safe_error = redact_config_secrets(str(exc), self.config)
+                return self._pause(
+                    task,
+                    f"Task Workspace 无法激活：{type(exc).__name__}: {safe_error}",
+                )
         if self.operation_reconciler is not None:
             try:
                 reconciliation = self.operation_reconciler.reconcile_task(
@@ -161,17 +199,30 @@ class BugfixService:
                     *reconciliation.conflict_operation_ids,
                     *reconciliation.unknown_operation_ids,
                 ]
+                task.unresolved_operation_ids = list(dict.fromkeys(unresolved))
                 return self._pause(
                     task,
                     "副作用操作需要人工恢复：" + ", ".join(dict.fromkeys(unresolved)),
                 )
+            task.unresolved_operation_ids = list(
+                dict.fromkeys(
+                    [
+                        *reconciliation.prepared_operation_ids,
+                        *reconciliation.replayable_operation_ids,
+                    ]
+                )
+            )
         if task.agent_invocations >= self.config.max_agent_invocations:
             return self._pause(task, "已达到 Agent 最大调用次数")
 
         task.agent_invocations += 1
         self._save(task)
         graph_config = {
-            "configurable": {"thread_id": task.task_id},
+            "configurable": {
+                "thread_id": task.task_id,
+                "workspace_root": task.workspace_root,
+                "workspace_baseline_id": task.workspace_baseline_id,
+            },
             "recursion_limit": self.config.max_graph_steps,
         }
         try:
@@ -215,6 +266,14 @@ class BugfixService:
         task.context_recovery = None
         task.investigation_recovery = None
         self._record_tool_results(task, result)
+        if self.operation_reconciler is not None:
+            task.unresolved_operation_ids = [
+                item.operation_id
+                for item in self.operation_reconciler.journal.list_incomplete(
+                    task.task_id
+                )
+            ]
+        self._refresh_verification(task)
         if task.consecutive_test_failures >= self.config.max_consecutive_test_failures:
             return self._pause(task, "已达到最大连续测试失败次数")
 
@@ -232,6 +291,32 @@ class BugfixService:
             else RepairOutcome.model_validate(response)
         )
         return self._apply_outcome(task, outcome)
+
+    def _refresh_verification(self, task: TaskState) -> None:
+        if (
+            self.verification_policy_store is None
+            or not task.verification_policy_id
+        ):
+            return
+        policy = self.verification_policy_store.load(
+            task.task_id,
+            task.verification_policy_version,
+        )
+        if policy is None or policy.policy_id != task.verification_policy_id:
+            return
+        tests = [
+            item
+            for item in self.compaction_store.list_evidence(task.task_id)
+            if isinstance(item, SystemTestEvidence)
+        ]
+        evaluation = evaluate_required_oracles(policy, tests)
+        task.required_oracle_count = len(policy.required_oracles)
+        task.passed_required_oracle_count = len(
+            evaluation.passed_required_oracle_ids
+        )
+        task.supplemental_failure_count = len(
+            evaluation.conflicting_evidence_ids
+        )
 
     def _handle_interrupts(self, task: TaskState, interrupts: object) -> TaskState:
         task.pending_actions = self._normalize_actions(interrupts)
@@ -430,6 +515,23 @@ class BugfixService:
             )
         else:
             if task.successful_changed_files:
+                if self.verification_policy_store is not None and task.verification_policy_id:
+                    policy = self.verification_policy_store.load(
+                        task.task_id,
+                        task.verification_policy_version,
+                    )
+                    tests = [
+                        item
+                        for item in self.compaction_store.list_evidence(task.task_id)
+                        if isinstance(item, SystemTestEvidence)
+                    ]
+                    if policy is None or not evaluate_required_oracles(
+                        policy, tests
+                    ).fixed_allowed:
+                        return self._pause(
+                            task,
+                            "required verification oracle 未全部满足，不能标记为已修复",
+                        )
                 if not any(
                     result.exit_code != 0 for result in task.test_results
                 ):

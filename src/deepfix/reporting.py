@@ -43,6 +43,30 @@ def render_report(
         "",
         *_approval_lines(task),
         "",
+        "## 可信执行",
+        "",
+        f"源项目：{task.source_project_root or task.project_root}",
+        f"任务 Workspace：{task.workspace_root or task.project_root}",
+        f"Workspace Baseline：{task.workspace_baseline_id or '无'}",
+        f"隔离级别：{task.confinement_level}",
+        (
+            "Verification Policy："
+            f"{task.verification_policy_id or '无'}"
+            + (
+                f" (v{task.verification_policy_version})"
+                if task.verification_policy_version is not None
+                else ""
+            )
+        ),
+        (
+            "Required Oracle："
+            f"{task.passed_required_oracle_count}/"
+            f"{task.required_oracle_count} 通过"
+        ),
+        f"Supplemental 失败：{task.supplemental_failure_count}",
+        "未完成 Operation："
+        + ("、".join(task.unresolved_operation_ids) or "无"),
+        "",
         "## 上下文管理",
         "",
         f"工作记忆版本：{task.working_memory_version}",

@@ -207,12 +207,14 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
             research_evidence_store,
             compaction_store,
             investigation,
+            **kwargs,
         ):
             captures["service_store"] = working_memory_store
             captures["service_research_store"] = research_evidence_store
             captures["service_compaction_store"] = compaction_store
             captures["service_repository"] = repository
             captures["service_investigation"] = investigation
+            captures["service_execution_backend"] = kwargs["execution_backend"]
             self.config = config
 
         def start(self, problem):
@@ -313,7 +315,7 @@ def test_resume_reuses_persisted_project_python(tmp_path, monkeypatch):
         return object()
 
     class FakeService:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
     monkeypatch.setattr(cli_module, "build_agent", fake_build_agent)

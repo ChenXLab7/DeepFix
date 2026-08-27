@@ -20,6 +20,7 @@ from deepfix.compaction.models import (
     CompactionFailureRecord,
     ContextRecoveryMetadata,
     FileChangeEvidence,
+    SystemTestEvidence,
 )
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config
@@ -51,6 +52,8 @@ from deepfix.persistence import TaskRepository
 from deepfix.research.models import ExternalEvidence, SearchCandidate
 from deepfix.research.store import ResearchEvidenceStore
 from deepfix.service import BugfixService
+from deepfix.verification import VerificationPolicyBuilder, VerificationPolicyStore
+from deepfix.workspace import WorkspaceFactory
 
 
 class FakeAgent:
@@ -224,6 +227,9 @@ def make_service(
     research_store=None,
     investigation=None,
     operation_reconciler=None,
+    workspace_factory=None,
+    verification_policy_store=None,
+    execution_backend=None,
 ):
     repository = TaskRepository(config.database_path)
     memory_store = memory_store or WorkingMemoryStore(config.database_path)
@@ -238,9 +244,117 @@ def make_service(
             research_store,
             investigation=investigation,
             operation_reconciler=operation_reconciler,
+            workspace_factory=workspace_factory,
+            verification_policy_store=verification_policy_store,
+            execution_backend=execution_backend,
         ),
         repository,
     )
+
+
+def test_service_creates_workspace_and_policy_before_agent_invocation(app_config):
+    fake_agent = FakeAgent(outcome())
+    workspace_factory = WorkspaceFactory(
+        app_config.database_path.parent / "workspaces"
+    )
+    policy_store = VerificationPolicyStore(app_config.database_path)
+    service, _ = make_service(
+        app_config,
+        fake_agent,
+        workspace_factory=workspace_factory,
+        verification_policy_store=policy_store,
+    )
+
+    task = service.start("运行 python -m pytest -q 并修复失败")
+
+    assert task.source_project_root == str(app_config.project_root)
+    assert task.workspace_root != str(app_config.project_root)
+    assert task.project_root == task.workspace_root
+    assert task.workspace_baseline_id
+    assert task.verification_policy_id
+    assert task.verification_policy_version == 1
+    _, graph_config = fake_agent.invoke_calls[0]
+    assert graph_config["configurable"]["workspace_root"] == task.workspace_root
+    assert policy_store.load(task.task_id).policy_id == task.verification_policy_id
+
+
+def test_repository_suite_failure_blocks_fixed_at_service_boundary(app_config):
+    test = app_config.project_root / "tests" / "test_value.py"
+    test.parent.mkdir(parents=True, exist_ok=True)
+    test.write_text("def test_value(): assert True\n", encoding="utf-8")
+    task = TaskState.create(
+        app_config.project_root,
+        "运行 python -m pytest tests/test_value.py -q 并修复",
+        app_config.approval_mode,
+    )
+    workspace = WorkspaceFactory(
+        app_config.database_path.parent / "policy-workspaces"
+    ).create(task.task_id, app_config.project_root)
+    task.project_root = str(workspace.root)
+    task.workspace_root = str(workspace.root)
+    task.workspace_baseline_id = workspace.baseline.baseline_id
+    task.successful_changed_files = ["value.py"]
+    task.changed_files = ["value.py"]
+    task.test_results = [
+        RepairTestResult("baseline", 1, "failed"),
+        RepairTestResult("targeted", 0, "passed"),
+    ]
+    task.transition_to(TaskStatus.INVESTIGATING)
+    policy = VerificationPolicyBuilder().build(task, workspace)
+    policy_store = VerificationPolicyStore(app_config.database_path)
+    policy_store.save(policy)
+    task.verification_policy_id = policy.policy_id
+    task.verification_policy_version = policy.version
+    compaction = CompactionStore(app_config.database_path)
+    for evidence in (
+        FileChangeEvidence(
+            evidence_id="file-change",
+            path="value.py",
+            operation="edit",
+            status="succeeded",
+            tool_call_id="edit-value",
+            source_message_id="edit-result",
+        ),
+        SystemTestEvidence(
+            evidence_id="targeted-pass",
+            command="python -m pytest tests/test_value.py -q",
+            exit_code=0,
+            summary="1 passed",
+            tool_call_id="targeted",
+            source_message_id="targeted-result",
+            origin="user_specified",
+            scope="targeted",
+            timing="post_change",
+            workspace_baseline_id=workspace.baseline.baseline_id,
+            code_state_hash="code-a",
+        ),
+        SystemTestEvidence(
+            evidence_id="suite-failure",
+            command="python -m pytest -q",
+            exit_code=1,
+            summary="1 failed",
+            tool_call_id="suite",
+            source_message_id="suite-result",
+            origin="repository_existing",
+            scope="full_suite",
+            timing="post_change",
+            workspace_baseline_id=workspace.baseline.baseline_id,
+            code_state_hash="code-a",
+        ),
+    ):
+        compaction.save_evidence(task.task_id, evidence)
+    service, repository = make_service(
+        app_config,
+        FakeAgent(passing_outcome()),
+        verification_policy_store=policy_store,
+    )
+    service.compaction_store = compaction
+    repository.save(task)
+
+    result = service._invoke(task, {"messages": []})
+
+    assert result.status is TaskStatus.PAUSED
+    assert "required verification oracle" in result.pause_reason
 
 
 def test_unresolved_operation_pauses_before_agent_invocation(app_config):

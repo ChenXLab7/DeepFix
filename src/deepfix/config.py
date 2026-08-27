@@ -43,6 +43,7 @@ class AppConfig:
     max_agent_invocations: int = 30
     max_consecutive_test_failures: int = 3
     max_graph_steps: int = 40
+    workspaces_path: Path | None = None
 
 
 def load_config(
@@ -94,10 +95,13 @@ def load_config(
     database_path = state_database_path()
     artifacts_path = database_path.parent / "artifacts"
     artifacts_path.mkdir(parents=True, exist_ok=True)
+    workspaces_path = database_path.parent / "workspaces"
+    workspaces_path.mkdir(parents=True, exist_ok=True)
     return AppConfig(
         project_root=project,
         database_path=database_path,
         artifacts_path=artifacts_path,
+        workspaces_path=workspaces_path,
         main_model=ModelRoleConfig(
             model_name=main_model_name,
             api_key=SecretStr(main_key),

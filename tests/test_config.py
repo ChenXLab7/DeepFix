@@ -57,6 +57,8 @@ def test_load_config_resolves_project_and_state_paths(tmp_path, monkeypatch):
     assert config.database_path == state_home.resolve() / "deepfix.sqlite3"
     assert config.artifacts_path == state_home.resolve() / "artifacts"
     assert config.artifacts_path.is_dir()
+    assert config.workspaces_path == state_home.resolve() / "workspaces"
+    assert config.workspaces_path.is_dir()
     assert config.main_model.model_name == "deepseek-v4-pro"
     assert config.compaction_model.model_name == "deepseek-v4-flash"
     assert config.approval_mode is ApprovalMode.MANUAL
