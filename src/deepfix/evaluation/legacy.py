@@ -17,6 +17,11 @@ from deepfix.evaluation.models import (
     EvaluationRun,
 )
 from deepfix.evaluation.traces import summarize_llm_trace
+from deepfix.investigation.token_budget import (
+    TokenBudgetCallbackHandler,
+    TokenBudgetMiddleware,
+    TokenBudgetStore,
+)
 from deepfix.models import TaskState, TaskStatus
 from deepfix.service import BugfixService
 
@@ -42,7 +47,7 @@ class LegacyLoopRunner:
     ) -> None:
         self.project_python = project_python.expanduser().resolve()
         self.config_factory = config_factory or _build_run_config
-        self.service_factory = service_factory or _default_service_factory
+        self.service_factory = service_factory
         self.oracle_runner = oracle_runner or _run_oracle
         self.clock = clock
 
@@ -62,9 +67,24 @@ class LegacyLoopRunner:
         started_at = self.clock()
         task: TaskState | None = None
         sanitized_error_code: str | None = None
+        middleware: TokenBudgetMiddleware | None = None
 
         try:
-            with self.service_factory(config) as service:
+            middleware = build_evaluation_token_budget_middleware(config, budget)
+            compaction_callbacks = build_evaluation_compaction_callbacks(
+                config,
+                budget,
+            )
+            service_context = (
+                self.service_factory(config)
+                if self.service_factory is not None
+                else _default_service_factory(
+                    config,
+                    evaluation_middleware=middleware,
+                    compaction_callbacks=compaction_callbacks,
+                )
+            )
+            with service_context as service:
                 task = service.start(case.problem)
         except Exception:  # noqa: BLE001 - evaluation records only a stable code
             sanitized_error_code = "legacy_runner_failed"
@@ -98,10 +118,36 @@ class LegacyLoopRunner:
             config.artifacts_path / "debug" / "llm_calls.jsonl",
             task_id,
         )
+        ledger_usage = None
+        if middleware is not None:
+            try:
+                ledger_usage = middleware.store.usage(task_id)
+            except KeyError:
+                pass
         usage = trace_usage.model_copy(
             update={
+                "input_tokens": (
+                    ledger_usage.input_tokens
+                    if ledger_usage
+                    else trace_usage.input_tokens
+                ),
+                "output_tokens": (
+                    ledger_usage.output_tokens
+                    if ledger_usage
+                    else trace_usage.output_tokens
+                ),
+                "model_calls": (
+                    ledger_usage.model_calls
+                    if ledger_usage
+                    else trace_usage.model_calls
+                ),
                 "tool_calls": tool_calls,
                 "wall_seconds": elapsed,
+                "usage_estimated": (
+                    ledger_usage.estimated
+                    if ledger_usage
+                    else trace_usage.usage_estimated
+                ),
             }
         )
         return EvaluationRun(
@@ -226,7 +272,12 @@ def _bind_python_command(command: str, project_python: Path) -> str:
 
 
 @contextmanager
-def _default_service_factory(config: AppConfig) -> Iterator[BugfixService]:
+def _default_service_factory(
+    config: AppConfig,
+    *,
+    evaluation_middleware: TokenBudgetMiddleware | None = None,
+    compaction_callbacks: tuple[TokenBudgetCallbackHandler, ...] = (),
+) -> Iterator[BugfixService]:
     from langgraph.checkpoint.sqlite import SqliteSaver
 
     from deepfix.agent import build_agent
@@ -262,6 +313,11 @@ def _default_service_factory(config: AppConfig) -> Iterator[BugfixService]:
             client,
             backend,
         )
+        if evaluation_middleware is not None:
+            extensions = replace(
+                extensions,
+                middleware=(*extensions.middleware, evaluation_middleware),
+            )
         with repository.checkpoint_connection() as connection:
             agent = build_agent(
                 config,
@@ -273,6 +329,7 @@ def _default_service_factory(config: AppConfig) -> Iterator[BugfixService]:
                 research_evidence_store=research_evidence_store,
                 investigation=investigation,
                 backend=backend,
+                compaction_model_callbacks=compaction_callbacks,
             )
             yield BugfixService(
                 agent,
@@ -284,3 +341,30 @@ def _default_service_factory(config: AppConfig) -> Iterator[BugfixService]:
                 compaction_store,
                 investigation,
             )
+
+
+def build_evaluation_token_budget_middleware(
+    config: AppConfig,
+    budget: EvaluationBudget,
+) -> TokenBudgetMiddleware:
+    return TokenBudgetMiddleware(
+        TokenBudgetStore(config.database_path),
+        input_cap=budget.max_input_tokens,
+        output_cap=budget.max_output_tokens,
+        requested_output_tokens=min(4096, budget.max_output_tokens),
+    )
+
+
+def build_evaluation_compaction_callbacks(
+    config: AppConfig,
+    budget: EvaluationBudget,
+) -> tuple[TokenBudgetCallbackHandler, ...]:
+    return (
+        TokenBudgetCallbackHandler(
+            TokenBudgetStore(config.database_path),
+            input_cap=budget.max_input_tokens,
+            output_cap=budget.max_output_tokens,
+            role="compaction",
+            requested_output_tokens=min(4096, budget.max_output_tokens),
+        ),
+    )

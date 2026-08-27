@@ -59,8 +59,8 @@ def build_provenance_batch(
         ),
         python_version=_python_version(python_executable),
         python_executable_sha256=_file_sha256(python_executable),
-        budget_enforcement="post_run_observation",
-        model_accounting="main_model_trace_only",
+        budget_enforcement="pre_call_reservation",
+        model_accounting="all_model_roles",
     )
 
 

@@ -19,6 +19,10 @@ from deepfix.evaluation.models import (
     EvaluationRun,
     RunUsage,
 )
+from deepfix.investigation.token_budget import (
+    TokenBudgetCallbackHandler,
+    TokenBudgetMiddleware,
+)
 from deepfix.models import TaskState, TaskStatus
 
 BUDGET = EvaluationBudget(
@@ -405,6 +409,80 @@ def test_legacy_runner_invokes_service_oracle_and_trace_summary(tmp_path) -> Non
     assert run.usage.model_calls == 1
     assert run.usage.tool_calls == 2
     assert run.usage.wall_seconds == 2.5
+
+
+def test_default_legacy_runner_receives_runtime_token_budget(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    config = _app_config(workspace, run_dir)
+    received: list[TokenBudgetMiddleware] = []
+    received_callbacks: list[tuple[TokenBudgetCallbackHandler, ...]] = []
+
+    @contextmanager
+    def default_service_factory(
+        received_config,
+        *,
+        evaluation_middleware=None,
+        compaction_callbacks=(),
+    ):
+        assert received_config is config
+        received.append(evaluation_middleware)
+        received_callbacks.append(compaction_callbacks)
+        evaluation_middleware.store.initialize(
+            "task-evaluation",
+            input_cap=BUDGET.max_input_tokens,
+            output_cap=BUDGET.max_output_tokens,
+        )
+        main = evaluation_middleware.store.reserve(
+            "task-evaluation",
+            "main-test-call",
+            input_tokens=20,
+            output_tokens=10,
+        )
+        evaluation_middleware.store.settle(
+            main.reservation_id,
+            input_tokens=12,
+            output_tokens=4,
+        )
+        compact = evaluation_middleware.store.reserve(
+            "task-evaluation",
+            "compaction-test-call",
+            input_tokens=8,
+            output_tokens=3,
+        )
+        evaluation_middleware.store.charge_unknown(compact.reservation_id)
+        yield FakeService(
+            _task(workspace, status=TaskStatus.COMPLETED, resolution="fixed")
+        )
+
+    monkeypatch.setattr(
+        "deepfix.evaluation.legacy._default_service_factory",
+        default_service_factory,
+    )
+    times = iter([1.0, 2.0])
+    runner = LegacyLoopRunner(
+        project_python=Path(sys.executable),
+        config_factory=lambda *_: config,
+        oracle_runner=lambda *_: 0,
+        clock=lambda: next(times),
+    )
+
+    run = runner.run(case(), workspace, run_dir, BUDGET)
+
+    assert len(received) == 1
+    assert received[0].input_cap == BUDGET.max_input_tokens
+    assert received[0].output_cap == BUDGET.max_output_tokens
+    assert len(received_callbacks[0]) == 1
+    assert received_callbacks[0][0].role == "compaction"
+    assert run.usage.input_tokens == 20
+    assert run.usage.output_tokens == 7
+    assert run.usage.model_calls == 2
+    assert run.usage.usage_estimated is True
 
 
 def test_default_oracle_binds_python_command_to_selected_interpreter(

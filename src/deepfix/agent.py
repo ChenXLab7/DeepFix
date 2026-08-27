@@ -102,6 +102,7 @@ def build_agent(
     *,
     allowed_skill_roots: tuple[str | Path, ...] = (),
     backend=None,
+    compaction_model_callbacks: tuple[object, ...] = (),
 ):
     register_harness_profile(
         f"deepseek:{config.main_model.model_name}",
@@ -112,6 +113,10 @@ def build_agent(
     )
     main_model = build_main_model(config)
     compaction_model = build_compaction_model(config)
+    if compaction_model_callbacks:
+        compaction_model = compaction_model.with_config(
+            callbacks=list(compaction_model_callbacks)
+        )
     resolved_backend = backend or build_backend(config)
     tasks = task_repository or TaskRepository(config.database_path)
     compaction = compaction_store or CompactionStore(config.database_path)
