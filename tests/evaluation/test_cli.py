@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from deepfix.cli import build_parser as build_production_parser
 from deepfix.evaluation.__main__ import main, validate_summary
 from deepfix.evaluation.models import (
     EvaluationBudget,
@@ -91,6 +92,30 @@ def test_cli_dry_run_lists_cases_without_constructing_runner(
 
     assert code == 0
     assert "sample-buggy" in capsys.readouterr().out
+
+
+def test_evaluation_cli_has_experiment_command_but_production_cli_has_no_loop_flag(
+    tmp_path,
+    capsys,
+) -> None:
+    manifest = _write_manifest(tmp_path / "cases.json")
+
+    code = main(
+        [
+            "experiment",
+            "--manifest",
+            str(manifest),
+            "--project",
+            str(tmp_path),
+            "--dry-run",
+        ]
+    )
+
+    assert code == 0
+    assert "sample-buggy" in capsys.readouterr().out
+    production_help = build_production_parser().format_help()
+    assert "--loop" not in production_help
+    assert "experiment" not in production_help
 
 
 def test_cli_refuses_model_execution_without_online_opt_in(

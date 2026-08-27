@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from deepfix.evaluation.experiment import ExperimentLoopRunner
 from deepfix.evaluation.harness import CaseRunner, EvaluationHarness
 from deepfix.evaluation.legacy import LegacyLoopRunner
 from deepfix.evaluation.manifest import load_manifest
@@ -49,16 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m deepfix.evaluation")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    baseline = subparsers.add_parser("baseline")
-    baseline.add_argument("--manifest", required=True)
-    baseline.add_argument("--project", required=True)
-    baseline.add_argument("--python", default=sys.executable)
-    baseline.add_argument("--runs", type=_positive_int, default=3)
-    baseline.add_argument("--run-start", type=_positive_int, default=1)
-    baseline.add_argument("--case", dest="selected_cases", action="append")
-    baseline.add_argument("--output")
-    baseline.add_argument("--summary")
-    baseline.add_argument("--dry-run", action="store_true")
+    _add_run_arguments(subparsers.add_parser("baseline"))
+    _add_run_arguments(subparsers.add_parser("experiment"))
 
     validate = subparsers.add_parser("validate-summary")
     validate.add_argument("path")
@@ -133,8 +126,11 @@ def main(
         print(f"python executable does not exist: {project_python}", file=sys.stderr)
         return 2
 
+    loop_name = "experiment" if args.command == "experiment" else "legacy"
     resolved_runner_factory = runner_factory or (
-        lambda python: LegacyLoopRunner(project_python=python)
+        (lambda python: ExperimentLoopRunner(project_python=python))
+        if loop_name == "experiment"
+        else (lambda python: LegacyLoopRunner(project_python=python))
     )
     runner = resolved_runner_factory(project_python)
     harness = EvaluationHarness(Path(args.output), runner)
@@ -171,7 +167,7 @@ def main(
         [case.case_id for case in cases],
     )
     summary = EvaluationSummary(
-        loop="legacy",
+        loop=loop_name,
         status="stopped_budget" if stopped_budget else "complete",
         manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
         budget=manifest.budget,
@@ -204,9 +200,9 @@ def main(
     validate_summary(summary_path)
 
     if stopped_budget:
-        print(f"stopped baseline after budget violation; summary={summary_path}")
+        print(f"stopped {args.command} after budget violation; summary={summary_path}")
         return 3
-    print(f"completed baseline: runs={len(graded_runs)} summary={summary_path}")
+    print(f"completed {args.command}: runs={len(graded_runs)} summary={summary_path}")
     return 0
 
 
@@ -499,6 +495,18 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
+
+
+def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--runs", type=_positive_int, default=3)
+    parser.add_argument("--run-start", type=_positive_int, default=1)
+    parser.add_argument("--case", dest="selected_cases", action="append")
+    parser.add_argument("--output")
+    parser.add_argument("--summary")
+    parser.add_argument("--dry-run", action="store_true")
 
 
 if __name__ == "__main__":
