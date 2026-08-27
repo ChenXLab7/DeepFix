@@ -102,6 +102,18 @@ class SystemTestEvidence(StrictModel):
     summary: str
     tool_call_id: str = Field(min_length=1)
     source_message_id: str = Field(min_length=1)
+    origin: Literal[
+        "user_specified",
+        "repository_existing",
+        "agent_generated",
+        "minimal_reproduction",
+    ] = "repository_existing"
+    scope: Literal["targeted", "module", "full_suite"] = "targeted"
+    timing: Literal["baseline", "post_change", "post_recovery"] = "baseline"
+    workspace_baseline_id: str = Field(default="legacy-untracked", min_length=1)
+    code_state_hash: str = Field(default="legacy-untracked", min_length=1)
+    test_target_paths: list[str] = Field(default_factory=list)
+    test_content_hashes: dict[str, str] = Field(default_factory=dict)
 
 
 class FileChangeEvidence(StrictModel):

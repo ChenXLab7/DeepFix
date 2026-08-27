@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
@@ -19,6 +20,12 @@ from deepfix.compaction.models import (
 from deepfix.compaction.store import CompactionStore, DeterministicEvidence
 from deepfix.models import TaskState
 from deepfix.research.store import ResearchEvidenceStore
+from deepfix.verification import (
+    classify_pytest_scope,
+    extract_user_pytest_commands,
+    pytest_target_paths,
+)
+from deepfix.workspace import WorkspaceBaseline, compute_code_state_hash
 
 _FILE_TO_OPERATION = {
     "write_file": "write",
@@ -55,7 +62,13 @@ class EvidenceCollector:
             args = call.get("args", {})
             args = args if isinstance(args, Mapping) else {}
             if name == "execute":
-                test = _test_evidence(task_id, call_id, args, result)
+                test = _test_evidence(
+                    task_id,
+                    call_id,
+                    args,
+                    result,
+                    task_state,
+                )
                 if test is not None:
                     collected.append(test)
                 continue
@@ -110,8 +123,12 @@ class EvidenceCollector:
                 )
             )
 
+        existing_ids = {
+            item.evidence_id for item in self.store.list_evidence(task_id)
+        }
         for evidence in collected:
-            self.store.save_evidence(task_id, evidence)
+            if evidence.evidence_id not in existing_ids:
+                self.store.save_evidence(task_id, evidence)
         return _as_block(self.store.list_evidence(task_id))
 
     def collect_pair(
@@ -161,6 +178,7 @@ def _test_evidence(
     call_id: str,
     args: Mapping[str, object],
     result: ToolMessage,
+    task_state: TaskState,
 ) -> SystemTestEvidence | None:
     command = str(args.get("command", "")).strip()
     artifact = result.artifact
@@ -183,7 +201,76 @@ def _test_evidence(
         summary=_message_text(result),
         tool_call_id=call_id,
         source_message_id=str(result.id),
+        **_test_metadata(command, task_state),
     )
+
+
+def _test_metadata(command: str, task: TaskState) -> dict[str, object]:
+    root = Path(task.workspace_root or task.project_root).resolve()
+    targets = pytest_target_paths(command)
+    baseline = _workspace_baseline(root)
+    baseline_hashes = baseline.managed_file_hashes if baseline else {}
+    normalized = _normalize_command(command)
+    user_commands = {
+        _normalize_command(item)
+        for item in extract_user_pytest_commands(task.user_problem)
+    }
+    content_hashes: dict[str, str] = {}
+    for relative in targets:
+        path = (root / relative).resolve(strict=False)
+        try:
+            path.relative_to(root)
+        except ValueError:
+            continue
+        if path.is_file():
+            content_hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    targets_modified = baseline is not None and bool(targets) and any(
+        path not in baseline_hashes
+        or content_hashes.get(path) != baseline_hashes.get(path)
+        for path in targets
+    )
+    if targets_modified:
+        origin = "agent_generated"
+    elif normalized in user_commands:
+        origin = "user_specified"
+    elif any("repro" in path.lower() for path in targets):
+        origin = "minimal_reproduction"
+    elif targets and not all(path in baseline_hashes for path in targets):
+        origin = "agent_generated"
+    else:
+        origin = "repository_existing"
+    current_hash = compute_code_state_hash(root)
+    if task.investigation_recovery is not None:
+        timing = "post_recovery"
+    elif (
+        baseline is not None and current_hash != baseline.code_state_hash
+    ) or task.changed_files:
+        timing = "post_change"
+    else:
+        timing = "baseline"
+    return {
+        "origin": origin,
+        "scope": classify_pytest_scope(command),
+        "timing": timing,
+        "workspace_baseline_id": (
+            task.workspace_baseline_id
+            or (baseline.baseline_id if baseline else "legacy-untracked")
+        ),
+        "code_state_hash": current_hash,
+        "test_target_paths": targets,
+        "test_content_hashes": content_hashes,
+    }
+
+
+def _workspace_baseline(root: Path) -> WorkspaceBaseline | None:
+    path = root / ".deepfix-baseline.json"
+    if not path.is_file():
+        return None
+    return WorkspaceBaseline.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _normalize_command(command: str) -> str:
+    return " ".join(command.strip().replace("\\", "/").split()).lower()
 
 
 def _file_evidence(

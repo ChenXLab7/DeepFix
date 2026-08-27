@@ -24,7 +24,7 @@ _IGNORED_DIRECTORIES = frozenset(
         "__pycache__",
     }
 )
-_IGNORED_FILES = frozenset({_BASELINE_FILE, ".coverage"})
+_IGNORED_FILES = frozenset({_BASELINE_FILE, ".coverage", "deepfix.sqlite3"})
 _IGNORED_SUFFIXES = frozenset({".pyc", ".pyo"})
 _SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -268,5 +268,6 @@ def _is_ignored(relative: Path) -> bool:
     return (
         any(part in _IGNORED_DIRECTORIES for part in relative.parts)
         or relative.name in _IGNORED_FILES
+        or relative.name.startswith("deepfix.sqlite3-")
         or relative.suffix.lower() in _IGNORED_SUFFIXES
     )

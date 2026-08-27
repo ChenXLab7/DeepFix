@@ -171,6 +171,8 @@ class TaskState:
     source_project_root: str | None = None
     workspace_root: str | None = None
     workspace_baseline_id: str | None = None
+    verification_policy_id: str | None = None
+    verification_policy_version: int | None = None
     project_python: str = field(
         default_factory=lambda: str(Path(sys.executable).resolve())
     )

@@ -61,6 +61,22 @@ def test_pytest_exit_code_comes_from_paired_tool_message(tmp_path):
     assert collector.store.list_evidence("task-a") == [block.tests[0]]
 
 
+def test_historical_test_evidence_keeps_original_code_state(tmp_path):
+    collector = _collector(tmp_path)
+    task = _task(tmp_path)
+    source = tmp_path / "value.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    history = _execute_history(exit_code=0)
+
+    first = collector.collect(task.task_id, history, task).tests[0]
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    task.changed_files = ["value.py"]
+    second = collector.collect(task.task_id, history, task).tests[0]
+
+    assert second == first
+    assert second.timing == "baseline"
+
+
 def test_approved_target_is_not_reported_as_successful_file_change(tmp_path):
     collector = _collector(tmp_path)
     task = _task(tmp_path)
@@ -241,3 +257,48 @@ def test_collect_pair_uses_the_same_evidence_identity_as_history_collection(tmp_
 
     assert paired is not None
     assert paired.evidence_id == block.tests[0].evidence_id
+
+
+def test_pytest_evidence_records_origin_scope_timing_and_code_identity(tmp_path):
+    test = tmp_path / "tests" / "test_value.py"
+    test.parent.mkdir()
+    test.write_text("def test_value(): assert True\n", encoding="utf-8")
+    task = _task(tmp_path)
+    task.user_problem = "运行 python -m pytest tests/test_value.py -q 验证"
+    task.workspace_baseline_id = "baseline-a"
+
+    block = _collector(tmp_path).collect(
+        task.task_id,
+        [
+            AIMessage(
+                id="m-user-test",
+                content="",
+                tool_calls=[
+                    {
+                        "name": "execute",
+                        "args": {
+                            "command": "python -m pytest tests/test_value.py -q"
+                        },
+                        "id": "pytest-user",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                id="m-user-result",
+                content="1 passed",
+                name="execute",
+                tool_call_id="pytest-user",
+                artifact={"exit_code": 0},
+            ),
+        ],
+        task,
+    )
+
+    evidence = block.tests[0]
+    assert evidence.origin == "user_specified"
+    assert evidence.scope == "targeted"
+    assert evidence.workspace_baseline_id == "baseline-a"
+    assert evidence.test_target_paths == ["tests/test_value.py"]
+    assert evidence.test_content_hashes["tests/test_value.py"]
+    assert evidence.code_state_hash
