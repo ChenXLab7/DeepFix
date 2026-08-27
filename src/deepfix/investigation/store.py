@@ -6,6 +6,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+from deepfix.investigation.experiments import (
+    ExperimentAssessment,
+    ExperimentResult,
+    StrategyDecision,
+)
 from deepfix.investigation.models import (
     InvestigationEvent,
     InvestigationState,
@@ -97,6 +102,133 @@ class InvestigationStore:
             for row in rows
         ]
 
+    def commit_experiment(
+        self,
+        expected_version: int,
+        *,
+        event_id: str,
+        event_payload: str,
+        result: ExperimentResult,
+        assessment: ExperimentAssessment,
+        next_state: InvestigationState,
+    ) -> InvestigationState:
+        if result.experiment_id != assessment.experiment_id:
+            raise InvestigationStateConflict("experiment result/assessment 不一致")
+        if next_state.task_id.strip() == "":
+            raise InvestigationStateConflict("experiment state 缺少 task_id")
+        with open_sqlite_connection(self.database_path) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                current = self._load(connection, next_state.task_id)
+                current_version = 0 if current is None else current.version
+                existing = connection.execute(
+                    """
+                    SELECT payload FROM experiment_events
+                    WHERE task_id = ? AND event_id = ?
+                    """,
+                    (next_state.task_id, event_id),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing[0]) != event_payload:
+                        raise InvestigationStateConflict(
+                            "相同 experiment event_id 的内容冲突"
+                        )
+                    connection.rollback()
+                    if current is None:
+                        raise InvestigationStateConflict("重放缺少物化状态")
+                    return current
+                if current_version != expected_version:
+                    raise InvestigationStateConflict("investigation state 版本冲突")
+                committed = next_state.model_copy(update={"version": current_version + 1})
+                created_at = datetime.now(UTC).isoformat(timespec="microseconds")
+                connection.execute(
+                    """
+                    INSERT INTO experiment_results(
+                        task_id, experiment_id, result_payload,
+                        assessment_payload, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(task_id, experiment_id) DO UPDATE SET
+                        result_payload = excluded.result_payload,
+                        assessment_payload = excluded.assessment_payload,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        committed.task_id,
+                        result.experiment_id,
+                        result.model_dump_json(),
+                        assessment.model_dump_json(),
+                        created_at,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO experiment_events(
+                        task_id, event_id, experiment_id, payload, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        committed.task_id,
+                        event_id,
+                        result.experiment_id,
+                        event_payload,
+                        created_at,
+                    ),
+                )
+                self._upsert_state(connection, committed)
+                connection.commit()
+                return committed
+            except Exception:
+                connection.rollback()
+                raise
+
+    def count_experiment_events(self, task_id: str) -> int:
+        with open_sqlite_connection(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM experiment_events WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return int(row[0])
+
+    def save_strategy_decision(self, decision: StrategyDecision) -> None:
+        payload = decision.model_dump_json()
+        created_at = datetime.now(UTC).isoformat(timespec="microseconds")
+        with open_sqlite_connection(self.database_path) as connection:
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO strategy_decisions(
+                        task_id, decision_id, payload, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        decision.task_id,
+                        decision.decision_id,
+                        payload,
+                        created_at,
+                    ),
+                )
+                connection.commit()
+            except sqlite3.IntegrityError as exc:
+                row = connection.execute(
+                    """
+                    SELECT payload FROM strategy_decisions
+                    WHERE task_id = ? AND decision_id = ?
+                    """,
+                    (decision.task_id, decision.decision_id),
+                ).fetchone()
+                if row is None or str(row[0]) != payload:
+                    raise InvestigationStateConflict(
+                        "strategy decision identity conflict"
+                    ) from exc
+
+    def count_strategy_decisions(self, task_id: str) -> int:
+        with open_sqlite_connection(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM strategy_decisions WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return int(row[0])
+
     def last_sequence(self, task_id: str) -> int:
         with open_sqlite_connection(self.database_path) as connection:
             row = connection.execute(
@@ -143,6 +275,41 @@ class InvestigationStore:
                     version INTEGER NOT NULL,
                     payload TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_decisions (
+                    task_id TEXT NOT NULL,
+                    decision_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (task_id, decision_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS experiment_results (
+                    task_id TEXT NOT NULL,
+                    experiment_id TEXT NOT NULL,
+                    result_payload TEXT NOT NULL,
+                    assessment_payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (task_id, experiment_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS experiment_events (
+                    task_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    experiment_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (task_id, event_id)
                 )
                 """
             )

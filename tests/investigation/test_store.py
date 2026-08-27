@@ -1,7 +1,28 @@
 import pytest
 
+from deepfix.investigation.experiments import StrategyDecision
 from deepfix.investigation.models import AgentPhase, NewInvestigationEvent
 from deepfix.investigation.store import InvestigationStateConflict, InvestigationStore
+
+
+def test_strategy_decision_save_is_idempotent(tmp_path) -> None:
+    store = InvestigationStore(tmp_path / "state.db")
+    decision = StrategyDecision(
+        decision_id="decision-1",
+        task_id="task-a",
+        blackboard_fingerprint="blackboard-1",
+        decision_type="ask_user",
+        current_assessment="Local evidence cannot answer the question",
+        evidence_gap_ids=["gap-1"],
+        uncertainty=0.8,
+        rationale_refs=[],
+        question_for_user="Which behavior is expected?",
+    )
+
+    store.save_strategy_decision(decision)
+    store.save_strategy_decision(decision)
+
+    assert store.count_strategy_decisions("task-a") == 1
 
 
 def new_event(

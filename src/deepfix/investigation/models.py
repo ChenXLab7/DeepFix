@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import Field, JsonValue, model_validator
 
-from deepfix.compaction.models import StrictModel
+from deepfix.compaction.models import ProvenanceRef, StrictModel
 
 
 class AgentPhase(StrEnum):
@@ -124,6 +124,14 @@ class InvestigationHypothesis(StrictModel):
     reason: str = Field(min_length=1)
 
 
+class ExperimentClaimRecord(StrictModel):
+    claim_id: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+    state: Literal["confirmed", "conflict"] = "confirmed"
+    sources: list[ProvenanceRef] = Field(default_factory=list)
+    provenance_root_ids: list[str] = Field(default_factory=list)
+
+
 class InvestigationPermit(StrictModel):
     permit_id: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
@@ -220,6 +228,19 @@ class InvestigationState(StrictModel):
     recent_tool_signatures: list[str] = Field(default_factory=list, max_length=32)
     test_evidence_ids: list[str] = Field(default_factory=list, max_length=64)
     hypotheses: list[InvestigationHypothesis] = Field(default_factory=list, max_length=64)
+    experiment_claims: list[ExperimentClaimRecord] = Field(
+        default_factory=list,
+        max_length=128,
+    )
+    active_experiment_id: str | None = None
+    completed_experiment_ids: list[str] = Field(default_factory=list, max_length=128)
+    closed_evidence_gap_ids: list[str] = Field(default_factory=list, max_length=128)
+    independent_evidence_root_ids: list[str] = Field(
+        default_factory=list,
+        max_length=256,
+    )
+    experiment_progress_fingerprint: str | None = None
+    last_strategy_signature: str | None = None
     supported_hypothesis_ids: list[str] = Field(default_factory=list, max_length=64)
     seen_progress_fingerprints: list[str] = Field(default_factory=list, max_length=64)
     progress_generation: int = 0
