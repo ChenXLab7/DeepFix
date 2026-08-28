@@ -1,6 +1,6 @@
 import json
 from collections import deque
-from dataclasses import replace
+from dataclasses import asdict, replace
 from uuid import uuid4
 
 import pytest
@@ -49,6 +49,7 @@ from deepfix.operations import (
     OperationStateSnapshot,
 )
 from deepfix.persistence import TaskRepository
+from deepfix.reporting import render_report
 from deepfix.research.models import ExternalEvidence, SearchCandidate
 from deepfix.research.store import ResearchEvidenceStore
 from deepfix.service import BugfixService
@@ -758,6 +759,49 @@ def test_completed_outcome_requires_and_records_passing_test(app_config):
     assert task.final_summary == (
         "未复现用户描述的问题：当前环境中所运行的 pytest 测试通过，且未修改代码。"
     )
+
+
+def test_offline_report_path_keeps_todo_navigation_in_graph_state_only(app_config):
+    todos = [
+        {"content": "reproduce failure", "status": "completed"},
+        {"content": "identify root cause", "status": "in_progress"},
+        {"content": "apply minimal fix", "status": "pending"},
+        {"content": "run required verification", "status": "pending"},
+    ]
+    graph_result = passing_outcome()
+    graph_result.update(
+        {
+            "todos": todos,
+            "_deepfix_todo_rounds_since_update": 2,
+            "_deepfix_last_todo_progress_fingerprint": "todo-fingerprint",
+            "_deepfix_pending_navigation_reminder": "request-local reminder",
+        }
+    )
+    service, _ = make_service(app_config, FakeAgent(graph_result))
+
+    task = service.start("测试失败")
+    deterministic_evidence = EvidenceCollector(
+        service.compaction_store,
+        service.research_evidence_store,
+    ).collect(task.task_id, graph_result["messages"], task)
+    task_payload = task.to_dict()
+    boundary_texts = [
+        json.dumps(task_payload, ensure_ascii=False, default=str),
+        deterministic_evidence.model_dump_json(),
+        json.dumps(asdict(task.context_metrics), ensure_ascii=False),
+        render_report(task),
+    ]
+
+    assert graph_result["todos"] == todos
+    assert "todos" not in task_payload
+    for forbidden in (
+        "_deepfix_todo_rounds_since_update",
+        "_deepfix_last_todo_progress_fingerprint",
+        "_deepfix_pending_navigation_reminder",
+    ):
+        assert all(forbidden not in text for text in boundary_texts)
+    for todo in todos:
+        assert all(todo["content"] not in text for text in boundary_texts)
 
 
 def test_not_reproduced_is_rejected_when_current_task_has_failed_test(app_config):

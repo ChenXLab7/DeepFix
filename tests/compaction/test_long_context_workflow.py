@@ -11,6 +11,8 @@ from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain_core.exceptions import ContextOverflowError
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import ExecutionInfo, Runtime
 from pydantic import SecretStr
 
@@ -42,6 +44,7 @@ from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, TaskState, TaskStatus
 from deepfix.models import TestResult as RepairTestResult
+from deepfix.navigation.models import TodoNavigationState
 from deepfix.persistence import TaskRepository
 from deepfix.protected_context import ProtectedContext, render_protected_context
 from deepfix.research.store import ResearchEvidenceStore
@@ -108,6 +111,8 @@ class _WorkflowResult:
     history_contains_all_compressed_message_ids: bool
     no_work_unit_was_split: bool
     target_project_has_no_deepfix_artifacts: bool
+    conversation_artifact_text: str
+    restored_navigation_state: dict[str, object]
 
 
 class _LongBugWorkflow:
@@ -345,6 +350,35 @@ class _LongBugWorkflow:
             active_snapshot,
         )
         history = artifact_adapter.read_verified(events[-1].conversation_artifact.path)
+        navigation_checkpointer = InMemorySaver()
+        navigation_graph_builder = StateGraph(TodoNavigationState)
+        navigation_graph_builder.add_node("checkpoint", lambda state: {})
+        navigation_graph_builder.add_edge(START, "checkpoint")
+        navigation_graph_builder.add_edge("checkpoint", END)
+        navigation_graph = navigation_graph_builder.compile(
+            checkpointer=navigation_checkpointer
+        )
+        navigation_config = {"configurable": {"thread_id": task.task_id}}
+        navigation_graph.invoke(
+            {
+                "messages": [HumanMessage(id="navigation-user", content=constraint)],
+                "todos": [
+                    {"content": "reproduce failure", "status": "completed"},
+                    {"content": "identify root cause", "status": "in_progress"},
+                    {"content": "apply minimal fix", "status": "pending"},
+                    {"content": "run required verification", "status": "pending"},
+                ],
+                "_deepfix_todo_rounds_since_update": 2,
+                "_deepfix_last_completed_tool_round_id": "m-edit-call",
+                "_deepfix_last_todo_progress_fingerprint": "todo-progress-fingerprint",
+                "_deepfix_last_navigation_hint_fingerprint": "milestone-fingerprint",
+                "_deepfix_pending_navigation_reminder": "request-local reminder",
+            },
+            navigation_config,
+        )
+        restored_navigation_state = dict(
+            navigation_graph.get_state(navigation_config).values
+        )
         scoped_partition = partition_work_units(_scoped(task.task_id, messages), set())
         units = {unit.unit_id: unit for unit in scoped_partition.units}
         compressed_ids = {
@@ -372,6 +406,8 @@ class _LongBugWorkflow:
             target_project_has_no_deepfix_artifacts=not any(
                 ".deepfix" in path.name for path in self.project.rglob("*")
             ),
+            conversation_artifact_text=history,
+            restored_navigation_state=restored_navigation_state,
         )
 
 
@@ -389,6 +425,27 @@ def test_long_bugfix_preserves_evidence_across_three_compactions(workflow):
     assert result.no_work_unit_was_split
     assert result.target_project_has_no_deepfix_artifacts
     assert result.task.status is TaskStatus.COMPLETED
+    expected_todos = [
+        {"content": "reproduce failure", "status": "completed"},
+        {"content": "identify root cause", "status": "in_progress"},
+        {"content": "apply minimal fix", "status": "pending"},
+        {"content": "run required verification", "status": "pending"},
+    ]
+    assert result.restored_navigation_state["todos"] == expected_todos
+    assert result.restored_navigation_state["_deepfix_todo_rounds_since_update"] == 2
+    assert result.restored_navigation_state[
+        "_deepfix_last_todo_progress_fingerprint"
+    ] == "todo-progress-fingerprint"
+    assert result.restored_navigation_state[
+        "_deepfix_pending_navigation_reminder"
+    ] == "request-local reminder"
+    for forbidden in (
+        "_deepfix_todo_rounds_since_update",
+        "_deepfix_last_todo_progress_fingerprint",
+        "_deepfix_pending_navigation_reminder",
+    ):
+        assert forbidden not in result.final_snapshot.model_dump_json()
+        assert forbidden not in result.conversation_artifact_text
 
 
 class _FailingAdapter:
