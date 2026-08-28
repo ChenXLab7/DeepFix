@@ -1,4 +1,4 @@
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from deepfix.navigation.rounds import completed_tool_rounds_after
 
@@ -111,4 +111,71 @@ def test_duplicate_tool_messages_do_not_multiply_round():
     messages = _round("a1", [{"id": "c1", "name": "read_file", "args": {}}])
     messages.append(ToolMessage(id="result-duplicate", content="again", tool_call_id="c1"))
     delta = completed_tool_rounds_after(messages, None)
-    assert (delta.count, delta.latest_round_id) == (1, "a1")
+    assert (delta.count, delta.latest_round_id) == (0, None)
+
+
+def test_tool_result_cannot_cross_next_tool_round_boundary():
+    messages = [
+        AIMessage(id="a1", content="", tool_calls=[{"id": "c1", "name": "read_file", "args": {}}]),
+        AIMessage(id="a2", content="", tool_calls=[{"id": "c2", "name": "grep", "args": {}}]),
+        ToolMessage(id="t2", content="ok", tool_call_id="c2"),
+    ]
+    assert completed_tool_rounds_after(messages, None).count == 1
+
+
+def test_duplicate_ai_ids_are_ambiguous_and_ignored():
+    messages = _round("same", [{"id": "c1", "name": "read_file", "args": {}}]) + _round(
+        "same", [{"id": "c2", "name": "grep", "args": {}}]
+    )
+    delta = completed_tool_rounds_after(messages, None)
+    assert (delta.count, delta.latest_round_id) == (0, None)
+
+
+def test_reused_call_id_is_ambiguous_and_ignored():
+    messages = _round("a1", [{"id": "c1", "name": "read_file", "args": {}}]) + _round(
+        "a2", [{"id": "c1", "name": "grep", "args": {}}]
+    )
+    delta = completed_tool_rounds_after(messages, None)
+    assert (delta.count, delta.latest_round_id) == (0, None)
+
+
+def test_duplicate_cursor_id_does_not_recount_from_first_match():
+    messages = _round("a1", [{"id": "c1", "name": "read_file", "args": {}}]) + _round(
+        "a2", [{"id": "c2", "name": "grep", "args": {}}]
+    ) + _round("a2", [{"id": "c3", "name": "ls", "args": {}}])
+    delta = completed_tool_rounds_after(messages, "a2")
+    assert (delta.count, delta.latest_round_id) == (0, "a1")
+
+
+def test_checkpoint_boundary_rebaselines_cursor_before_new_rounds():
+    checkpoint = SystemMessage(
+        id="checkpoint",
+        content="snapshot",
+        additional_kwargs={"_deepfix_snapshot_version": 2},
+    )
+    baseline = completed_tool_rounds_after([checkpoint], "old-round")
+    assert (baseline.count, baseline.latest_round_id) == (0, None)
+
+    first = [
+        checkpoint,
+        *_round("new-1", [{"id": "new-c1", "name": "read_file", "args": {}}]),
+    ]
+    baseline = completed_tool_rounds_after(first, "old-round")
+    assert (baseline.count, baseline.latest_round_id) == (0, "new-1")
+
+    second = [
+        checkpoint,
+        *_round("new-1", [{"id": "new-c1", "name": "read_file", "args": {}}]),
+        *_round("new-2", [{"id": "new-c2", "name": "grep", "args": {}}]),
+    ]
+    delta = completed_tool_rounds_after(second, baseline.latest_round_id)
+    assert (delta.count, delta.latest_round_id) == (1, "new-2")
+
+    third = [
+        checkpoint,
+        *_round("new-1", [{"id": "new-c1", "name": "read_file", "args": {}}]),
+        *_round("new-2", [{"id": "new-c2", "name": "grep", "args": {}}]),
+        *_round("new-3", [{"id": "new-c3", "name": "ls", "args": {}}]),
+    ]
+    delta = completed_tool_rounds_after(third, delta.latest_round_id)
+    assert (delta.count, delta.latest_round_id) == (1, "new-3")
