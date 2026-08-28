@@ -579,6 +579,56 @@ def test_sync_and_async_model_wrappers_produce_equivalent_request_content():
     assert captured_sync[0].state == captured_async[0].state
 
 
+def test_sync_and_async_model_wrappers_preserve_structured_system_content_and_metadata():
+    middleware = TodoNavigationMiddleware(FeedbackSource())
+    reminder = "<todo_navigation_reminder>review</todo_navigation_reminder>"
+    structured_content = [
+        {"type": "text", "text": "base system"},
+        {"type": "image", "source": "opaque-system-context"},
+    ]
+    metadata = {
+        "additional_kwargs": {"cache_control": {"type": "ephemeral"}},
+        "response_metadata": {"trace_id": "trace-1"},
+        "name": "deepfix-system",
+        "id": "system-1",
+    }
+    sync_system = SystemMessage(content=list(structured_content), **metadata)
+    async_system = SystemMessage(content=list(structured_content), **metadata)
+    sync_request = model_request(reminder, system_message=sync_system)
+    async_request = model_request(reminder, system_message=async_system)
+    captured_sync: list[ModelRequest] = []
+    captured_async: list[ModelRequest] = []
+
+    middleware.wrap_model_call(
+        sync_request,
+        lambda candidate: captured_sync.append(candidate)
+        or ModelResponse(result=[AIMessage(content="sync")]),
+    )
+
+    async def handler(candidate: ModelRequest) -> ModelResponse:
+        captured_async.append(candidate)
+        return ModelResponse(result=[AIMessage(content="async")])
+
+    asyncio.run(middleware.awrap_model_call(async_request, handler))
+
+    expected_content = [
+        *structured_content,
+        {"type": "text", "text": f"\n\n{reminder}"},
+    ]
+    for original, updated in (
+        (sync_system, captured_sync[0].system_message),
+        (async_system, captured_async[0].system_message),
+    ):
+        assert updated is not None
+        assert updated is not original
+        assert updated.content == expected_content
+        assert updated.additional_kwargs == metadata["additional_kwargs"]
+        assert updated.response_metadata == metadata["response_metadata"]
+        assert updated.name == metadata["name"]
+        assert updated.id == metadata["id"]
+        assert original.content == structured_content
+
+
 def test_blank_task_id_returns_no_update_without_querying_feedback():
     source = FeedbackSource()
     middleware = TodoNavigationMiddleware(source)

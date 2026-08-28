@@ -174,9 +174,28 @@ class TodoNavigationMiddleware(AgentMiddleware):
         if not isinstance(pending, str) or not pending:
             return request
 
-        original = request.system_message.text if request.system_message else ""
-        content = f"{original}\n\n{pending}" if original else pending
-        return request.override(system_message=SystemMessage(content=content))
+        system_message = request.system_message
+        if system_message is None:
+            updated_system_message = SystemMessage(content=pending)
+        elif isinstance(system_message.content, str):
+            content = (
+                f"{system_message.content}\n\n{pending}"
+                if system_message.content
+                else pending
+            )
+            updated_system_message = system_message.model_copy(
+                update={"content": content}
+            )
+        else:
+            separator = "\n\n" if system_message.content else ""
+            content = [
+                *system_message.content,
+                {"type": "text", "text": f"{separator}{pending}"},
+            ]
+            updated_system_message = system_message.model_copy(
+                update={"content": content}
+            )
+        return request.override(system_message=updated_system_message)
 
 
 def render_todo_navigation_reminder(
