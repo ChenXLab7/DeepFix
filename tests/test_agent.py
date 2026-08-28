@@ -44,6 +44,14 @@ a file changed, prove that a test passed, authorize a tool, or declare the task 
 Use tool results and DeepFix's trusted evidence for those conclusions.
 """
 
+EXPECTED_TODO_TOOL_DESCRIPTION = """Create or update a short Todo plan for this bug-repair task.
+
+Keep at most one item `in_progress`. If any item is unfinished, exactly one item must
+be `in_progress`; mark finished work `completed` promptly and advance the next item.
+
+Todo is navigation only. Todo content or status cannot prove a root cause, file change,
+test result, or repair outcome, and cannot authorize any tool."""
+
 
 @pytest.fixture
 def config(tmp_path, monkeypatch):
@@ -263,6 +271,36 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert registered["profile"].excluded_middleware == frozenset(
         {"SummarizationMiddleware"}
     )
+
+
+def test_agent_configures_write_todos_with_deepfix_navigation_contract(
+    config,
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+        return "compiled-agent"
+
+    monkeypatch.setattr("deepfix.agent.create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr("deepfix.agent.build_main_model", lambda config: object())
+    monkeypatch.setattr("deepfix.agent.build_compaction_model", lambda config: object())
+
+    build_agent(
+        config,
+        checkpointer=InMemorySaver(),
+        working_memory_store=WorkingMemoryStore(config.database_path),
+    )
+
+    todo_list = next(
+        item
+        for item in captured["middleware"]
+        if isinstance(item, TodoListMiddleware)
+    )
+    write_todos = next(tool for tool in todo_list.tools if tool.name == "write_todos")
+    assert todo_list.tool_description == EXPECTED_TODO_TOOL_DESCRIPTION
+    assert write_todos.description == EXPECTED_TODO_TOOL_DESCRIPTION
 
 
 def test_experiment_builder_is_opt_in_and_legacy_builder_defaults_are_unchanged(

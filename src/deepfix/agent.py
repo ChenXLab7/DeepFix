@@ -60,7 +60,10 @@ from deepfix.memory import WorkingMemoryStore
 from deepfix.models import RepairOutcome
 from deepfix.navigation.feedback import LegacyNavigationFeedbackSource
 from deepfix.navigation.middleware import TodoNavigationMiddleware
-from deepfix.navigation.prompts import DEEPFIX_TODO_SYSTEM_PROMPT
+from deepfix.navigation.prompts import (
+    DEEPFIX_TODO_SYSTEM_PROMPT,
+    DEEPFIX_TODO_TOOL_DESCRIPTION,
+)
 from deepfix.operations import OperationJournalStore
 from deepfix.persistence import TaskRepository
 from deepfix.prompting import PromptPolicyMiddleware
@@ -260,7 +263,10 @@ def build_agent(
         ],
         middleware=[
             MessageIdentityMiddleware(),
-            TodoListMiddleware(system_prompt=DEEPFIX_TODO_SYSTEM_PROMPT),
+            TodoListMiddleware(
+                system_prompt=DEEPFIX_TODO_SYSTEM_PROMPT,
+                tool_description=DEEPFIX_TODO_TOOL_DESCRIPTION,
+            ),
             TodoNavigationMiddleware(navigation_feedback, reminder_rounds=3),
             LegacyContextMigrationMiddleware(
                 LegacyContextStores(tasks, working_memory_store, compaction),

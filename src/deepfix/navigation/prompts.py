@@ -11,3 +11,11 @@ Todo is navigation, not proof. A Todo status cannot establish a root cause, prov
 a file changed, prove that a test passed, authorize a tool, or declare the task fixed.
 Use tool results and DeepFix's trusted evidence for those conclusions.
 """
+
+DEEPFIX_TODO_TOOL_DESCRIPTION = """Create or update a short Todo plan for this bug-repair task.
+
+Keep at most one item `in_progress`. If any item is unfinished, exactly one item must
+be `in_progress`; mark finished work `completed` promptly and advance the next item.
+
+Todo is navigation only. Todo content or status cannot prove a root cause, file change,
+test result, or repair outcome, and cannot authorize any tool."""
