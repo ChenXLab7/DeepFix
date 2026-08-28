@@ -123,6 +123,28 @@ def test_tool_result_cannot_cross_next_tool_round_boundary():
     assert completed_tool_rounds_after(messages, None).count == 1
 
 
+def test_tool_result_cannot_cross_plain_ai_boundary():
+    messages = [
+        AIMessage(id="a1", content="", tool_calls=[{"id": "c1", "name": "read_file", "args": {}}]),
+        AIMessage(id="a2", content="explaining before result"),
+        ToolMessage(id="t1", content="late", tool_call_id="c1"),
+    ]
+    assert completed_tool_rounds_after(messages, None).count == 0
+
+
+def test_tool_result_cannot_cross_human_or_system_boundary():
+    for boundary in (
+        HumanMessage(id="u2", content="new request"),
+        SystemMessage(id="s2", content="context update"),
+    ):
+        messages = [
+            AIMessage(id="a1", content="", tool_calls=[{"id": "c1", "name": "read_file", "args": {}}]),
+            boundary,
+            ToolMessage(id="t1", content="late", tool_call_id="c1"),
+        ]
+        assert completed_tool_rounds_after(messages, None).count == 0
+
+
 def test_duplicate_ai_ids_are_ambiguous_and_ignored():
     messages = _round("same", [{"id": "c1", "name": "read_file", "args": {}}]) + _round(
         "same", [{"id": "c2", "name": "grep", "args": {}}]

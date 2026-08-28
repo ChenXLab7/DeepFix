@@ -9,8 +9,6 @@ from dataclasses import dataclass
 from langchain_core.messages import (
     AIMessage,
     AnyMessage,
-    HumanMessage,
-    RemoveMessage,
     SystemMessage,
     ToolMessage,
 )
@@ -117,9 +115,9 @@ def _next_round_boundary(messages: Sequence[AnyMessage], start: int) -> int:
 
 
 def _is_round_boundary(message: AnyMessage) -> bool:
-    return isinstance(message, (HumanMessage, RemoveMessage)) or (
-        isinstance(message, AIMessage) and bool(message.tool_calls)
-    ) or _is_checkpoint(message)
+    """End an AI tool-result block at every intervening non-tool message."""
+
+    return not isinstance(message, ToolMessage)
 
 
 def _is_checkpoint(message: AnyMessage) -> bool:
