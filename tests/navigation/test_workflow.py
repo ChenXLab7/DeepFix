@@ -2,17 +2,20 @@ from __future__ import annotations
 
 from typing import Any
 
+from compaction.test_long_context_workflow import _LongBugWorkflow
 from langchain.agents import create_agent
 from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
 from pydantic import Field
 
 from deepfix.compaction.middleware import MessageIdentityMiddleware
 from deepfix.navigation.feedback import NavigationFeedback
 from deepfix.navigation.middleware import TodoNavigationMiddleware
+from deepfix.navigation.models import TodoNavigationState
 from deepfix.navigation.prompts import DEEPFIX_TODO_SYSTEM_PROMPT
 
 TODOS = [
@@ -169,4 +172,104 @@ def test_todo_navigation_survives_checkpoint_resume_and_parallel_tool_rounds():
     assert sum(
         prompt.count("<todo_navigation_reminder>")
         for prompt in model.captured_system_prompts
+    ) == 1
+
+
+def test_post_compaction_cursor_rebase_counts_three_new_rounds_without_delay(
+    tmp_path,
+):
+    compacted = _LongBugWorkflow(tmp_path).run()
+    snapshot_message = compacted.final_snapshot_message
+    assert "_deepfix_snapshot_version" in snapshot_message.additional_kwargs
+
+    model = _ScriptedChatModel(
+        responses=[
+            AIMessage(
+                id="new-1",
+                content="",
+                tool_calls=[
+                    _call("read_file", "new-call-1", {"file_path": "src/value.py"})
+                ],
+            ),
+            AIMessage(id="stop-1", content="First new round complete."),
+            AIMessage(
+                id="new-2",
+                content="",
+                tool_calls=[_call("grep", "new-call-2", {"pattern": "normalize"})],
+            ),
+            AIMessage(id="stop-2", content="Second new round complete."),
+            AIMessage(
+                id="new-3",
+                content="",
+                tool_calls=[
+                    _call("read_file", "new-call-3", {"file_path": "tests/test_value.py"})
+                ],
+            ),
+            AIMessage(id="stop-3", content="Third new round complete."),
+        ]
+    )
+    checkpointer = InMemorySaver()
+    config = {"configurable": {"thread_id": "workflow-task"}}
+    seed_builder = StateGraph(TodoNavigationState)
+    seed_builder.add_node("checkpoint", lambda state: {})
+    seed_builder.add_edge(START, "checkpoint")
+    seed_builder.add_edge("checkpoint", END)
+    seed_graph = seed_builder.compile(checkpointer=checkpointer)
+    seed_graph.invoke(
+        {
+            "messages": [snapshot_message],
+            "todos": TODOS,
+            "_deepfix_todo_rounds_since_update": 0,
+            "_deepfix_last_completed_tool_round_id": "old-round-not-retained",
+            "_deepfix_last_todo_progress_fingerprint": (
+                "5f78ef6c5f272dfec1a91db55cc9a57d00166a64d93dc5e76a9af9a94efa2af1"
+            ),
+            "_deepfix_last_navigation_hint_fingerprint": None,
+            "_deepfix_pending_navigation_reminder": None,
+        },
+        config,
+    )
+    seeded = seed_graph.get_state(config).values
+    assert seeded["todos"] == TODOS
+    assert seeded["_deepfix_todo_rounds_since_update"] == 0
+    assert seeded["_deepfix_last_completed_tool_round_id"] == (
+        "old-round-not-retained"
+    )
+    assert seeded["messages"] == [snapshot_message]
+    agent = _agent(model, checkpointer)
+
+    agent.invoke(
+        {"messages": [HumanMessage(id="resume-1", content="Run new round one.")]},
+        config,
+    )
+    after_new_1 = agent.get_state(config).values
+    agent.invoke(
+        {"messages": [HumanMessage(id="resume-2", content="Run new round two.")]},
+        config,
+    )
+    after_new_2 = agent.get_state(config).values
+    agent.invoke(
+        {"messages": [HumanMessage(id="resume-3", content="Run new round three.")]},
+        config,
+    )
+    after_new_3 = agent.get_state(config).values
+
+    assert after_new_1["_deepfix_todo_rounds_since_update"] == 1, after_new_1
+    assert after_new_1["_deepfix_last_completed_tool_round_id"] == "new-1"
+    assert after_new_1["_deepfix_pending_navigation_reminder"] is None
+    assert after_new_2["_deepfix_todo_rounds_since_update"] == 2
+    assert after_new_2["_deepfix_last_completed_tool_round_id"] == "new-2"
+    assert after_new_2["_deepfix_pending_navigation_reminder"] is None
+    assert after_new_3["_deepfix_todo_rounds_since_update"] == 0
+    assert after_new_3["_deepfix_last_completed_tool_round_id"] == "new-3"
+    assert "<todo_navigation_reminder>" in after_new_3[
+        "_deepfix_pending_navigation_reminder"
+    ]
+    assert len(model.captured_system_prompts) == 6
+    assert all(
+        "<todo_navigation_reminder>" not in prompt
+        for prompt in model.captured_system_prompts[:-1]
+    )
+    assert model.captured_system_prompts[-1].count(
+        "<todo_navigation_reminder>"
     ) == 1

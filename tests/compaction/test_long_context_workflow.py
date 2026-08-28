@@ -185,6 +185,7 @@ class _WorkflowResult:
     conversation_artifact_text: str
     restored_navigation_state: dict[str, object]
     compaction_navigation_inputs: list[dict[str, object]]
+    final_snapshot_message: SystemMessage
 
 
 class _LongBugWorkflow:
@@ -320,6 +321,7 @@ class _LongBugWorkflow:
         navigation_checkpointer = InMemorySaver()
         navigation_config = {"configurable": {"thread_id": task.task_id}}
         navigation_graph_builder = StateGraph(_CompactionNavigationState)
+        compaction_model_inputs: list[list[object]] = []
 
         def force_compaction(state):
             runtime = Runtime(
@@ -343,9 +345,10 @@ class _LongBugWorkflow:
             )
             response = compaction_middleware.wrap_model_call(
                 request,
-                lambda compacted: ModelResponse(
-                    result=[AIMessage(content="continue")]
-                ),
+                lambda compacted: compaction_model_inputs.append(
+                    list(compacted.messages)
+                )
+                or ModelResponse(result=[AIMessage(content="continue")]),
             )
             command_update = getattr(response, "command", None)
             failures = snapshots.list_failures(task.task_id)
@@ -483,6 +486,12 @@ class _LongBugWorkflow:
             conversation_artifact_text=history,
             restored_navigation_state=restored_navigation_state,
             compaction_navigation_inputs=compaction_middleware.navigation_inputs,
+            final_snapshot_message=next(
+                message
+                for message in compaction_model_inputs[-1]
+                if isinstance(message, SystemMessage)
+                and "_deepfix_snapshot_version" in message.additional_kwargs
+            ),
         )
 
 
