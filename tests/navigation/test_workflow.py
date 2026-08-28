@@ -120,7 +120,18 @@ def test_todo_navigation_survives_checkpoint_resume_and_parallel_tool_rounds():
         {"messages": [HumanMessage(id="user-1", content="Fix the failure.")]},
         config,
     )
+    checkpoint_before_resume = _agent(model, checkpointer).get_state(config).values
     assert first["todos"] == TODOS
+    assert checkpoint_before_resume["todos"] == TODOS
+    assert checkpoint_before_resume["_deepfix_todo_rounds_since_update"] == 2
+    assert checkpoint_before_resume["_deepfix_last_completed_tool_round_id"] == (
+        "second-investigation-round"
+    )
+    assert checkpoint_before_resume[
+        "_deepfix_last_todo_progress_fingerprint"
+    ] == "5f78ef6c5f272dfec1a91db55cc9a57d00166a64d93dc5e76a9af9a94efa2af1"
+    assert checkpoint_before_resume["_deepfix_last_navigation_hint_fingerprint"] is None
+    assert checkpoint_before_resume["_deepfix_pending_navigation_reminder"] is None
 
     captured_before_resume = len(model.captured_system_prompts)
     resumed_agent = _agent(model, checkpointer)
@@ -130,7 +141,7 @@ def test_todo_navigation_survives_checkpoint_resume_and_parallel_tool_rounds():
     )
 
     captured_after_resume = model.captured_system_prompts[captured_before_resume:]
-    captured_system_prompt = captured_after_resume[-1]
+    captured_system_prompt = model.captured_system_prompts[-1]
     checkpoint_state = resumed_agent.get_state(config).values
 
     assert result["todos"] == TODOS
@@ -139,7 +150,23 @@ def test_todo_navigation_survives_checkpoint_resume_and_parallel_tool_rounds():
         "third-investigation-round"
     )
     assert checkpoint_state["_deepfix_todo_rounds_since_update"] == 0
+    assert checkpoint_state[
+        "_deepfix_last_todo_progress_fingerprint"
+    ] == checkpoint_before_resume["_deepfix_last_todo_progress_fingerprint"]
+    assert checkpoint_state["_deepfix_last_navigation_hint_fingerprint"] is None
+    assert "<todo_navigation_reminder>" in checkpoint_state[
+        "_deepfix_pending_navigation_reminder"
+    ]
     assert len(captured_after_resume) == 2
     assert "<todo_navigation_reminder>" not in captured_after_resume[0]
     assert "<todo_navigation_reminder>" in captured_system_prompt
     assert captured_system_prompt.count("<todo_navigation_reminder>") == 1
+    assert len(model.captured_system_prompts) == 6
+    assert all(
+        "<todo_navigation_reminder>" not in prompt
+        for prompt in model.captured_system_prompts[:-1]
+    )
+    assert sum(
+        prompt.count("<todo_navigation_reminder>")
+        for prompt in model.captured_system_prompts
+    ) == 1

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -10,9 +10,16 @@ from deepagents.backends import FilesystemBackend, LocalShellBackend
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain_core.exceptions import ContextOverflowError
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import ExecutionInfo, Runtime
 from pydantic import SecretStr
 
@@ -22,7 +29,10 @@ from deepfix.compaction.budget import ContextBudgetReport
 from deepfix.compaction.coordinator import CompactionCoordinator, CompactionRequest
 from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.identity import stable_work_unit_id
-from deepfix.compaction.middleware import DeepFixCompactionMiddleware
+from deepfix.compaction.middleware import (
+    DeepFixCompactionMiddleware,
+    DeepFixCompactionState,
+)
 from deepfix.compaction.models import (
     CompactionDelta,
     DeepFixCompactionEvent,
@@ -46,7 +56,11 @@ from deepfix.models import ApprovalRecord, TaskState, TaskStatus
 from deepfix.models import TestResult as RepairTestResult
 from deepfix.navigation.models import TodoNavigationState
 from deepfix.persistence import TaskRepository
-from deepfix.protected_context import ProtectedContext, render_protected_context
+from deepfix.protected_context import (
+    ProtectedContext,
+    ProtectedContextBuilder,
+    render_protected_context,
+)
 from deepfix.research.store import ResearchEvidenceStore
 from deepfix.service import BugfixService
 
@@ -101,6 +115,63 @@ def _scoped(task_id: str, messages):
     ]
 
 
+_NAVIGATION_STATE = {
+    "todos": [
+        {"content": "reproduce failure", "status": "completed"},
+        {"content": "identify root cause", "status": "in_progress"},
+        {"content": "apply minimal fix", "status": "pending"},
+        {"content": "run required verification", "status": "pending"},
+    ],
+    "_deepfix_todo_rounds_since_update": 2,
+    "_deepfix_last_completed_tool_round_id": "m-read",
+    "_deepfix_last_todo_progress_fingerprint": "todo-progress-fingerprint",
+    "_deepfix_last_navigation_hint_fingerprint": "milestone-fingerprint",
+    "_deepfix_pending_navigation_reminder": "request-local reminder",
+}
+
+
+class _CompactionNavigationState(TodoNavigationState, DeepFixCompactionState):
+    pass
+
+
+class _ForcedCompactionBudget:
+    def measure(self, request, blocks):
+        return _budget("normal_compaction", 0.85)
+
+
+class _RecordingCompactionMiddleware(DeepFixCompactionMiddleware):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.navigation_inputs: list[dict[str, object]] = []
+
+    def wrap_model_call(self, request, handler):
+        self.navigation_inputs.append(
+            {key: request.state.get(key) for key in _NAVIGATION_STATE}
+        )
+        return super().wrap_model_call(request, handler)
+
+
+class _ConstraintProtectedBuilder:
+    def __init__(self, delegate: ProtectedContextBuilder, constraint: str) -> None:
+        self.delegate = delegate
+        self.constraint = constraint
+
+    def build(self, task_id, messages, event):
+        context = self.delegate.build(task_id, messages, event)
+        anchor = context.task_anchor.model_copy(
+            update={
+                "user_constraints": [
+                    UserConstraint(
+                        constraint_id="constraint-public-api",
+                        text=self.constraint,
+                        source_user_message_id="m-user",
+                    )
+                ]
+            }
+        )
+        return replace(context, task_anchor=anchor)
+
+
 @dataclass
 class _WorkflowResult:
     task: TaskState
@@ -113,6 +184,7 @@ class _WorkflowResult:
     target_project_has_no_deepfix_artifacts: bool
     conversation_artifact_text: str
     restored_navigation_state: dict[str, object]
+    compaction_navigation_inputs: list[dict[str, object]]
 
 
 class _LongBugWorkflow:
@@ -124,6 +196,7 @@ class _LongBugWorkflow:
 
     def run(self) -> _WorkflowResult:
         database = self.state / "deepfix.sqlite3"
+        constraint = "只修复符号归一化，不得修改公开 API"
         tasks = TaskRepository(database)
         memory = WorkingMemoryStore(database)
         snapshots = CompactionStore(database)
@@ -148,7 +221,6 @@ class _LongBugWorkflow:
         failed = project_backend.execute(command)
         assert failed.exit_code == 1
 
-        constraint = "只修复符号归一化，不得修改公开 API"
         task = TaskState.create(self.project, constraint, ApprovalMode.MANUAL)
         task.transition_to(TaskStatus.INVESTIGATING)
         tasks.save(task)
@@ -237,45 +309,75 @@ class _LongBugWorkflow:
         collector = EvidenceCollector(snapshots, research)
         events = []
         active_snapshot = None
+        compaction_middleware = _RecordingCompactionMiddleware(
+            _ConstraintProtectedBuilder(
+                ProtectedContextBuilder(tasks, memory, snapshots, research, collector),
+                constraint,
+            ),
+            _ForcedCompactionBudget(),
+            coordinator,
+        )
+        navigation_checkpointer = InMemorySaver()
+        navigation_config = {"configurable": {"thread_id": task.task_id}}
+        navigation_graph_builder = StateGraph(_CompactionNavigationState)
+
+        def force_compaction(state):
+            runtime = Runtime(
+                execution_info=ExecutionInfo(
+                    checkpoint_id="workflow-checkpoint",
+                    checkpoint_ns="",
+                    task_id="compaction-model",
+                    thread_id=task.task_id,
+                )
+            )
+            request = ModelRequest(
+                model=FakeListChatModel(
+                    responses=["continue"],
+                    profile={"max_input_tokens": 100},
+                ),
+                messages=list(state["messages"]),
+                system_message=SystemMessage(content="repair"),
+                tools=[],
+                state=state,
+                runtime=runtime,
+            )
+            response = compaction_middleware.wrap_model_call(
+                request,
+                lambda compacted: ModelResponse(
+                    result=[AIMessage(content="continue")]
+                ),
+            )
+            command_update = getattr(response, "command", None)
+            failures = snapshots.list_failures(task.task_id)
+            assert command_update is not None, [
+                (failure.stage, failure.error_code) for failure in failures
+            ]
+            return command_update.update
+
+        navigation_graph_builder.add_node("compact", force_compaction)
+        navigation_graph_builder.add_edge(START, "compact")
+        navigation_graph_builder.add_edge("compact", END)
+        navigation_graph = navigation_graph_builder.compile(
+            checkpointer=navigation_checkpointer
+        )
+        restored_navigation_state: dict[str, object] = {}
 
         def compact(current_messages):
-            nonlocal active_snapshot
-            evidence = collector.collect(task.task_id, current_messages, task)
-            anchor = TaskAnchor(
-                task_id=task.task_id,
-                task_goal=constraint,
-                user_constraints=[
-                    UserConstraint(
-                        constraint_id="constraint-public-api",
-                        text=constraint,
-                        source_user_message_id="m-user",
-                    )
+            nonlocal active_snapshot, restored_navigation_state
+            graph_input: dict[str, object] = {
+                "messages": [
+                    RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                    *current_messages,
                 ],
-                latest_user_message_id="m-user",
-                project_root=str(self.project),
-                project_python=sys.executable,
-                task_status=task.status.value,
-            )
-            protected = ProtectedContext(
-                anchor,
-                memory.latest(task.task_id),
-                evidence,
-                active_snapshot,
-            )
-            result = coordinator.invoke_automatic(
-                CompactionRequest(
-                    task_id=task.task_id,
-                    entrypoint="automatic",
-                    messages=tuple(current_messages),
-                    active_event=events[-1] if events else None,
-                    protected_context=protected,
-                    budget=_budget("normal_compaction", 0.85),
-                    model=object(),
-                ),
-                lambda compacted: ModelResponse(result=[AIMessage(content="继续")]),
+            }
+            if not events:
+                graph_input.update(_NAVIGATION_STATE)
+            navigation_graph.invoke(graph_input, navigation_config)
+            restored_navigation_state = dict(
+                navigation_graph.get_state(navigation_config).values
             )
             event = DeepFixCompactionEvent.model_validate(
-                result.command.update["_deepfix_compaction_event"]
+                restored_navigation_state["_deepfix_compaction_event"]
             )
             active_snapshot = snapshots.activate_from_event(task.task_id, event)
             events.append(event)
@@ -350,35 +452,6 @@ class _LongBugWorkflow:
             active_snapshot,
         )
         history = artifact_adapter.read_verified(events[-1].conversation_artifact.path)
-        navigation_checkpointer = InMemorySaver()
-        navigation_graph_builder = StateGraph(TodoNavigationState)
-        navigation_graph_builder.add_node("checkpoint", lambda state: {})
-        navigation_graph_builder.add_edge(START, "checkpoint")
-        navigation_graph_builder.add_edge("checkpoint", END)
-        navigation_graph = navigation_graph_builder.compile(
-            checkpointer=navigation_checkpointer
-        )
-        navigation_config = {"configurable": {"thread_id": task.task_id}}
-        navigation_graph.invoke(
-            {
-                "messages": [HumanMessage(id="navigation-user", content=constraint)],
-                "todos": [
-                    {"content": "reproduce failure", "status": "completed"},
-                    {"content": "identify root cause", "status": "in_progress"},
-                    {"content": "apply minimal fix", "status": "pending"},
-                    {"content": "run required verification", "status": "pending"},
-                ],
-                "_deepfix_todo_rounds_since_update": 2,
-                "_deepfix_last_completed_tool_round_id": "m-edit-call",
-                "_deepfix_last_todo_progress_fingerprint": "todo-progress-fingerprint",
-                "_deepfix_last_navigation_hint_fingerprint": "milestone-fingerprint",
-                "_deepfix_pending_navigation_reminder": "request-local reminder",
-            },
-            navigation_config,
-        )
-        restored_navigation_state = dict(
-            navigation_graph.get_state(navigation_config).values
-        )
         scoped_partition = partition_work_units(_scoped(task.task_id, messages), set())
         units = {unit.unit_id: unit for unit in scoped_partition.units}
         compressed_ids = {
@@ -400,6 +473,7 @@ class _LongBugWorkflow:
             history_contains_all_compressed_message_ids=all(
                 message_id in history
                 for unit_id in compressed_ids
+                if unit_id in units
                 for message_id in units[unit_id].message_ids
             ),
             no_work_unit_was_split=no_split,
@@ -408,6 +482,7 @@ class _LongBugWorkflow:
             ),
             conversation_artifact_text=history,
             restored_navigation_state=restored_navigation_state,
+            compaction_navigation_inputs=compaction_middleware.navigation_inputs,
         )
 
 
@@ -425,25 +500,10 @@ def test_long_bugfix_preserves_evidence_across_three_compactions(workflow):
     assert result.no_work_unit_was_split
     assert result.target_project_has_no_deepfix_artifacts
     assert result.task.status is TaskStatus.COMPLETED
-    expected_todos = [
-        {"content": "reproduce failure", "status": "completed"},
-        {"content": "identify root cause", "status": "in_progress"},
-        {"content": "apply minimal fix", "status": "pending"},
-        {"content": "run required verification", "status": "pending"},
-    ]
-    assert result.restored_navigation_state["todos"] == expected_todos
-    assert result.restored_navigation_state["_deepfix_todo_rounds_since_update"] == 2
-    assert result.restored_navigation_state[
-        "_deepfix_last_todo_progress_fingerprint"
-    ] == "todo-progress-fingerprint"
-    assert result.restored_navigation_state[
-        "_deepfix_pending_navigation_reminder"
-    ] == "request-local reminder"
-    for forbidden in (
-        "_deepfix_todo_rounds_since_update",
-        "_deepfix_last_todo_progress_fingerprint",
-        "_deepfix_pending_navigation_reminder",
-    ):
+    assert result.compaction_navigation_inputs == [_NAVIGATION_STATE] * 3
+    for field, value in _NAVIGATION_STATE.items():
+        assert result.restored_navigation_state[field] == value
+    for forbidden in _NAVIGATION_STATE:
         assert forbidden not in result.final_snapshot.model_dump_json()
         assert forbidden not in result.conversation_artifact_text
 

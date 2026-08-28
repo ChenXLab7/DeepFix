@@ -768,14 +768,31 @@ def test_offline_report_path_keeps_todo_navigation_in_graph_state_only(app_confi
         {"content": "apply minimal fix", "status": "pending"},
         {"content": "run required verification", "status": "pending"},
     ]
+    private_navigation_state = {
+        "_deepfix_todo_rounds_since_update": 2,
+        "_deepfix_last_completed_tool_round_id": "verification-round",
+        "_deepfix_last_todo_progress_fingerprint": "todo-fingerprint",
+        "_deepfix_last_navigation_hint_fingerprint": "oracle-milestone",
+        "_deepfix_pending_navigation_reminder": "request-local reminder",
+    }
     graph_result = passing_outcome()
-    graph_result.update(
-        {
-            "todos": todos,
-            "_deepfix_todo_rounds_since_update": 2,
-            "_deepfix_last_todo_progress_fingerprint": "todo-fingerprint",
-            "_deepfix_pending_navigation_reminder": "request-local reminder",
-        }
+    graph_result.update({"todos": todos, **private_navigation_state})
+    graph_result["messages"] = [
+        message.model_copy(
+            update={
+                "additional_kwargs": {
+                    **message.additional_kwargs,
+                    "todos": todos,
+                    **private_navigation_state,
+                }
+            },
+            deep=True,
+        )
+        for message in graph_result["messages"]
+    ]
+    navigation_bearing_messages = json.dumps(
+        [message.model_dump(mode="json") for message in graph_result["messages"]],
+        ensure_ascii=False,
     )
     service, _ = make_service(app_config, FakeAgent(graph_result))
 
@@ -794,13 +811,12 @@ def test_offline_report_path_keeps_todo_navigation_in_graph_state_only(app_confi
 
     assert graph_result["todos"] == todos
     assert "todos" not in task_payload
-    for forbidden in (
-        "_deepfix_todo_rounds_since_update",
-        "_deepfix_last_todo_progress_fingerprint",
-        "_deepfix_pending_navigation_reminder",
-    ):
+    assert "todos" in navigation_bearing_messages
+    for forbidden in private_navigation_state:
+        assert forbidden in navigation_bearing_messages
         assert all(forbidden not in text for text in boundary_texts)
     for todo in todos:
+        assert todo["content"] in navigation_bearing_messages
         assert all(todo["content"] not in text for text in boundary_texts)
 
 
