@@ -73,14 +73,30 @@ class LegacyNavigationFeedbackSource:
         )
         tests = [item for item in evidence if isinstance(item, SystemTestEvidence)]
         evaluation = evaluate_required_oracles(policy, tests) if policy is not None else None
+        latest_successful_change = max(
+            (
+                index
+                for index, item in enumerate(evidence)
+                if isinstance(item, FileChangeEvidence) and item.status == "succeeded"
+            ),
+            default=None,
+        )
+        current_verification = evaluation is not None and evaluation.fixed_allowed and (
+            latest_successful_change is None
+            or _required_oracles_verified_after(
+                policy,
+                evidence,
+                latest_successful_change,
+            )
+        )
 
-        if successful_paths and not (evaluation and evaluation.fixed_allowed):
+        if successful_paths and not current_verification:
             milestones["verification-pending"] = (
                 "Changed files: "
                 + ", ".join(successful_paths)
                 + "; required verification is pending."
             )
-        if evaluation is not None and evaluation.fixed_allowed:
+        if current_verification:
             passed_ids = ", ".join(sorted(evaluation.passed_required_oracle_ids))
             milestones["required-oracles-satisfied"] = (
                 f"Required oracles satisfied: {passed_ids}."
@@ -121,6 +137,33 @@ def _has_matching_user_baseline_pass(
         if matching and all(item.exit_code == oracle.expected_exit_code for item in matching):
             return True
     return False
+
+
+def _required_oracles_verified_after(
+    policy: VerificationPolicy,
+    evidence: list[object],
+    latest_successful_change: int,
+) -> bool:
+    """Require every oracle's expected result after the latest successful change."""
+
+    for oracle in policy.required_oracles:
+        if not any(
+            isinstance(item, SystemTestEvidence)
+            and index > latest_successful_change
+            and item.exit_code == oracle.expected_exit_code
+            and _normalize_command(item.command) == _normalize_command(oracle.command)
+            and _timing_satisfies(item.timing, oracle.required_timing)
+            for index, item in enumerate(evidence)
+        ):
+            return False
+    return bool(policy.required_oracles)
+
+
+def _timing_satisfies(actual: str, required: str) -> bool:
+    return actual == "baseline" if required == "baseline" else actual in {
+        "post_change",
+        "post_recovery",
+    }
 
 
 def _normalize_command(command: str) -> str:

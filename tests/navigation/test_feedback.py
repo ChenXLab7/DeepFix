@@ -185,6 +185,34 @@ def test_satisfied_required_post_change_oracles_are_reported_without_pending(tmp
     assert "Required oracles satisfied: oracle-a, oracle-b." in feedback.lines
 
 
+def test_later_successful_change_makes_historical_oracle_pass_stale(tmp_path):
+    stores = _stores(tmp_path)
+    stores.verification.save(_policy(_oracle()))
+    stores.evidence.save_evidence("task-a", _successful_change("first.py"))
+    stores.evidence.save_evidence("task-a", _test_evidence("first-pass"))
+    stores.evidence.save_evidence("task-a", _successful_change("later.py"))
+
+    feedback = stores.source.build("task-a")
+
+    assert "verification-pending" in feedback.milestone_ids
+    assert "required-oracles-satisfied" not in feedback.milestone_ids
+    assert "Changed files: first.py, later.py; required verification is pending." in feedback.lines
+
+
+def test_required_oracle_pass_after_latest_change_is_current(tmp_path):
+    stores = _stores(tmp_path)
+    stores.verification.save(_policy(_oracle()))
+    stores.evidence.save_evidence("task-a", _successful_change("first.py"))
+    stores.evidence.save_evidence("task-a", _test_evidence("first-pass"))
+    stores.evidence.save_evidence("task-a", _successful_change("later.py"))
+    stores.evidence.save_evidence("task-a", _test_evidence("current-pass"))
+
+    feedback = stores.source.build("task-a")
+
+    assert "required-oracles-satisfied" in feedback.milestone_ids
+    assert "verification-pending" not in feedback.milestone_ids
+
+
 def test_unavailable_failed_or_conflicting_oracles_do_not_claim_satisfaction(tmp_path):
     stores = _stores(tmp_path)
     stores.verification.save(
