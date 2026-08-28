@@ -93,7 +93,7 @@ def completed_tool_rounds_after(
     if history_replaced:
         cursor_round_id = None
     if history_replaced:
-        return ToolRoundDelta(0, latest_round_id)
+        return ToolRoundDelta(len(complete_round_ids), latest_round_id)
     if cursor_round_id is None:
         return ToolRoundDelta(len(complete_round_ids), latest_round_id)
     if cursor_round_id not in complete_round_ids:

@@ -183,7 +183,7 @@ def test_checkpoint_boundary_rebaselines_cursor_before_new_rounds():
         *_round("new-1", [{"id": "new-c1", "name": "read_file", "args": {}}]),
     ]
     baseline = completed_tool_rounds_after(first, "old-round")
-    assert (baseline.count, baseline.latest_round_id) == (0, "new-1")
+    assert (baseline.count, baseline.latest_round_id) == (1, "new-1")
 
     second = [
         checkpoint,
