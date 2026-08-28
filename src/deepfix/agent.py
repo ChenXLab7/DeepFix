@@ -8,6 +8,7 @@ from deepagents.profiles.harness import (
     HarnessProfile,
     register_harness_profile,
 )
+from langchain.agents.middleware import TodoListMiddleware
 from langchain_deepseek import ChatDeepSeek
 
 from deepfix.approval import merge_interrupt_on
@@ -57,6 +58,9 @@ from deepfix.investigation.tools import (
 )
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import RepairOutcome
+from deepfix.navigation.feedback import LegacyNavigationFeedbackSource
+from deepfix.navigation.middleware import TodoNavigationMiddleware
+from deepfix.navigation.prompts import DEEPFIX_TODO_SYSTEM_PROMPT
 from deepfix.operations import OperationJournalStore
 from deepfix.persistence import TaskRepository
 from deepfix.prompting import PromptPolicyMiddleware
@@ -66,6 +70,7 @@ from deepfix.protected_context import (
     ProtectedContextMiddleware,
 )
 from deepfix.research.store import ResearchEvidenceStore
+from deepfix.verification import VerificationPolicyStore
 
 
 def _build_deepseek_model(role: ModelRoleConfig) -> ChatDeepSeek:
@@ -101,6 +106,7 @@ def build_agent(
     investigation: InvestigationCoordinator | None = None,
     extensions: AgentExtensions | None = None,
     research_evidence_store: ResearchEvidenceStore | None = None,
+    verification_policy_store: VerificationPolicyStore | None = None,
     *,
     allowed_skill_roots: tuple[str | Path, ...] = (),
     backend=None,
@@ -137,6 +143,14 @@ def build_agent(
         tasks=tasks,
         compaction_store=compaction,
         evidence_collector=evidence_collector,
+    )
+    policy_store = verification_policy_store or VerificationPolicyStore(
+        config.database_path
+    )
+    navigation_feedback = LegacyNavigationFeedbackSource(
+        investigation_store,
+        compaction,
+        policy_store,
     )
     protected_builder = ProtectedContextBuilder(
         tasks,
@@ -190,6 +204,7 @@ def build_agent(
         "continue_investigation",
         "search_diagnostic_artifacts",
         "read_diagnostic_artifact",
+        "write_todos",
     }
     resolved = merge_extensions(
         extensions or AgentExtensions(),
@@ -211,6 +226,7 @@ def build_agent(
         "continue_investigation": InvestigationCapability.META,
         "search_diagnostic_artifacts": InvestigationCapability.READ,
         "read_diagnostic_artifact": InvestigationCapability.READ,
+        "write_todos": InvestigationCapability.META,
         **{
             item.tool.name: item.investigation_capability
             for item in resolved.tools
@@ -244,6 +260,8 @@ def build_agent(
         ],
         middleware=[
             MessageIdentityMiddleware(),
+            TodoListMiddleware(system_prompt=DEEPFIX_TODO_SYSTEM_PROMPT),
+            TodoNavigationMiddleware(navigation_feedback, reminder_rounds=3),
             LegacyContextMigrationMiddleware(
                 LegacyContextStores(tasks, working_memory_store, compaction),
                 DeepAgentsArtifactAdapter(resolved_backend),

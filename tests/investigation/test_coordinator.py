@@ -8,6 +8,7 @@ from langchain_core.messages import ToolMessage
 from deepfix.investigation.errors import InvestigationStateError
 from deepfix.investigation.models import (
     AgentPhase,
+    InvestigationCapability,
     RecordHypothesisInput,
     ToolObservation,
 )
@@ -692,6 +693,38 @@ def test_six_distinct_artifact_searches_trigger_existing_stagnation_gate(tmp_pat
     assert state.progress_generation == 0
     assert state.stagnation_level == 1
     assert state.reevaluation_required is True
+
+
+def test_write_todos_remains_available_during_stagnation(tmp_path):
+    coordinator = coordinator_fixture(tmp_path)
+    state = coordinator.state("task-a").model_copy(update={"stagnation_level": 1})
+
+    allowed = coordinator.allowed_tool_names(
+        state,
+        {
+            "write_todos": InvestigationCapability.META,
+            "read_file": InvestigationCapability.READ,
+        },
+    )
+
+    assert "write_todos" in allowed
+
+
+def test_write_todos_is_authorized_during_stagnation(tmp_path, monkeypatch):
+    coordinator = coordinator_fixture(tmp_path)
+    stagnated = coordinator.state("task-a").model_copy(
+        update={"stagnation_level": 1}
+    )
+    monkeypatch.setattr(coordinator, "state", lambda task_id: stagnated)
+
+    authorization = coordinator.authorize_tool(
+        "task-a",
+        "write_todos",
+        {"todos": []},
+        tool_call_id="todo-call-1",
+    )
+
+    assert authorization.allowed is True
 
 
 def test_error_artifact_tool_message_is_not_recorded_as_successful_retrieval(tmp_path):

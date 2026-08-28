@@ -185,6 +185,7 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
         extensions=None,
         research_evidence_store=None,
         investigation=None,
+        verification_policy_store=None,
         backend=None,
     ):
         captures["agent_store"] = working_memory_store
@@ -194,6 +195,7 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
         captures["agent_compaction_store"] = compaction_store
         captures["agent_backend"] = backend
         captures["agent_investigation"] = investigation
+        captures["agent_verification_policy_store"] = verification_policy_store
         return object()
 
     class FakeService:
@@ -214,6 +216,9 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
             captures["service_compaction_store"] = compaction_store
             captures["service_repository"] = repository
             captures["service_investigation"] = investigation
+            captures["service_verification_policy_store"] = kwargs[
+                "verification_policy_store"
+            ]
             captures["service_execution_backend"] = kwargs["execution_backend"]
             self.config = config
 
@@ -242,6 +247,10 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
     assert captures["agent_repository"] is captures["service_repository"]
     assert captures["agent_compaction_store"] is captures["service_compaction_store"]
     assert captures["agent_investigation"] is captures["service_investigation"]
+    assert (
+        captures["agent_verification_policy_store"]
+        is captures["service_verification_policy_store"]
+    )
     assert captures["agent_backend"] is not None
     assert {item.tool.name for item in captures["extensions"].tools} == {
         "inspect_dependency",

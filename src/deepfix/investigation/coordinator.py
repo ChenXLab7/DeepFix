@@ -123,7 +123,7 @@ _PHASE_CAPABILITIES: dict[AgentPhase, frozenset[InvestigationCapability]] = {
     ),
 }
 _REEVALUATION_TOOL_NAMES = frozenset(
-    {"record_hypothesis", "continue_investigation", "save_progress"}
+    {"record_hypothesis", "continue_investigation", "save_progress", "write_todos"}
 )
 _DIAGNOSTIC_RESULT_EVENTS = {
     (
@@ -929,11 +929,7 @@ class InvestigationCoordinator:
             and not state.reevaluation_required
         ):
             return ToolAuthorization(allowed=True)
-        if normalized_tool in {
-            "record_hypothesis",
-            "continue_investigation",
-            "save_progress",
-        }:
+        if normalized_tool in _REEVALUATION_TOOL_NAMES:
             return ToolAuthorization(allowed=True)
         permit = state.permit
         target = _target_from_arguments(normalized_tool, arguments)

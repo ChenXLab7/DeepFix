@@ -210,6 +210,7 @@ def main(
                 extensions=extensions,
                 research_evidence_store=research_evidence_store,
                 investigation=investigation,
+                verification_policy_store=verification_policy_store,
                 backend=artifact_backend,
             )
             service = BugfixService(
