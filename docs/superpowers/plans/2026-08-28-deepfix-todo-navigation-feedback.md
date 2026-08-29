@@ -6,6 +6,8 @@
 
 **Architecture:** Reuse LangChain `TodoListMiddleware`, `PlanningState`, native Todo schema, and `write_todos`. Add a thin DeepFix middleware that validates the single-`in_progress` invariant, counts complete Tool Rounds from stable Graph Messages, reads a transient navigation feedback projection, and injects request-local reminders. Legacy Phase and Working Memory remain unchanged and shadow-only in this plan.
 
+**Status:** Completed and merged into `codex/deepfix-single-agent`. Final offline verification on 2026-08-29: `450 passed`; Ruff passed. The later State Authority Migration Plans 2–4 remain unimplemented.
+
 **Tech Stack:** Python 3.11+, DeepAgents 0.7.x, LangChain 1.3.x, LangGraph 1.2.x, Pydantic 2, pytest 8+, Ruff 0.12+
 
 **Spec:** `docs/superpowers/specs/2026-08-27-deepfix-architecture-audit.md`
@@ -39,7 +41,7 @@
 - Consumes: `langchain.agents.middleware.todo.PlanningState`, `Todo`; `PrivateStateAttr`.
 - Produces: `TodoNavigationState`, `TodoValidation`, `validate_todos(todos)`, `todo_progress_fingerprint(todos)`.
 
-- [ ] **Step 1: Write failing tests for native schema reuse and the single-current-item rule**
+- [x] **Step 1: Write failing tests for native schema reuse and the single-current-item rule**
 
 ```python
 from deepfix.navigation.models import (
@@ -73,13 +75,13 @@ def test_prose_only_rewrite_does_not_change_progress_fingerprint():
     assert todo_progress_fingerprint(before) == todo_progress_fingerprint(after)
 ```
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run: `python -m pytest tests/navigation/test_models.py -q`
 
 Expected: FAIL because `deepfix.navigation.models` does not exist.
 
-- [ ] **Step 3: Define private Graph metadata without creating a custom Todo schema**
+- [x] **Step 3: Define private Graph metadata without creating a custom Todo schema**
 
 ```python
 from typing import Annotated, NotRequired
@@ -113,7 +115,7 @@ class TodoValidation(BaseModel):
 
 Implement `validate_todos()` against native `content/status` dictionaries. Empty/all-completed lists allow zero `in_progress`; every other list requires exactly one. Implement `todo_progress_fingerprint()` from list length, ordered status values, and the `in_progress` index only, so wording changes cannot reset the counter.
 
-- [ ] **Step 4: Run focused tests and Ruff**
+- [x] **Step 4: Run focused tests and Ruff**
 
 Run: `python -m pytest tests/navigation/test_models.py -q`
 
@@ -123,7 +125,7 @@ Run: `python -m ruff check src/deepfix/navigation/models.py tests/navigation/tes
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the state contract**
+- [x] **Step 5: Commit the state contract**
 
 ```powershell
 git add src/deepfix/navigation/__init__.py src/deepfix/navigation/models.py tests/navigation/test_models.py
@@ -142,7 +144,7 @@ git commit -m "feat: define native todo navigation state"
 - Consumes: stable IDs assigned by `MessageIdentityMiddleware`; Graph `AIMessage` and paired `ToolMessage` objects.
 - Produces: `ToolRoundDelta(count: int, latest_round_id: str | None)` and `completed_tool_rounds_after(messages, cursor_round_id)`.
 
-- [ ] **Step 1: Write failing tests for sequential, incomplete, and parallel rounds**
+- [x] **Step 1: Write failing tests for sequential, incomplete, and parallel rounds**
 
 ```python
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -198,13 +200,13 @@ def test_write_todos_only_round_is_not_an_action_round():
 
 Add cases proving the cursor prevents recounting and that a missing cursor after compaction establishes a new baseline instead of recounting retained history.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `python -m pytest tests/navigation/test_rounds.py -q`
 
 Expected: FAIL because `deepfix.navigation.rounds` does not exist.
 
-- [ ] **Step 3: Implement deterministic round detection**
+- [x] **Step 3: Implement deterministic round detection**
 
 ```python
 from dataclasses import dataclass
@@ -255,7 +257,7 @@ def completed_tool_rounds_after(
 
 Scan AI messages in order, require a stable AI message ID and exactly one paired ToolMessage for every non-empty tool-call ID, and count the group once. Ignore groups whose only tool is `write_todos`. If a non-null cursor is absent from retained messages, return zero new rounds and set the latest complete round as the new cursor; this avoids a false reminder after compaction.
 
-- [ ] **Step 4: Run focused tests and Ruff**
+- [x] **Step 4: Run focused tests and Ruff**
 
 Run: `python -m pytest tests/navigation/test_rounds.py -q`
 
@@ -265,7 +267,7 @@ Run: `python -m ruff check src/deepfix/navigation/rounds.py tests/navigation/tes
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit Tool Round detection**
+- [x] **Step 5: Commit Tool Round detection**
 
 ```powershell
 git add src/deepfix/navigation/rounds.py tests/navigation/test_rounds.py
@@ -284,7 +286,7 @@ git commit -m "feat: count stable todo action rounds"
 - Consumes: `InvestigationStore.load(task_id)`, `CompactionStore.list_evidence(task_id)`, `VerificationPolicyStore.load(task_id)`, `evaluate_required_oracles()`.
 - Produces: `NavigationFeedback`, `NavigationFeedbackSource` protocol, `LegacyNavigationFeedbackSource.build(task_id)`.
 
-- [ ] **Step 1: Write failing tests for deterministic milestone projection**
+- [x] **Step 1: Write failing tests for deterministic milestone projection**
 
 ```python
 from deepfix.navigation.feedback import LegacyNavigationFeedbackSource
@@ -315,13 +317,13 @@ def test_same_authoritative_state_has_stable_feedback_fingerprint(stores):
 
 Also cover: closed evidence-gap IDs; all required post-change oracles satisfied; baseline user-specified test passing before any successful code change; failed/unavailable required oracle must not emit completion wording.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `python -m pytest tests/navigation/test_feedback.py -q`
 
 Expected: FAIL because the feedback module does not exist.
 
-- [ ] **Step 3: Implement a transient typed projection**
+- [x] **Step 3: Implement a transient typed projection**
 
 ```python
 from typing import Protocol
@@ -342,7 +344,7 @@ class NavigationFeedbackSource(Protocol):
 
 `LegacyNavigationFeedbackSource` performs read-only queries and sorts/deduplicates milestone IDs before hashing them. It may report supported hypotheses, closed evidence gaps, successful changes awaiting verification, required-oracle satisfaction, and baseline non-reproduction. It must not save data, mutate InvestigationState, or turn model prose into a milestone. Plan 3 will replace this adapter with final Repository views without changing the middleware protocol.
 
-- [ ] **Step 4: Run focused tests and Ruff**
+- [x] **Step 4: Run focused tests and Ruff**
 
 Run: `python -m pytest tests/navigation/test_feedback.py -q`
 
@@ -352,7 +354,7 @@ Run: `python -m ruff check src/deepfix/navigation/feedback.py tests/navigation/t
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the feedback projection**
+- [x] **Step 5: Commit the feedback projection**
 
 ```powershell
 git add src/deepfix/navigation/feedback.py tests/navigation/test_feedback.py
@@ -371,7 +373,7 @@ git commit -m "feat: project trusted navigation milestones"
 - Consumes: `TodoNavigationState`, `NavigationFeedbackSource`, `completed_tool_rounds_after()`, LangChain `ModelRequest` and `ToolCallRequest`.
 - Produces: `TodoNavigationMiddleware(feedback_source, reminder_rounds=3)` with sync/async model and tool hooks.
 
-- [ ] **Step 1: Write failing tests for validation, cadence, and request-local injection**
+- [x] **Step 1: Write failing tests for validation, cadence, and request-local injection**
 
 ```python
 def test_invalid_parallel_in_progress_todos_return_error_tool_message(middleware):
@@ -406,13 +408,13 @@ def test_same_milestone_is_injected_once(middleware):
 
 Add tests proving: a meaningful Todo status change resets the counter; prose-only rewriting does not; reminder scheduling does not mutate `InvestigationState.no_progress_count`; no Todo causes a “create a plan before more tools” advisory; HTML/XML-sensitive milestone content is escaped; async hooks match sync behavior.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `python -m pytest tests/navigation/test_middleware.py -q`
 
 Expected: FAIL because `TodoNavigationMiddleware` does not exist.
 
-- [ ] **Step 3: Implement state updates and reminder rendering**
+- [x] **Step 3: Implement state updates and reminder rendering**
 
 ```python
 class TodoNavigationMiddleware(AgentMiddleware):
@@ -477,7 +479,7 @@ class TodoNavigationMiddleware(AgentMiddleware):
 
 `before_model()` must compare the stored Todo progress fingerprint, add only newly completed action rounds, request a feedback projection, and schedule either a cadence reminder or a one-shot new-milestone reminder. It writes only private navigation metadata. `wrap_model_call()` appends the pending reminder to the request's SystemMessage and never changes `request.messages`. `wrap_tool_call()` validates `write_todos` arguments before delegating; all other tools pass through unchanged. Implement async wrappers with identical decisions.
 
-- [ ] **Step 4: Run focused tests and Ruff**
+- [x] **Step 4: Run focused tests and Ruff**
 
 Run: `python -m pytest tests/navigation/test_middleware.py -q`
 
@@ -487,7 +489,7 @@ Run: `python -m ruff check src/deepfix/navigation/middleware.py tests/navigation
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the middleware**
+- [x] **Step 5: Commit the middleware**
 
 ```powershell
 git add src/deepfix/navigation/middleware.py tests/navigation/test_middleware.py
@@ -511,7 +513,7 @@ git commit -m "feat: add evidence-aware todo reminders"
 - Consumes: `TodoListMiddleware`, `TodoNavigationMiddleware`, `LegacyNavigationFeedbackSource`, existing Store instances.
 - Produces: `build_agent(..., verification_policy_store: VerificationPolicyStore | None = None)` with native `write_todos` available in every legacy Phase/stagnation condition.
 
-- [ ] **Step 1: Extend agent-construction tests before changing production wiring**
+- [x] **Step 1: Extend agent-construction tests before changing production wiring**
 
 ```python
 assert middleware_names[:9] == [
@@ -531,7 +533,7 @@ assert capabilities["write_todos"] is InvestigationCapability.META
 
 Add assertions that the CLI passes the same `VerificationPolicyStore` instance to `build_agent()` and `BugfixService`, and that an extension cannot register another `write_todos` tool.
 
-- [ ] **Step 2: Add a failing coordinator test proving Todo remains visible during reevaluation**
+- [x] **Step 2: Add a failing coordinator test proving Todo remains visible during reevaluation**
 
 ```python
 def test_write_todos_remains_available_during_stagnation(coordinator):
@@ -546,13 +548,13 @@ def test_write_todos_remains_available_during_stagnation(coordinator):
     assert "write_todos" in allowed
 ```
 
-- [ ] **Step 3: Run the construction tests and verify RED**
+- [x] **Step 3: Run the construction tests and verify RED**
 
 Run: `python -m pytest tests/test_agent.py tests/test_cli.py tests/investigation/test_coordinator.py -q`
 
 Expected: FAIL because Todo middleware and capability wiring are absent.
 
-- [ ] **Step 4: Wire native Todo before legacy investigation/context middleware**
+- [x] **Step 4: Wire native Todo before legacy investigation/context middleware**
 
 Define the DeepFix-specific native Todo prompt in `navigation/prompts.py`:
 
@@ -592,7 +594,7 @@ middleware=[
 
 Add `write_todos` to `core_tool_names` and classify it as `InvestigationCapability.META`. Add it to the legacy reevaluation allow-list so old Phase remains shadow state rather than blocking the new navigation tool. Update CLI wiring to reuse its existing policy-store instance.
 
-- [ ] **Step 5: Run focused tests and Ruff**
+- [x] **Step 5: Run focused tests and Ruff**
 
 Run: `python -m pytest tests/test_agent.py tests/test_cli.py tests/investigation/test_coordinator.py -q`
 
@@ -602,7 +604,7 @@ Run: `python -m ruff check src/deepfix/navigation/prompts.py src/deepfix/agent.p
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit agent wiring**
+- [x] **Step 6: Commit agent wiring**
 
 ```powershell
 git add src/deepfix/navigation/prompts.py src/deepfix/agent.py src/deepfix/cli.py src/deepfix/investigation/coordinator.py tests/test_agent.py tests/test_cli.py tests/investigation/test_coordinator.py
@@ -622,7 +624,7 @@ git commit -m "feat: enable native todo navigation"
 - Consumes: fully wired agent, `InMemorySaver`/SQLite Checkpointer, stable Message IDs, existing compaction coordinator.
 - Produces: regression coverage proving navigation metadata survives restoration without entering protected facts, snapshots, reports, or task progress.
 
-- [ ] **Step 1: Write a checkpoint-resume workflow test**
+- [x] **Step 1: Write a checkpoint-resume workflow test**
 
 Use a deterministic scripted chat model to emit: initial `write_todos`; one parallel read round; a second investigation round; Checkpoint resume; a third round; and then capture the next SystemMessage. Assert:
 
@@ -637,7 +639,7 @@ assert "<todo_navigation_reminder>" in captured_system_prompt
 assert captured_system_prompt.count("<todo_navigation_reminder>") == 1
 ```
 
-- [ ] **Step 2: Write compaction isolation assertions**
+- [x] **Step 2: Write compaction isolation assertions**
 
 After forcing compaction, assert the activated Snapshot JSON and Conversation Artifact contain no private navigation field names, while restored Graph State retains the Todo list and counter metadata through the Checkpointer.
 
@@ -651,17 +653,17 @@ for forbidden in (
     assert forbidden not in conversation_artifact_text
 ```
 
-- [ ] **Step 3: Add service/report isolation assertions**
+- [x] **Step 3: Add service/report isolation assertions**
 
 Run an offline task through the report path and assert Todo navigation metadata is absent from `TaskState.to_dict()`, deterministic Evidence, ContextMetrics, and the rendered report. Todo itself remains available only from Graph State/Checkpoint.
 
-- [ ] **Step 4: Run the focused workflow tests**
+- [x] **Step 4: Run the focused workflow tests**
 
 Run: `python -m pytest tests/navigation tests/compaction/test_long_context_workflow.py tests/test_service.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Run the Plan 1 core regression gate**
+- [x] **Step 5: Run the Plan 1 core regression gate**
 
 Run: `python -m pytest tests/test_agent.py tests/test_cli.py tests/test_service.py tests/test_verification.py tests/navigation tests/investigation tests/compaction -q`
 
@@ -671,7 +673,7 @@ Run: `python -m ruff check src/deepfix tests/navigation tests/test_agent.py test
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit workflow coverage**
+- [x] **Step 6: Commit workflow coverage**
 
 ```powershell
 git add tests/navigation/test_workflow.py tests/compaction/test_long_context_workflow.py tests/test_service.py
