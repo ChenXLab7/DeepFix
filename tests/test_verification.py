@@ -9,7 +9,9 @@ from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode
 from deepfix.models import TaskState
 from deepfix.research.store import ResearchEvidenceStore
+from deepfix.task_domain.repository import TaskRepository
 from deepfix.verification import (
+    VerificationPolicy,
     VerificationPolicyBuilder,
     VerificationPolicyConflict,
     VerificationPolicyStore,
@@ -79,6 +81,44 @@ def test_policy_cannot_downgrade_required_oracle(tmp_path, task_workspace, task)
 
     with pytest.raises(VerificationPolicyConflict):
         store.save(changed)
+
+
+def test_policy_store_can_delegate_to_task_repository(
+    tmp_path,
+    task_workspace,
+    task,
+):
+    tasks = TaskRepository(tmp_path / "state.db")
+    store = VerificationPolicyStore(tasks=tasks)
+    policy = VerificationPolicyBuilder().build(task, task_workspace)
+
+    store.save(policy)
+
+    assert tasks.load_verification_policy(task.task_id) == policy
+    assert store.load(task.task_id) == policy
+
+
+def test_verification_policy_has_no_workspace_allowed_paths(
+    task_workspace,
+    task,
+):
+    policy = VerificationPolicyBuilder().build(task, task_workspace)
+
+    assert "allowed_paths" not in VerificationPolicy.model_fields
+    assert "allowed_paths" not in policy.model_dump()
+
+
+def test_relevant_paths_do_not_authorize_workspace_mutation(
+    task_workspace,
+    task,
+):
+    policy = VerificationPolicyBuilder().build(task, task_workspace)
+    oracle = policy.required_oracles[0].model_copy(
+        update={"relevant_paths": ["tests/test_value.py"]}
+    )
+
+    assert oracle.relevant_paths == ["tests/test_value.py"]
+    assert not hasattr(oracle, "can_modify")
 
 
 def test_repository_suite_is_required_when_user_did_not_name_a_test(

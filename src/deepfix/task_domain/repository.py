@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from deepfix.database import SQLiteDatabase
 from deepfix.task_domain.models import (
@@ -17,6 +18,9 @@ from deepfix.task_domain.models import (
     TaskLifecycleStatus,
     validate_lifecycle_transition,
 )
+
+if TYPE_CHECKING:
+    from deepfix.verification import VerificationPolicy
 
 
 class TaskRepository:
@@ -74,6 +78,25 @@ class TaskRepository:
                 reason=reason,
                 expected_version=expected_version,
             )
+
+    def save_verification_policy(self, policy: VerificationPolicy) -> None:
+        from deepfix.verification import VerificationPolicyConflict
+
+        try:
+            with self.database.unit_of_work(immediate=True) as connection:
+                self._save_verification_policy(connection, policy)
+        except sqlite3.IntegrityError as exc:
+            raise VerificationPolicyConflict(
+                "verification policy identity conflict"
+            ) from exc
+
+    def load_verification_policy(
+        self,
+        task_id: str,
+        version: int | None = None,
+    ) -> VerificationPolicy | None:
+        with self.database.connection() as connection:
+            return self._load_verification_policy(connection, task_id, version)
 
     def save_legacy_projection(self, task) -> None:
         from deepfix.task_domain.migration import (
@@ -231,6 +254,18 @@ class TaskRepository:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS verification_policies (
+                    task_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    policy_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY(task_id, version),
+                    UNIQUE(policy_id)
+                )
+                """
+            )
 
     def _synchronize_legacy_lifecycle(
         self,
@@ -363,6 +398,68 @@ class TaskRepository:
             reason=next_reason,
             updated_at=updated_at,
         )
+
+    @staticmethod
+    def _save_verification_policy(
+        connection: sqlite3.Connection,
+        policy: VerificationPolicy,
+    ) -> None:
+        from deepfix.verification import (
+            VerificationPolicy,
+            VerificationPolicyConflict,
+        )
+
+        latest_row = connection.execute(
+            """
+            SELECT payload FROM verification_policies
+            WHERE task_id = ? ORDER BY version DESC LIMIT 1
+            """,
+            (policy.task_id,),
+        ).fetchone()
+        if latest_row is not None:
+            latest = VerificationPolicy.model_validate_json(latest_row[0])
+            if policy.version <= latest.version:
+                if policy == latest:
+                    return
+                raise VerificationPolicyConflict("policy version must increase")
+            old_required = {item.oracle_id for item in latest.required_oracles}
+            new_required = {item.oracle_id for item in policy.required_oracles}
+            if not old_required.issubset(new_required):
+                raise VerificationPolicyConflict(
+                    "required oracle cannot be removed or downgraded"
+                )
+        connection.execute(
+            """
+            INSERT INTO verification_policies(task_id, version, policy_id, payload)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                policy.task_id,
+                policy.version,
+                policy.policy_id,
+                policy.model_dump_json(),
+            ),
+        )
+
+    @staticmethod
+    def _load_verification_policy(
+        connection: sqlite3.Connection,
+        task_id: str,
+        version: int | None,
+    ) -> VerificationPolicy | None:
+        from deepfix.verification import VerificationPolicy
+
+        query = (
+            "SELECT payload FROM verification_policies WHERE task_id = ? "
+            + (
+                "AND version = ?"
+                if version is not None
+                else "ORDER BY version DESC LIMIT 1"
+            )
+        )
+        parameters = (task_id, version) if version is not None else (task_id,)
+        row = connection.execute(query, parameters).fetchone()
+        return VerificationPolicy.model_validate_json(row[0]) if row else None
 
     def _backfill_historical_task(self, task_id: str) -> None:
         from deepfix.models import TaskState

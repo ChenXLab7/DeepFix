@@ -10,6 +10,12 @@ from deepfix.task_domain.models import (
     TaskLifecycleStatus,
 )
 from deepfix.task_domain.repository import TaskRepository
+from deepfix.verification import (
+    OracleConflictRule,
+    VerificationOracle,
+    VerificationPolicy,
+    VerificationPolicyConflict,
+)
 
 
 @pytest.fixture
@@ -30,6 +36,32 @@ def definition() -> TaskDefinition:
         project_python="C:/Python/python.exe",
         confinement_level="guarded_local",
         created_at="2026-08-29T00:00:00+00:00",
+    )
+
+
+@pytest.fixture
+def policy() -> VerificationPolicy:
+    required = VerificationOracle(
+        oracle_id="oracle-targeted",
+        origin="user_specified",
+        command="python -m pytest tests/test_value.py -q",
+        scope="targeted",
+        role="required",
+        relevant_paths=["tests/test_value.py"],
+    )
+    return VerificationPolicy(
+        policy_id="policy-1",
+        task_id="task-1",
+        version=1,
+        required_oracles=[required],
+        supplemental_oracles=[],
+        conflict_rules=[
+            OracleConflictRule(
+                rule_id="related-failure",
+                description="相关回归失败阻止完成",
+                blocking_scopes=["module", "full_suite"],
+            )
+        ],
     )
 
 
@@ -153,3 +185,34 @@ def test_unknown_task_raises_key_error(repository) -> None:
         repository.get_definition("missing-task")
     with pytest.raises(KeyError, match="missing-task"):
         repository.get_lifecycle("missing-task")
+
+
+def test_task_repository_loads_latest_and_requested_policy_version(
+    repository,
+    policy,
+) -> None:
+    repository.save_verification_policy(policy)
+    second = policy.model_copy(update={"policy_id": "policy-2", "version": 2})
+    repository.save_verification_policy(second)
+
+    assert repository.load_verification_policy(policy.task_id) == second
+    assert repository.load_verification_policy(policy.task_id, version=1) == policy
+    assert repository.load_verification_policy("missing-task") is None
+
+
+def test_task_repository_rejects_required_oracle_downgrade(
+    repository,
+    policy,
+) -> None:
+    repository.save_verification_policy(policy)
+    downgraded = policy.model_copy(
+        update={
+            "policy_id": "policy-2",
+            "version": 2,
+            "required_oracles": [],
+            "supplemental_oracles": policy.required_oracles,
+        }
+    )
+
+    with pytest.raises(VerificationPolicyConflict, match="cannot be removed"):
+        repository.save_verification_policy(downgraded)

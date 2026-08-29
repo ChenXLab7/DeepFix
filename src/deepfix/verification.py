@@ -5,14 +5,16 @@ import json
 import re
 import shlex
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field
 
 from deepfix.compaction.models import StrictModel, SystemTestEvidence
 from deepfix.models import TaskState
-from deepfix.persistence import open_sqlite_connection
 from deepfix.workspace import TaskWorkspace
+
+if TYPE_CHECKING:
+    from deepfix.task_domain.repository import TaskRepository
 
 _PYTEST_COMMAND = re.compile(
     r"(?i)(?:python(?:\.exe)?\s+-m\s+pytest|pytest)(?:\s+[^\r\n，。；;]+)?"
@@ -106,72 +108,23 @@ class VerificationPolicyBuilder:
 
 
 class VerificationPolicyStore:
-    def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path).expanduser().resolve()
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with open_sqlite_connection(self.database_path) as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS verification_policies (
-                    task_id TEXT NOT NULL,
-                    version INTEGER NOT NULL,
-                    policy_id TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    PRIMARY KEY(task_id, version),
-                    UNIQUE(policy_id)
-                )
-                """
-            )
-            connection.commit()
+    def __init__(
+        self,
+        database_path: str | Path | None = None,
+        *,
+        tasks: TaskRepository | None = None,
+    ) -> None:
+        from deepfix.task_domain.repository import TaskRepository
+
+        if tasks is None and database_path is None:
+            raise ValueError("database_path or tasks is required")
+        self.tasks = tasks or TaskRepository(database_path)
 
     def save(self, policy: VerificationPolicy) -> None:
-        with open_sqlite_connection(self.database_path) as connection:
-            latest_row = connection.execute(
-                """
-                SELECT payload FROM verification_policies
-                WHERE task_id = ? ORDER BY version DESC LIMIT 1
-                """,
-                (policy.task_id,),
-            ).fetchone()
-            if latest_row is not None:
-                latest = VerificationPolicy.model_validate_json(latest_row[0])
-                if policy.version <= latest.version:
-                    if policy == latest:
-                        return
-                    raise VerificationPolicyConflict("policy version must increase")
-                old_required = {item.oracle_id for item in latest.required_oracles}
-                new_required = {item.oracle_id for item in policy.required_oracles}
-                if not old_required.issubset(new_required):
-                    raise VerificationPolicyConflict(
-                        "required oracle cannot be removed or downgraded"
-                    )
-            connection.execute(
-                """
-                INSERT INTO verification_policies(task_id, version, policy_id, payload)
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    policy.task_id,
-                    policy.version,
-                    policy.policy_id,
-                    policy.model_dump_json(),
-                ),
-            )
-            connection.commit()
+        self.tasks.save_verification_policy(policy)
 
     def load(self, task_id: str, version: int | None = None) -> VerificationPolicy | None:
-        query = (
-            "SELECT payload FROM verification_policies WHERE task_id = ? "
-            + (
-                "AND version = ?"
-                if version is not None
-                else "ORDER BY version DESC LIMIT 1"
-            )
-        )
-        parameters = (task_id, version) if version is not None else (task_id,)
-        with open_sqlite_connection(self.database_path) as connection:
-            row = connection.execute(query, parameters).fetchone()
-        return VerificationPolicy.model_validate_json(row[0]) if row else None
+        return self.tasks.load_verification_policy(task_id, version)
 
 
 def evaluate_required_oracles(
