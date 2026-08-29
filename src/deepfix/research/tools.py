@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -13,6 +14,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
 
+from deepfix.compaction.models import ArtifactReference
 from deepfix.models import Evidence
 from deepfix.research.dependency import DependencyInspector
 from deepfix.research.fetcher import EvidenceFetchError, SafeEvidenceFetcher
@@ -230,6 +232,38 @@ def build_fetch_external_evidence_tool(
                 runtime,
                 f"证据 artifact 写入失败: {write_result.error}",
             )
+        try:
+            read_result = artifact_backend.read(
+                artifact_path,
+                offset=0,
+                limit=max(2000, artifact.count("\n") + 2),
+            )
+        except Exception as exc:  # noqa: BLE001 - backend implementations vary
+            return _error(
+                "fetch_external_evidence",
+                runtime,
+                f"证据 artifact 校验失败: {type(exc).__name__}",
+            )
+        file_data = read_result.file_data
+        restored = (
+            file_data.get("content")
+            if read_result.error is None
+            and file_data is not None
+            and file_data.get("encoding") == "utf-8"
+            else None
+        )
+        if restored != artifact:
+            return _error(
+                "fetch_external_evidence",
+                runtime,
+                "证据 artifact 校验失败: 回读内容不一致",
+            )
+        artifact_reference = ArtifactReference(
+            path=artifact_path,
+            kind="research",
+            content_hash=hashlib.sha256(restored.encode("utf-8")).hexdigest(),
+            work_unit_ids=[],
+        )
 
         evidence = ExternalEvidence(
             evidence_id=evidence_id,
@@ -252,7 +286,11 @@ def build_fetch_external_evidence_tool(
             artifact_path=artifact_path,
         )
         try:
-            store.save_evidence(evidence)
+            store.save_evidence(
+                evidence,
+                artifact_reference=artifact_reference,
+                artifact_content=restored,
+            )
         except Exception as exc:  # noqa: BLE001 - persistence becomes a Tool error
             return _error(
                 "fetch_external_evidence",

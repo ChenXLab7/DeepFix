@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from deepagents.backends.protocol import WriteResult
+from deepagents.backends.protocol import ReadResult, WriteResult
 from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage, ToolMessage
 
@@ -111,16 +111,30 @@ class RecordingBackend:
         store: ResearchEvidenceStore,
         *,
         error: str | None = None,
+        corrupt_readback: bool = False,
     ) -> None:
         self.store = store
         self.error = error
+        self.corrupt_readback = corrupt_readback
         self.calls: list[tuple[str, str]] = []
+        self.contents: dict[str, str] = {}
         self.evidence_count_during_write: int | None = None
 
     def write(self, file_path: str, content: str) -> WriteResult:
         self.evidence_count_during_write = len(self.store.list_evidence("task-a"))
         self.calls.append((file_path, content))
+        if self.error is None:
+            self.contents[file_path] = content
         return WriteResult(error=self.error, path=file_path if self.error is None else None)
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        del offset, limit
+        content = self.contents.get(file_path)
+        if content is None:
+            return ReadResult(error="not found")
+        if self.corrupt_readback:
+            content += "\ncorrupted"
+        return ReadResult(file_data={"content": content, "encoding": "utf-8"})
 
 
 def _save_candidate(store: ResearchEvidenceStore, task_id: str = "task-a") -> SearchCandidate:
@@ -349,6 +363,19 @@ def test_artifact_write_failure_creates_no_evidence_row(tmp_path):
 
     assert message.status == "error"
     assert backend.calls
+    assert store.list_evidence("task-a") == []
+
+
+def test_artifact_readback_mismatch_creates_no_evidence_row(tmp_path):
+    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    candidate = _save_candidate(store)
+    backend = RecordingBackend(store, corrupt_readback=True)
+    tool = build_fetch_external_evidence_tool(StubFetcher(), store, backend)
+
+    message = tool.func(candidate_id=candidate.candidate_id, runtime=_runtime())
+
+    assert message.status == "error"
+    assert "artifact 校验失败" in message.content
     assert store.list_evidence("task-a") == []
 
 

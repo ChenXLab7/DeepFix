@@ -8,6 +8,7 @@ from pydantic import Field
 
 from deepfix.compaction.models import (
     ApprovalEvidence,
+    ArtifactReference,
     FileChangeEvidence,
     ResearchStatusEvidence,
     StrictModel,
@@ -19,7 +20,9 @@ from deepfix.domain_repositories.evidence import (
     EvidenceRepository,
     deterministic_provenance_roots,
     restore_deterministic_evidence,
+    restore_external_evidence,
 )
+from deepfix.research.models import ExternalEvidence, ResearchQuery, SearchCandidate
 
 
 class DomainMigrationReport(StrictModel):
@@ -36,11 +39,26 @@ class DomainMigrationReport(StrictModel):
 
 
 class DomainMigrator:
-    def __init__(self, database: SQLiteDatabase | str | Path) -> None:
+    def __init__(
+        self,
+        database: SQLiteDatabase | str | Path,
+        *,
+        artifact_root: str | Path | None = None,
+    ) -> None:
         self.database = (
             database if isinstance(database, SQLiteDatabase) else SQLiteDatabase(database)
         )
-        self.evidence = EvidenceRepository(self.database)
+        self.artifact_root = (
+            Path(artifact_root).expanduser().resolve()
+            if artifact_root is not None
+            else None
+        )
+        self.evidence = EvidenceRepository(
+            self.database,
+            artifact_verifier=(
+                self._verify_artifact if self.artifact_root is not None else None
+            ),
+        )
         self._initialize_schema()
 
     def migrate_deterministic_evidence(self, task_id: str) -> DomainMigrationReport:
@@ -107,6 +125,112 @@ class DomainMigrator:
             self._save_report(report)
         return report
 
+    def migrate_research(self, task_id: str) -> DomainMigrationReport:
+        task_id = _required(task_id, "task_id")
+        existing = self._load_report("research", task_id)
+        if existing is not None:
+            return existing
+        queries, candidates, external = self._legacy_research_rows(task_id)
+        query_ids_by_text: dict[str, list[str]] = {}
+        for query in queries:
+            self.evidence.record_research_attempt(
+                task_id=query.task_id,
+                query_id=query.query_id,
+                sanitized_query=query.sanitized_query,
+                providers=query.providers,
+                provider_errors=query.provider_errors,
+                created_at=query.created_at,
+            )
+            query_ids_by_text.setdefault(query.sanitized_query, []).append(query.query_id)
+        candidates_by_query: dict[str, list[SearchCandidate]] = {}
+        missing_references: list[str] = []
+        for candidate in candidates:
+            matching = query_ids_by_text.get(candidate.query, [])
+            if not matching:
+                missing_references.append(
+                    f"candidate:{candidate.candidate_id}:query:{candidate.query}"
+                )
+                continue
+            candidates_by_query.setdefault(matching[-1], []).append(candidate)
+        for query_id, items in candidates_by_query.items():
+            self.evidence.record_research_candidates(query_id, items)
+        known_candidate_ids = {item.candidate_id for item in candidates}
+        for item in external:
+            if item.candidate_id not in known_candidate_ids:
+                missing_references.append(
+                    f"evidence:{item.evidence_id}:candidate:{item.candidate_id}"
+                )
+                continue
+            reference = self._artifact_reference(item.artifact_path)
+            if reference is None:
+                missing_references.append(item.artifact_path)
+                continue
+            self.evidence.accept_external(
+                item,
+                provenance_root_ids=[f"url:{item.url}"],
+                artifact_references=[reference],
+            )
+
+        target_queries = [
+            ResearchQuery(
+                query_id=item.query_id,
+                task_id=item.task_id,
+                sanitized_query=item.sanitized_query,
+                providers=item.providers,
+                provider_errors=item.provider_errors,
+                created_at=item.created_at,
+            )
+            for item in self.evidence.list_research_attempts(task_id)
+        ]
+        target_candidates = self.evidence.list_research_candidates(task_id)
+        target_external = [
+            restore_external_evidence(item)
+            for item in self.evidence.list_for_task(task_id)
+            if item.kind is EvidenceKind.EXTERNAL_RESEARCH
+        ]
+        source_projection = _research_projection(queries, candidates, external)
+        target_projection = _research_projection(
+            target_queries,
+            target_candidates,
+            target_external,
+        )
+        source_ids = {f"{kind}:{identity}" for kind, identity, _ in source_projection}
+        target_ids = {f"{kind}:{identity}" for kind, identity, _ in target_projection}
+        source_payloads = {
+            f"{kind}:{identity}": payload
+            for kind, identity, payload in source_projection
+        }
+        target_payloads = {
+            f"{kind}:{identity}": payload
+            for kind, identity, payload in target_projection
+        }
+        identity_mismatches = sorted(source_ids ^ target_ids)
+        hash_mismatches = sorted(
+            identity
+            for identity in source_ids & target_ids
+            if source_payloads[identity] != target_payloads[identity]
+        )
+        report = DomainMigrationReport(
+            domain="research",
+            task_id=task_id,
+            source_count=len(source_projection),
+            target_count=len(target_projection),
+            source_hash=_canonical_hash(source_projection),
+            target_hash=_canonical_hash(target_projection),
+            identity_mismatches=identity_mismatches,
+            hash_mismatches=hash_mismatches,
+            missing_references=sorted(set(missing_references)),
+            ready_to_switch=(
+                len(source_projection) == len(target_projection)
+                and not identity_mismatches
+                and not hash_mismatches
+                and not missing_references
+            ),
+        )
+        if report.ready_to_switch:
+            self._save_report(report)
+        return report
+
     def _legacy_rows(self, task_id: str) -> list[tuple[str, str, str]]:
         with self.database.connection() as connection:
             table = connection.execute(
@@ -126,6 +250,73 @@ class DomainMigrator:
                 (task_id,),
             ).fetchall()
         return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
+
+    def _legacy_research_rows(
+        self,
+        task_id: str,
+    ) -> tuple[list[ResearchQuery], list[SearchCandidate], list[ExternalEvidence]]:
+        with self.database.connection() as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            query_rows = (
+                connection.execute(
+                    "SELECT payload FROM research_queries WHERE task_id = ? ORDER BY created_at, rowid",
+                    (task_id,),
+                ).fetchall()
+                if "research_queries" in tables
+                else []
+            )
+            candidate_rows = (
+                connection.execute(
+                    "SELECT payload FROM search_candidates WHERE task_id = ? ORDER BY created_at, rowid",
+                    (task_id,),
+                ).fetchall()
+                if "search_candidates" in tables
+                else []
+            )
+            evidence_rows = (
+                connection.execute(
+                    "SELECT payload FROM external_evidence WHERE task_id = ? ORDER BY updated_at, rowid",
+                    (task_id,),
+                ).fetchall()
+                if "external_evidence" in tables
+                else []
+            )
+        return (
+            [ResearchQuery.model_validate_json(str(row[0])) for row in query_rows],
+            [SearchCandidate.model_validate_json(str(row[0])) for row in candidate_rows],
+            [ExternalEvidence.model_validate_json(str(row[0])) for row in evidence_rows],
+        )
+
+    def _artifact_reference(self, virtual_path: str) -> ArtifactReference | None:
+        if self.artifact_root is None:
+            return None
+        prefix = "/.deepfix-artifacts/"
+        if not virtual_path.startswith(prefix):
+            return None
+        candidate = (
+            self.artifact_root / Path(virtual_path.removeprefix(prefix))
+        ).resolve()
+        try:
+            candidate.relative_to(self.artifact_root)
+        except ValueError:
+            return None
+        if not candidate.is_file():
+            return None
+        return ArtifactReference(
+            path=virtual_path,
+            kind="research",
+            content_hash=hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            work_unit_ids=[],
+        )
+
+    def _verify_artifact(self, reference: ArtifactReference) -> bool:
+        resolved = self._artifact_reference(reference.path)
+        return resolved is not None and resolved.content_hash == reference.content_hash
 
     def _load_report(self, domain: str, task_id: str) -> DomainMigrationReport | None:
         with self.database.connection() as connection:
@@ -220,6 +411,34 @@ def _canonical_payload(value: object) -> str:
 
 def _canonical_hash(value: object) -> str:
     return hashlib.sha256(_canonical_payload(value).encode("utf-8")).hexdigest()
+
+
+def _research_projection(
+    queries: list[ResearchQuery],
+    candidates: list[SearchCandidate],
+    evidence: list[ExternalEvidence],
+) -> list[tuple[str, str, str]]:
+    records = [
+        ("query", item.query_id, _canonical_payload(item.model_dump(mode="json")))
+        for item in queries
+    ]
+    records.extend(
+        (
+            "candidate",
+            item.candidate_id,
+            _canonical_payload(item.model_dump(mode="json")),
+        )
+        for item in candidates
+    )
+    records.extend(
+        (
+            "evidence",
+            item.evidence_id,
+            _canonical_payload(item.model_dump(mode="json")),
+        )
+        for item in evidence
+    )
+    return sorted(records, key=lambda item: (item[0], item[1]))
 
 
 def _required(value: str, name: str) -> str:

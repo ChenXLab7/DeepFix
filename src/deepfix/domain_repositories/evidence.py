@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -20,7 +21,7 @@ from deepfix.compaction.models import (
     SystemTestEvidence,
 )
 from deepfix.database import SQLiteDatabase
-from deepfix.research.models import ExternalEvidence
+from deepfix.research.models import ExternalEvidence, SearchCandidate
 
 
 class EvidenceIdentityConflict(RuntimeError):
@@ -76,6 +77,18 @@ class VerificationEvidenceView(StrictModel):
     verified_evidence_ids: list[str] = Field(default_factory=list)
     contradicted_evidence_ids: list[str] = Field(default_factory=list)
     unverified_evidence_ids: list[str] = Field(default_factory=list)
+
+
+class ResearchAttempt(StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    query_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    sanitized_query: str = Field(min_length=1)
+    providers: list[str] = Field(default_factory=list)
+    provider_errors: list[str] = Field(default_factory=list)
+    candidate_ids: list[str] = Field(default_factory=list)
+    created_at: str = Field(min_length=1)
 
 
 DeterministicEvidence: TypeAlias = (
@@ -147,6 +160,298 @@ class EvidenceRepository:
             payload=evidence.model_dump(mode="json"),
             provenance_root_ids=provenance_root_ids,
             artifact_references=artifact_references,
+        )
+
+    def accept_external_with_content(
+        self,
+        evidence: ExternalEvidence,
+        *,
+        provenance_root_ids: list[str],
+        artifact_reference: ArtifactReference,
+        artifact_content: str,
+    ) -> EvidenceEnvelope:
+        if artifact_reference.path != evidence.artifact_path:
+            raise ArtifactIntegrityError("External Evidence Artifact path mismatch")
+        actual_hash = hashlib.sha256(artifact_content.encode("utf-8")).hexdigest()
+        if actual_hash != artifact_reference.content_hash:
+            raise ArtifactIntegrityError(
+                f"Artifact verification failed: {artifact_reference.path}"
+            )
+        return self._record(
+            evidence_id=evidence.evidence_id,
+            task_id=evidence.task_id,
+            kind=EvidenceKind.EXTERNAL_RESEARCH,
+            origin=evidence.source_type,
+            authority=EvidenceAuthority.RESEARCH,
+            verification_state=_verification_from_text(evidence.local_verification),
+            payload_type=type(evidence).__name__,
+            payload=evidence.model_dump(mode="json"),
+            provenance_root_ids=provenance_root_ids,
+            artifact_references=[artifact_reference],
+            artifacts_preverified=True,
+        )
+
+    def update_external(self, evidence: ExternalEvidence) -> EvidenceEnvelope:
+        current = self.get(evidence.task_id, evidence.evidence_id)
+        if current.kind is not EvidenceKind.EXTERNAL_RESEARCH:
+            raise EvidenceIdentityConflict("Only external Evidence can update verification")
+        semantic = {
+            "evidence_id": current.evidence_id,
+            "task_id": current.task_id,
+            "kind": current.kind.value,
+            "origin": current.origin,
+            "authority": current.authority.value,
+            "verification_state": _verification_from_text(
+                evidence.local_verification
+            ).value,
+            "payload_type": type(evidence).__name__,
+            "payload": evidence.model_dump(mode="json"),
+            "provenance_root_ids": current.provenance_root_ids,
+            "artifact_references": [
+                reference.model_dump(mode="json")
+                for reference in current.artifact_references
+            ],
+        }
+        content_hash = _canonical_hash(semantic)
+        if content_hash == current.content_hash:
+            return current
+        updated = EvidenceEnvelope(
+            **semantic,
+            content_hash=content_hash,
+            created_at=_now(),
+        )
+        with self.database.unit_of_work(immediate=True) as connection:
+            row = connection.execute(
+                """
+                SELECT content_hash, revision FROM evidence_records
+                WHERE task_id = ? AND evidence_id = ?
+                """,
+                (evidence.task_id, evidence.evidence_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError((evidence.task_id, evidence.evidence_id))
+            if str(row[0]) != current.content_hash:
+                raise EvidenceIdentityConflict("External Evidence update conflict")
+            revision = int(row[1]) + 1
+            connection.execute(
+                """
+                INSERT INTO evidence_revisions(
+                    task_id, evidence_id, revision, envelope_json,
+                    content_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    updated.task_id,
+                    updated.evidence_id,
+                    revision,
+                    updated.model_dump_json(),
+                    updated.content_hash,
+                    updated.created_at,
+                ),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE evidence_records
+                SET verification_state = ?, envelope_json = ?,
+                    content_hash = ?, created_at = ?, revision = ?
+                WHERE task_id = ? AND evidence_id = ? AND content_hash = ?
+                """,
+                (
+                    updated.verification_state.value,
+                    updated.model_dump_json(),
+                    updated.content_hash,
+                    updated.created_at,
+                    revision,
+                    updated.task_id,
+                    updated.evidence_id,
+                    current.content_hash,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise EvidenceIdentityConflict("External Evidence update conflict")
+        return updated
+
+    def list_revisions(self, task_id: str, evidence_id: str) -> list[EvidenceEnvelope]:
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT envelope_json FROM evidence_revisions
+                WHERE task_id = ? AND evidence_id = ? ORDER BY revision
+                """,
+                (_required(task_id, "task_id"), _required(evidence_id, "evidence_id")),
+            ).fetchall()
+        return [EvidenceEnvelope.model_validate_json(str(row[0])) for row in rows]
+
+    def record_research_attempt(
+        self,
+        *,
+        task_id: str,
+        query_id: str,
+        sanitized_query: str,
+        providers: list[str],
+        provider_errors: list[str],
+        created_at: str | None = None,
+    ) -> ResearchAttempt:
+        attempt = ResearchAttempt(
+            query_id=_required(query_id, "query_id"),
+            task_id=_required(task_id, "task_id"),
+            sanitized_query=_required(sanitized_query, "sanitized_query"),
+            providers=_ordered_unique(providers),
+            provider_errors=_ordered_unique(
+                [_redact_provider_error(error) for error in provider_errors]
+            ),
+            candidate_ids=[],
+            created_at=created_at or _now(),
+        )
+        with self.database.unit_of_work(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT payload FROM research_attempts WHERE query_id = ?",
+                (attempt.query_id,),
+            ).fetchone()
+            if row is not None:
+                existing = ResearchAttempt.model_validate_json(str(row[0]))
+                if existing != attempt:
+                    raise EvidenceIdentityConflict("Research attempt identity conflict")
+                return existing
+            connection.execute(
+                """
+                INSERT INTO research_attempts(
+                    query_id, task_id, sanitized_query, payload, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt.query_id,
+                    attempt.task_id,
+                    attempt.sanitized_query,
+                    attempt.model_dump_json(),
+                    attempt.created_at,
+                ),
+            )
+        return attempt
+
+    def record_research_candidates(
+        self,
+        query_id: str,
+        candidates: list[SearchCandidate],
+    ) -> list[SearchCandidate]:
+        query_id = _required(query_id, "query_id")
+        with self.database.unit_of_work(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT payload FROM research_attempts WHERE query_id = ?",
+                (query_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(query_id)
+            attempt = ResearchAttempt.model_validate_json(str(row[0]))
+            for candidate in candidates:
+                if candidate.task_id != attempt.task_id:
+                    raise ValueError("Research candidate task_id mismatch")
+                payload = candidate.model_dump_json()
+                existing = connection.execute(
+                    "SELECT payload FROM research_candidates WHERE candidate_id = ?",
+                    (candidate.candidate_id,),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing[0]) != payload:
+                        raise EvidenceIdentityConflict(
+                            "Research candidate identity conflict"
+                        )
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO research_candidates(
+                        candidate_id, query_id, task_id, payload, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        candidate.candidate_id,
+                        query_id,
+                        candidate.task_id,
+                        payload,
+                        candidate.created_at,
+                    ),
+                )
+            candidate_ids = _ordered_unique(
+                [*attempt.candidate_ids, *(item.candidate_id for item in candidates)]
+            )
+            updated = attempt.model_copy(update={"candidate_ids": candidate_ids})
+            connection.execute(
+                "UPDATE research_attempts SET payload = ? WHERE query_id = ?",
+                (updated.model_dump_json(), query_id),
+            )
+        return list(candidates)
+
+    def get_research_attempt(self, task_id: str, query_id: str) -> ResearchAttempt:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT payload FROM research_attempts
+                WHERE task_id = ? AND query_id = ?
+                """,
+                (_required(task_id, "task_id"), _required(query_id, "query_id")),
+            ).fetchone()
+        if row is None:
+            raise KeyError(query_id)
+        return ResearchAttempt.model_validate_json(str(row[0]))
+
+    def list_research_attempts(self, task_id: str) -> list[ResearchAttempt]:
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM research_attempts
+                WHERE task_id = ? ORDER BY created_at, rowid
+                """,
+                (_required(task_id, "task_id"),),
+            ).fetchall()
+        return [ResearchAttempt.model_validate_json(str(row[0])) for row in rows]
+
+    def latest_research_attempt(
+        self,
+        task_id: str,
+        sanitized_query: str,
+    ) -> ResearchAttempt | None:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT payload FROM research_attempts
+                WHERE task_id = ? AND sanitized_query = ?
+                ORDER BY created_at DESC, rowid DESC LIMIT 1
+                """,
+                (_required(task_id, "task_id"), sanitized_query),
+            ).fetchone()
+        return None if row is None else ResearchAttempt.model_validate_json(str(row[0]))
+
+    def get_research_candidate(self, task_id: str, candidate_id: str) -> SearchCandidate:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT payload FROM research_candidates
+                WHERE task_id = ? AND candidate_id = ?
+                """,
+                (_required(task_id, "task_id"), _required(candidate_id, "candidate_id")),
+            ).fetchone()
+        if row is None:
+            raise KeyError(candidate_id)
+        return SearchCandidate.model_validate_json(str(row[0]))
+
+    def list_research_candidates(self, task_id: str) -> list[SearchCandidate]:
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM research_candidates
+                WHERE task_id = ? ORDER BY created_at, rowid
+                """,
+                (_required(task_id, "task_id"),),
+            ).fetchall()
+        return [SearchCandidate.model_validate_json(str(row[0])) for row in rows]
+
+    def research_summary(self, task_id: str) -> tuple[int, list[str]]:
+        attempts = self.list_research_attempts(task_id)
+        return (
+            len(attempts),
+            _ordered_unique(
+                [error for attempt in attempts for error in attempt.provider_errors]
+            ),
         )
 
     def record_semantic_candidate(
@@ -231,12 +536,14 @@ class EvidenceRepository:
         payload: dict[str, JsonValue],
         provenance_root_ids: list[str],
         artifact_references: list[ArtifactReference],
+        artifacts_preverified: bool = False,
     ) -> EvidenceEnvelope:
         task_id = _required(task_id, "task_id")
         evidence_id = _required(evidence_id, "evidence_id")
         roots = _normalize_roots(provenance_root_ids)
         references = list(artifact_references)
-        self._verify_artifacts(references)
+        if not artifacts_preverified:
+            self._verify_artifacts(references)
         semantic = {
             "evidence_id": evidence_id,
             "task_id": task_id,
@@ -276,8 +583,9 @@ class EvidenceRepository:
                 """
                 INSERT INTO evidence_records(
                     task_id, evidence_id, kind, authority,
-                    verification_state, envelope_json, content_hash, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    verification_state, envelope_json, content_hash, created_at,
+                    revision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 (
                     task_id,
@@ -302,6 +610,21 @@ class EvidenceRepository:
             restored = EvidenceEnvelope.model_validate_json(str(persisted[0]))
             if restored != envelope:
                 raise EvidenceIdentityConflict("Evidence persistence verification failed")
+            connection.execute(
+                """
+                INSERT INTO evidence_revisions(
+                    task_id, evidence_id, revision, envelope_json,
+                    content_hash, created_at
+                ) VALUES (?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    evidence_id,
+                    serialized,
+                    content_hash,
+                    envelope.created_at,
+                ),
+            )
             return restored
 
     def _verify_artifacts(self, references: list[ArtifactReference]) -> None:
@@ -328,6 +651,7 @@ class EvidenceRepository:
                     envelope_json TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY(task_id, evidence_id)
                 )
                 """
@@ -336,6 +660,58 @@ class EvidenceRepository:
                 """
                 CREATE INDEX IF NOT EXISTS evidence_records_task_kind
                 ON evidence_records(task_id, kind, created_at)
+                """
+            )
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(evidence_records)"
+                ).fetchall()
+            }
+            if "revision" not in columns:
+                connection.execute(
+                    "ALTER TABLE evidence_records ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
+                )
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS evidence_revisions (
+                    task_id TEXT NOT NULL,
+                    evidence_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    envelope_json TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(task_id, evidence_id, revision)
+                );
+                CREATE TABLE IF NOT EXISTS research_attempts (
+                    query_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    sanitized_query TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS research_attempts_task_query
+                ON research_attempts(task_id, sanitized_query, created_at);
+                CREATE TABLE IF NOT EXISTS research_candidates (
+                    candidate_id TEXT PRIMARY KEY,
+                    query_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS research_candidates_task
+                ON research_candidates(task_id, created_at);
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO evidence_revisions(
+                    task_id, evidence_id, revision, envelope_json,
+                    content_hash, created_at
+                )
+                SELECT task_id, evidence_id, revision, envelope_json,
+                       content_hash, created_at
+                FROM evidence_records
                 """
             )
 
@@ -394,6 +770,12 @@ def restore_deterministic_evidence(envelope: EvidenceEnvelope) -> DeterministicE
     return model.model_validate(envelope.payload)
 
 
+def restore_external_evidence(envelope: EvidenceEnvelope) -> ExternalEvidence:
+    if envelope.kind is not EvidenceKind.EXTERNAL_RESEARCH:
+        raise TypeError(f"Envelope is not external Evidence: {envelope.payload_type}")
+    return ExternalEvidence.model_validate(envelope.payload)
+
+
 def _verification_from_text(value: str) -> EvidenceVerification:
     return {
         "verified": EvidenceVerification.VERIFIED,
@@ -407,6 +789,25 @@ def _normalize_roots(values: list[str]) -> list[str]:
     if not roots:
         raise ValueError("Evidence provenance_root_ids must not be empty")
     return roots
+
+
+def _ordered_unique(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _redact_provider_error(value: str) -> str:
+    bounded = value.strip()[:500]
+    bounded = re.sub(
+        r"(?i)(authorization\s*:\s*bearer\s+)\S+",
+        r"\1[REDACTED]",
+        bounded,
+    )
+    bounded = re.sub(
+        r"(?i)((?:api[_ -]?key|token|secret)\s*[=:]\s*)\S+",
+        r"\1[REDACTED]",
+        bounded,
+    )
+    return bounded
 
 
 def _canonical_hash(value: dict[str, object]) -> str:
