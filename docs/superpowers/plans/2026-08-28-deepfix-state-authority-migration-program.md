@@ -70,6 +70,10 @@ Five Repository classes are logical access boundaries over one DeepFix SQLite da
 
 ### Plan 2: Shared Persistence Foundation and Bounded Task Domain
 
+**Status:** COMPLETE — implementation and offline migration gate recorded in
+`2026-08-28-deepfix-task-persistence-foundation.md` on 2026-08-29. Awaiting
+user review before Plan 3 begins.
+
 **Planned document:** `docs/superpowers/plans/2026-08-28-deepfix-task-persistence-foundation.md`
 
 **Deliverable:** Introduce the shared SQLite connection/UnitOfWork boundary; replace whole-object `TaskRepository.save(TaskState)` writes with immutable Task Definition, lifecycle, VerificationPolicy, AdjudicationDecision, and budget ledger operations; and provide a migration/read adapter for existing task JSON.

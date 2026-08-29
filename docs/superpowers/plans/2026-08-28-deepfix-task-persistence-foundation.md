@@ -1,5 +1,9 @@
 # DeepFix Task Persistence Foundation Implementation Plan
 
+**Status:** COMPLETE — implemented on `codex/task-persistence-foundation`; final
+offline evidence recorded below on 2026-08-29. Plan 3 remains blocked on the
+review checkpoint at the end of this document.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Establish one shared SQLite transaction boundary and a bounded Task domain whose immutable definition, lifecycle, VerificationPolicy, adjudication decisions, and token ledger are authoritative without prematurely removing unmigrated legacy task fields.
@@ -976,7 +980,7 @@ git commit -m "feat: wire bounded task authority into service"
 - Consumes: all Plan 2 outputs.
 - Produces: reviewed Plan 2 completion evidence and a frozen handoff contract for Plan 3.
 
-- [ ] **Step 1: Add a schema-boundary regression**
+- [x] **Step 1: Add a schema-boundary regression**
 
 In `tests/task_domain/test_repository.py`, enumerate normalized Task tables and assert their columns cannot hold excluded domains. Also scan production code and assert no new `TaskRepository.save(TaskState)` implementation writes `json.dumps(task.to_dict())` into the historical `tasks` table.
 
@@ -1008,7 +1012,7 @@ def test_repository_never_rewrites_historical_whole_payload():
     assert "UPDATE tasks" not in source
 ```
 
-- [ ] **Step 2: Add legacy rollback-window verification**
+- [x] **Step 2: Add legacy rollback-window verification**
 
 In `tests/task_domain/test_migration.py`, create a historical `tasks` row, backfill it, modify only an unmigrated legacy field, and assert:
 
@@ -1030,7 +1034,7 @@ def test_backfill_keeps_historical_row_read_only(repository, legacy_task_row):
     assert repository.get(task.task_id).hypotheses == ["H1"]
 ```
 
-- [ ] **Step 3: Run the Plan 2 focused gate**
+- [x] **Step 3: Run the Plan 2 focused gate**
 
 Run:
 
@@ -1046,7 +1050,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 4: Run the trusted execution and navigation regression gate**
+- [x] **Step 4: Run the trusted execution and navigation regression gate**
 
 Run:
 
@@ -1064,7 +1068,7 @@ Run:
 
 Expected: PASS. This verifies that Plan 2 did not weaken Todo, Workspace, approval, Receipt, Journal, or compaction invariants.
 
-- [ ] **Step 5: Run the core offline suite and static checks**
+- [x] **Step 5: Run the core offline suite and static checks**
 
 Run: `.venv\Scripts\python -m pytest -q`
 
@@ -1074,7 +1078,7 @@ Run: `git diff --check`
 
 Expected: all offline tests PASS; Ruff and diff checks exit 0. Do not run the online QuixBugs campaign.
 
-- [ ] **Step 6: Record exact completion evidence**
+- [x] **Step 6: Record exact completion evidence**
 
 Update this document with:
 
@@ -1085,12 +1089,95 @@ Update this document with:
 - confirmation that no Evidence/Execution/History tables were moved early;
 - any rollback-window tables intentionally retained for Plan 4.
 
-- [ ] **Step 7: Mark Plan 2 complete in the parent program and commit**
+- [x] **Step 7: Mark Plan 2 complete in the parent program and commit**
 
 ```powershell
 git add docs/superpowers/plans/2026-08-28-deepfix-task-persistence-foundation.md docs/superpowers/plans/2026-08-28-deepfix-state-authority-migration-program.md
 git commit -m "docs: record task persistence foundation completion"
 ```
+
+## Plan 2 Completion Evidence — 2026-08-29
+
+### Task commits
+
+| Task | Commit | Result |
+|---|---|---|
+| 1 | `6f72211` | shared SQLite connection and UnitOfWork |
+| 2 | `ef6f586` | immutable Task Definition and business lifecycle contracts |
+| 3 | `4fb9b47` | bounded normalized TaskRepository |
+| 4 | `755e001` | field-level legacy migration and read projection |
+| 5 | `0ad7729` | VerificationPolicy authority behind Task boundary |
+| 6 | `39e18f8` | atomic token budget/reservation ledger |
+| 7 | `eb490ce` | Service/CLI wiring and Adjudication persistence |
+
+### Normalized authority and compatibility boundary
+
+The normalized Task boundary owns exactly:
+
+```text
+task_definitions
+task_lifecycle
+verification_policies
+adjudication_decisions
+token_budgets
+token_reservations
+```
+
+`VerificationPolicy` has no `allowed_paths` field. Workspace mutation scope
+remains owned by `TaskWorkspace` and execution confinement;
+`VerificationOracle.relevant_paths` remains relevance metadata only.
+
+Legacy retirement was field-by-field. Immutable definition fields, business
+lifecycle fields, VerificationPolicy ID/version, and final `resolution` now
+project from normalized authority. The temporary `legacy_task_projection`
+continues to carry unmigrated conversation, hypotheses, evidence/test copies,
+changed-file copies, approvals, investigation/recovery state, compaction
+metrics, Artifact references, research metadata, and report fields. The
+historical `tasks` table is retained read-only as the rollback source and is
+never dual-written after backfill.
+
+No Evidence, Investigation, Execution/Receipt, Message/Todo, Snapshot,
+Artifact, or History table was moved into the Task domain. Those migrations
+remain Plan 3 work.
+
+### Migration and rollback evidence
+
+- `tests/task_domain/test_migration.py`: **12 passed**.
+- Historical whole-payload backfill preserves the original row, immutable
+  definition, business lifecycle version, and unmigrated-field updates.
+- Historical rows without a conversation receive the stable ordinal-zero User
+  Message ID; historical completed rows backfill a canonical Adjudication.
+- First backfill inserts definition, lifecycle, and projection in one
+  transaction. Fault injection proves a projection failure rolls the entire
+  migration back.
+- Definition and legacy projection hashes are reread and compared before the
+  migration transaction commits.
+
+### Verification commands and exact results
+
+- Plan 2 focused gate: **135 passed**.
+- Trusted execution/navigation gate: **254 passed, 2 failed**. Both failures
+  are the pre-existing Windows sandbox `_overlapped` / `WinError 10106`
+  failures in the two long-context workflow tests; no new failure appeared.
+- The repository's literal `pytest -q` command remains blocked at collection
+  by duplicate `test_models.py` module names. Running the full offline suite
+  with `PYTHONPATH=src;tests` and `--import-mode=importlib`, while explicitly
+  deselecting the two known Windows environment failures, produced
+  **969 passed, 2 skipped, 4 deselected**.
+- The three initially exposed investigation middleware regressions were traced
+  to a test fixture that mutated `workspace_baseline_id` after immutable task
+  creation. Initializing that baseline before the first save made all three
+  regression tests pass without weakening Task Definition immutability.
+- `ruff check src tests`: PASS.
+- `git diff --check`: PASS.
+- No online QuixBugs campaign or other paid acceptance run was executed.
+
+### Plan 3 handoff
+
+Plan 3 must consolidate Evidence/Research, Investigation,
+Execution/Receipt/Approval, and History/Compaction repositories before Plan 4
+can remove `legacy_task_projection`, the historical `tasks` rollback table,
+WorkingMemoryStore, Phase compatibility, and copied report fields.
 
 ## Plan 2 Review Checkpoint
 
