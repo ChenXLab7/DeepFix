@@ -8,6 +8,7 @@ from deepfix.task_domain.models import (
     TaskLifecycleStatus,
     validate_lifecycle_transition,
 )
+from deepfix.task_domain.repository import TaskRepository
 
 __all__ = [
     "AdjudicationDecision",
@@ -17,5 +18,6 @@ __all__ = [
     "TaskLifecycle",
     "TaskLifecycleConflict",
     "TaskLifecycleStatus",
+    "TaskRepository",
     "validate_lifecycle_transition",
 ]
