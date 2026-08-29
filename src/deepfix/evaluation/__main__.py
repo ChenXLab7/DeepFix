@@ -10,8 +10,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from deepfix.evaluation.compare import compare_summaries, decide_migration
 from deepfix.evaluation.experiment import ExperimentLoopRunner
-from deepfix.evaluation.harness import CaseRunner, EvaluationHarness
+from deepfix.evaluation.harness import (
+    CaseRunner,
+    EvaluationHarness,
+    validate_evaluation_source,
+)
 from deepfix.evaluation.legacy import LegacyLoopRunner
 from deepfix.evaluation.manifest import load_manifest
 from deepfix.evaluation.metrics import (
@@ -77,6 +82,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--manifest",
         default="evaluations/quixbugs-python.json",
     )
+
+    compare = subparsers.add_parser("compare")
+    compare.add_argument("--gate", required=True)
+    compare.add_argument("--legacy", required=True)
+    compare.add_argument("--experiment", required=True)
+    compare.add_argument("--report", required=True)
+    compare.add_argument("--decision", required=True)
     return parser
 
 
@@ -118,6 +130,14 @@ def main(
             f"cases={len(summary.case_ids)} runs={len(summary.runs)}"
         )
         return 0
+    if args.command == "compare":
+        return _compare_evaluations(
+            gate_path=Path(args.gate),
+            legacy_path=Path(args.legacy),
+            experiment_path=Path(args.experiment),
+            report_path=Path(args.report),
+            decision_path=Path(args.decision),
+        )
     if args.command == "merge-summaries":
         return _merge_summaries(
             [Path(path) for path in args.summaries],
@@ -134,8 +154,23 @@ def main(
     try:
         manifest = load_manifest(manifest_path)
         cases = _select_cases(manifest.cases, args.selected_cases)
+        if args.gate:
+            _validate_run_against_gate(
+                gate_path=Path(args.gate),
+                manifest_path=manifest_path,
+                manifest_budget=manifest.budget,
+                runs=args.runs,
+                selected_cases=args.selected_cases,
+            )
     except (OSError, TypeError, ValueError) as error:
         print(f"invalid manifest: {error}", file=sys.stderr)
+        return 2
+
+    project = Path(args.project).expanduser().resolve()
+    try:
+        validate_evaluation_source(cases, project)
+    except (OSError, ValueError) as error:
+        print(f"invalid evaluation source: {error}", file=sys.stderr)
         return 2
 
     if args.dry_run:
@@ -154,10 +189,6 @@ def main(
         print("--output and --summary are required for online evaluation", file=sys.stderr)
         return 2
 
-    project = Path(args.project).expanduser().resolve()
-    if not project.is_dir():
-        print(f"project directory does not exist: {project}", file=sys.stderr)
-        return 2
     project_python = Path(args.python).expanduser().resolve()
     if not project_python.is_file():
         print(f"python executable does not exist: {project_python}", file=sys.stderr)
@@ -342,6 +373,88 @@ def _registered_thresholds() -> GateThresholds:
         minimum_wrong_hypothesis_recovery_delta=0.15,
         maximum_token_multiplier=1.5,
         fault_invariant_violations=0,
+    )
+
+
+def _validate_run_against_gate(
+    *,
+    gate_path: Path,
+    manifest_path: Path,
+    manifest_budget: EvaluationBudget,
+    runs: int,
+    selected_cases: list[str] | None,
+) -> None:
+    gate = GateDefinition.model_validate_json(
+        gate_path.expanduser().resolve().read_text(encoding="utf-8")
+    )
+    if gate.case_manifest_sha256 != _sha256_file(manifest_path):
+        raise ValueError("gate case manifest hash does not match")
+    if gate.budget != manifest_budget:
+        raise ValueError("gate budget differs from manifest")
+    if gate.runs_per_case != runs:
+        raise ValueError("run count differs from immutable gate")
+    if gate.thresholds != _registered_thresholds():
+        raise ValueError("gate thresholds differ from preregistered values")
+    if selected_cases:
+        raise ValueError("gate-bound run must execute the complete case manifest")
+
+
+def _compare_evaluations(
+    *,
+    gate_path: Path,
+    legacy_path: Path,
+    experiment_path: Path,
+    report_path: Path,
+    decision_path: Path,
+) -> int:
+    try:
+        gate = GateDefinition.model_validate_json(
+            gate_path.expanduser().resolve().read_text(encoding="utf-8")
+        )
+        legacy = validate_summary(legacy_path)
+        experiment = validate_summary(experiment_path)
+        comparison = compare_summaries(
+            gate,
+            legacy,
+            experiment,
+            fault_invariant_violations=0,
+        )
+        decision = decide_migration(comparison)
+        _write_text_atomic(
+            report_path.expanduser().resolve(),
+            comparison.model_dump_json(indent=2) + "\n",
+        )
+        _write_text_atomic(
+            decision_path.expanduser().resolve(),
+            _render_gate_decision(comparison, decision),
+        )
+    except (OSError, TypeError, ValueError) as error:
+        print(f"cannot compare evaluation summaries: {error}", file=sys.stderr)
+        return 3
+    print(
+        f"A/B gate decision: {decision.status}; "
+        f"report={report_path} decision={decision_path}"
+    )
+    return {"pass": 0, "fail": 2, "inconclusive": 3}[decision.status]
+
+
+def _render_gate_decision(comparison: Any, decision: Any) -> str:
+    failed = ", ".join(decision.failed_thresholds) or "none"
+    inconclusive = ", ".join(decision.inconclusive_reasons) or "none"
+    return (
+        "# DeepFix Experiment Loop A/B Decision\n\n"
+        f"**Status:** {decision.status}\n\n"
+        f"- Paired runs: {comparison.paired_run_count}\n"
+        f"- Success-rate delta: {comparison.success_rate_delta:.6f}\n"
+        f"- Newly solved stable failures: "
+        f"{comparison.newly_solved_stable_failures}\n"
+        f"- Token multiplier: {comparison.token_multiplier}\n"
+        f"- False-FIXED rate: "
+        f"{comparison.experiment_false_fixed_per_all_tasks:.6f}\n"
+        f"- Wrong-hypothesis recovery delta: "
+        f"{comparison.wrong_hypothesis_recovery_delta}\n"
+        f"- Failed thresholds: {failed}\n"
+        f"- Inconclusive reasons: {inconclusive}\n"
     )
 
 
@@ -645,6 +758,7 @@ def _positive_int(value: str) -> int:
 
 def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--gate")
     parser.add_argument("--project", required=True)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--runs", type=_positive_int, default=3)

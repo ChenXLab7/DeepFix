@@ -131,6 +131,29 @@ class EvaluationHarness:
         )
 
 
+def validate_evaluation_source(
+    cases: list[EvaluationCase],
+    source: Path,
+) -> Path:
+    unresolved_source = source.expanduser().absolute()
+    _reject_links_and_junctions(unresolved_source)
+    source_root = unresolved_source.resolve(strict=True)
+    for case in cases:
+        source_directory = (source_root / case.source_subdir).resolve(strict=True)
+        try:
+            source_directory.relative_to(source_root)
+        except ValueError as error:
+            raise ValueError("source_subdir escapes source root") from error
+        if not source_directory.is_dir():
+            raise ValueError(f"source directory does not exist: {source_directory}")
+        if case.source_variant == "correct_control":
+            allowed_paths = {
+                _normalized_relative(path) for path in case.allowed_paths
+            }
+            _correct_control_paths(source_directory, allowed_paths)
+    return source_root
+
+
 def _normalized_relative(value: str) -> str:
     path = PurePosixPath(value.replace("\\", "/"))
     if (
@@ -144,6 +167,15 @@ def _normalized_relative(value: str) -> str:
 
 
 def _prepare_correct_control(workspace: Path, allowed_paths: set[str]) -> None:
+    answer, target = _correct_control_paths(workspace, allowed_paths)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(answer, target)
+
+
+def _correct_control_paths(
+    workspace: Path,
+    allowed_paths: set[str],
+) -> tuple[Path, Path]:
     if len(allowed_paths) != 1:
         raise ValueError("correct_control requires exactly one allowed path")
     target_relative = next(iter(allowed_paths))
@@ -162,8 +194,7 @@ def _prepare_correct_control(workspace: Path, allowed_paths: set[str]) -> None:
         raise ValueError("correct_control answer escapes workspace") from error
     if not answer.is_file():
         raise ValueError(f"correct_control answer does not exist: {answer_relative}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(answer, target)
+    return answer, target
 
 
 def _remove_gold_material(workspace: Path) -> None:

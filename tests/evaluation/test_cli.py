@@ -95,6 +95,77 @@ def test_cli_dry_run_lists_cases_without_constructing_runner(
     assert "sample-buggy" in capsys.readouterr().out
 
 
+def test_run_cli_rejects_run_count_that_differs_from_gate(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    baseline = _write_batch_summary(tmp_path, monkeypatch, run_start=1, runs=3)
+    manifest = baseline.parent / "cases.json"
+    gate_path = tmp_path / "gate.json"
+    gate_path.write_text(
+        json.dumps(_valid_gate(manifest, baseline)),
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "baseline",
+            "--manifest",
+            str(manifest),
+            "--gate",
+            str(gate_path),
+            "--project",
+            str(tmp_path),
+            "--runs",
+            "2",
+            "--dry-run",
+        ]
+    )
+
+    assert code == 2
+    assert "run count" in capsys.readouterr().err
+
+
+def test_dry_run_rejects_correct_control_without_gold_source(
+    tmp_path,
+    capsys,
+) -> None:
+    manifest = _write_manifest(
+        tmp_path / "cases.json",
+        cases=[
+            {
+                "case_id": "sample-control",
+                "problem": "verify the corrected sample",
+                "allowed_paths": ["python_programs/sample.py"],
+                "required_command": "python -m pytest -q",
+                "expected_outcome": "not_reproduced",
+                "source_variant": "correct_control",
+            }
+        ],
+    )
+    source = tmp_path / "source"
+    (source / "python_programs").mkdir(parents=True)
+    (source / "python_programs" / "sample.py").write_text(
+        "VALUE = 'buggy'\n",
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "baseline",
+            "--manifest",
+            str(manifest),
+            "--project",
+            str(source),
+            "--dry-run",
+        ]
+    )
+
+    assert code == 2
+    assert "correct_control answer does not exist" in capsys.readouterr().err
+
+
 def test_evaluation_cli_has_experiment_command_but_production_cli_has_no_loop_flag(
     tmp_path,
     capsys,
@@ -189,6 +260,57 @@ def test_preregister_writes_hash_bound_gate_and_refuses_changed_overwrite(
 
     assert second == 2
     assert "immutable gate" in capsys.readouterr().err
+
+
+def test_compare_cli_writes_report_and_inconclusive_decision(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    legacy_path = _write_batch_summary(
+        tmp_path,
+        monkeypatch,
+        run_start=1,
+        runs=3,
+    )
+    manifest_path = legacy_path.parent / "cases.json"
+    gate_path = tmp_path / "gate.json"
+    gate_path.write_text(
+        json.dumps(_valid_gate(manifest_path, legacy_path)),
+        encoding="utf-8",
+    )
+    experiment_path = tmp_path / "experiment.json"
+    experiment = json.loads(legacy_path.read_text(encoding="utf-8"))
+    experiment["loop"] = "experiment"
+    for run in experiment["runs"]:
+        run["loop"] = "experiment"
+        run["task_id"] = f"experiment-{run['task_id']}"
+    experiment_path.write_text(json.dumps(experiment), encoding="utf-8")
+    report_path = tmp_path / "report.json"
+    decision_path = tmp_path / "decision.md"
+
+    code = main(
+        [
+            "compare",
+            "--gate",
+            str(gate_path),
+            "--legacy",
+            str(legacy_path),
+            "--experiment",
+            str(experiment_path),
+            "--report",
+            str(report_path),
+            "--decision",
+            str(decision_path),
+        ]
+    )
+
+    assert code == 3
+    assert json.loads(report_path.read_text(encoding="utf-8"))[
+        "paired_run_count"
+    ] == 3
+    decision = decision_path.read_text(encoding="utf-8")
+    assert "# DeepFix Experiment Loop A/B Decision" in decision
+    assert "**Status:** inconclusive" in decision
 
 
 def test_cli_refuses_model_execution_without_online_opt_in(
