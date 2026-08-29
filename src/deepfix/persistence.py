@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+from deepfix.database import SQLiteDatabase
 from deepfix.models import TaskState
 
 
@@ -16,13 +17,9 @@ def open_sqlite_connection(
     *,
     check_same_thread: bool = False,
 ) -> sqlite3.Connection:
-    connection = sqlite3.connect(
-        Path(database_path).expanduser().resolve(),
+    return SQLiteDatabase(database_path).connect(
         check_same_thread=check_same_thread,
     )
-    connection.execute("PRAGMA busy_timeout = 5000")
-    connection.execute("PRAGMA journal_mode = WAL")
-    return connection
 
 
 class TaskRepository:
