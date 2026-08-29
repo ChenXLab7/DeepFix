@@ -16,6 +16,14 @@ from deepfix.compaction.models import (
     SystemTestEvidence,
 )
 from deepfix.compaction.snapshot import snapshot_content_hash
+from deepfix.database import SQLiteDatabase
+from deepfix.domain_repositories.evidence import (
+    EvidenceKind,
+    EvidenceRepository,
+    deterministic_provenance_roots,
+    restore_deterministic_evidence,
+)
+from deepfix.domain_repositories.migration import domain_is_switched
 from deepfix.persistence import open_sqlite_connection
 
 DeterministicEvidence: TypeAlias = (
@@ -31,36 +39,38 @@ _EVIDENCE_TYPES: dict[str, type[BaseModel]] = {
 
 
 class CompactionStore:
-    def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path).expanduser().resolve()
+    def __init__(self, database_path: SQLiteDatabase | str | Path) -> None:
+        self.database = (
+            database_path
+            if isinstance(database_path, SQLiteDatabase)
+            else SQLiteDatabase(database_path)
+        )
+        self.database_path = self.database.path
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        self.evidence_repository = EvidenceRepository(self.database)
 
     def save_evidence(self, task_id: str, evidence: DeterministicEvidence) -> None:
-        task_id = _required(task_id, "task_id")
-        kind = _evidence_kind(evidence)
-        payload = evidence.model_dump_json()
-        with open_sqlite_connection(self.database_path) as connection:
-            existing = connection.execute(
-                "SELECT payload FROM deterministic_evidence WHERE task_id = ? AND evidence_id = ?",
-                (task_id, evidence.evidence_id),
-            ).fetchone()
-            if existing is not None:
-                if str(existing[0]) != payload:
-                    raise ValueError("deterministic evidence 不能被不同内容覆盖")
-                return
-            connection.execute(
-                """
-                INSERT INTO deterministic_evidence(
-                    task_id, evidence_id, kind, payload, created_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (task_id, evidence.evidence_id, kind, payload, _utc_now()),
-            )
-            connection.commit()
+        self.evidence_repository.record_deterministic(
+            _required(task_id, "task_id"),
+            evidence,
+            provenance_root_ids=deterministic_provenance_roots(evidence),
+        )
 
     def list_evidence(self, task_id: str) -> list[DeterministicEvidence]:
         task_id = _required(task_id, "task_id")
+        current = {
+            item.evidence_id: restore_deterministic_evidence(item)
+            for item in self.evidence_repository.list_for_task(task_id)
+            if item.kind in {
+                EvidenceKind.TEST,
+                EvidenceKind.FILE_CHANGE,
+                EvidenceKind.APPROVAL,
+                EvidenceKind.RESEARCH_STATUS,
+            }
+        }
+        if domain_is_switched(self.database, "deterministic_evidence", task_id):
+            return list(current.values())
         with open_sqlite_connection(self.database_path) as connection:
             rows = connection.execute(
                 """
@@ -69,10 +79,13 @@ class CompactionStore:
                 """,
                 (task_id,),
             ).fetchall()
-        return [
+        legacy = [
             _EVIDENCE_TYPES[str(kind)].model_validate_json(str(payload))
             for kind, payload in rows
         ]
+        merged = {item.evidence_id: item for item in legacy}
+        merged.update(current)
+        return list(merged.values())
 
     def save_prepared_snapshot(
         self,
@@ -331,18 +344,6 @@ class CompactionStore:
                 """
             )
             connection.commit()
-
-
-def _evidence_kind(evidence: DeterministicEvidence) -> str:
-    if isinstance(evidence, SystemTestEvidence):
-        return "test"
-    if isinstance(evidence, FileChangeEvidence):
-        return "file"
-    if isinstance(evidence, ApprovalEvidence):
-        return "approval"
-    if isinstance(evidence, ResearchStatusEvidence):
-        return "research"
-    raise TypeError(f"不支持的 deterministic evidence: {type(evidence).__name__}")
 
 
 def _required(value: str, name: str) -> str:

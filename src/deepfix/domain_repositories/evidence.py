@@ -83,6 +83,13 @@ DeterministicEvidence: TypeAlias = (
 )
 ArtifactVerifier: TypeAlias = Callable[[ArtifactReference], bool]
 
+_DETERMINISTIC_PAYLOAD_TYPES: dict[str, type[DeterministicEvidence]] = {
+    "SystemTestEvidence": SystemTestEvidence,
+    "FileChangeEvidence": FileChangeEvidence,
+    "ApprovalEvidence": ApprovalEvidence,
+    "ResearchStatusEvidence": ResearchStatusEvidence,
+}
+
 
 class EvidenceRepository:
     """Own immutable current Evidence metadata, never acquisition behavior."""
@@ -365,6 +372,26 @@ def _deterministic_policy(
             _verification_from_text(evidence.verification),
         )
     raise TypeError(f"Unsupported deterministic Evidence: {type(evidence).__name__}")
+
+
+def deterministic_provenance_roots(evidence: DeterministicEvidence) -> list[str]:
+    if isinstance(evidence, SystemTestEvidence):
+        return [evidence.tool_call_id]
+    if isinstance(evidence, FileChangeEvidence):
+        source = evidence.tool_call_id or evidence.source_message_id
+        return [source or f"file-projection:{evidence.evidence_id}"]
+    if isinstance(evidence, ApprovalEvidence):
+        return [f"approval:{evidence.evidence_id}"]
+    if isinstance(evidence, ResearchStatusEvidence):
+        return [f"research:{evidence.evidence_id}"]
+    raise TypeError(f"Unsupported deterministic Evidence: {type(evidence).__name__}")
+
+
+def restore_deterministic_evidence(envelope: EvidenceEnvelope) -> DeterministicEvidence:
+    model = _DETERMINISTIC_PAYLOAD_TYPES.get(envelope.payload_type)
+    if model is None:
+        raise TypeError(f"Envelope is not deterministic Evidence: {envelope.payload_type}")
+    return model.model_validate(envelope.payload)
 
 
 def _verification_from_text(value: str) -> EvidenceVerification:

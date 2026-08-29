@@ -14,6 +14,8 @@ from deepfix.compaction.models import (
     ResearchStatusEvidence,
     SystemTestEvidence,
 )
+from deepfix.compaction.store import CompactionStore
+from deepfix.database import SQLiteDatabase
 from deepfix.domain_repositories.evidence import (
     ArtifactIntegrityError,
     EvidenceAuthority,
@@ -22,17 +24,23 @@ from deepfix.domain_repositories.evidence import (
     EvidenceRepository,
     EvidenceVerification,
 )
+from deepfix.domain_repositories.migration import DomainMigrator
 from deepfix.models import Evidence
 from deepfix.research.models import ExternalEvidence
 
 
-def _test_evidence(*, exit_code: int = 0) -> SystemTestEvidence:
+def _test_evidence(
+    *,
+    evidence_id: str = "test-evidence-1",
+    tool_call_id: str = "tool-call-1",
+    exit_code: int = 0,
+) -> SystemTestEvidence:
     return SystemTestEvidence(
-        evidence_id="test-evidence-1",
+        evidence_id=evidence_id,
         command="python -m pytest tests/test_value.py -q",
         exit_code=exit_code,
         summary="1 passed" if exit_code == 0 else "1 failed",
-        tool_call_id="tool-call-1",
+        tool_call_id=tool_call_id,
         source_message_id="tool-message-1",
         origin="user_specified",
         scope="targeted",
@@ -238,3 +246,90 @@ def test_verified_artifact_and_provenance_are_returned_by_task_view(tmp_path: Pa
     assert view.evidence_ids == [stored.evidence_id]
     assert view.verified_evidence_ids == []
     assert view.contradicted_evidence_ids == [stored.evidence_id]
+
+
+def _seed_legacy_evidence(database: SQLiteDatabase, evidence: SystemTestEvidence) -> None:
+    with database.unit_of_work() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deterministic_evidence (
+                task_id TEXT NOT NULL,
+                evidence_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(task_id, evidence_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO deterministic_evidence(
+                task_id, evidence_id, kind, payload, created_at
+            ) VALUES (?, ?, 'test', ?, ?)
+            """,
+            (
+                "task-1",
+                evidence.evidence_id,
+                evidence.model_dump_json(),
+                "2026-08-29T00:00:00+00:00",
+            ),
+        )
+
+
+def _legacy_rows(database: SQLiteDatabase) -> list[tuple[str, str, str, str]]:
+    with database.connection() as connection:
+        return connection.execute(
+            """
+            SELECT task_id, evidence_id, kind, payload
+            FROM deterministic_evidence ORDER BY task_id, evidence_id
+            """
+        ).fetchall()
+
+
+def test_deterministic_backfill_preserves_ids_payload_hashes_and_counts(tmp_path: Path):
+    database = SQLiteDatabase(tmp_path / "deepfix.db")
+    evidence = _test_evidence()
+    _seed_legacy_evidence(database, evidence)
+
+    report = DomainMigrator(database).migrate_deterministic_evidence("task-1")
+
+    assert report.source_count == report.target_count == 1
+    assert report.source_hash == report.target_hash
+    assert report.identity_mismatches == []
+    assert report.hash_mismatches == []
+    assert report.missing_references == []
+    assert report.ready_to_switch
+    assert CompactionStore(database).list_evidence("task-1") == [evidence]
+
+
+def test_backfill_is_idempotent_and_legacy_rows_become_read_only(tmp_path: Path):
+    database = SQLiteDatabase(tmp_path / "deepfix.db")
+    _seed_legacy_evidence(database, _test_evidence())
+    before = _legacy_rows(database)
+    migrator = DomainMigrator(database)
+
+    first = migrator.migrate_deterministic_evidence("task-1")
+    second = migrator.migrate_deterministic_evidence("task-1")
+    CompactionStore(database).save_evidence(
+        "task-1",
+        _test_evidence(
+            evidence_id="test-evidence-2",
+            tool_call_id="tool-call-2",
+        ),
+    )
+
+    assert second == first
+    assert _legacy_rows(database) == before
+    assert [
+        item.evidence_id for item in CompactionStore(database).list_evidence("task-1")
+    ] == ["test-evidence-1", "test-evidence-2"]
+
+
+def test_new_deterministic_write_never_populates_legacy_table(tmp_path: Path):
+    database = SQLiteDatabase(tmp_path / "deepfix.db")
+    store = CompactionStore(database)
+
+    store.save_evidence("task-1", _test_evidence())
+
+    assert _legacy_rows(database) == []
