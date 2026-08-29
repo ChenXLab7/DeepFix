@@ -70,6 +70,7 @@ def test_lifecycle_excludes_agent_phases() -> None:
         (TaskLifecycleStatus.WAITING_APPROVAL, TaskLifecycleStatus.RUNNING),
         (TaskLifecycleStatus.RUNNING, TaskLifecycleStatus.PAUSED),
         (TaskLifecycleStatus.PAUSED, TaskLifecycleStatus.RUNNING),
+        (TaskLifecycleStatus.PAUSED, TaskLifecycleStatus.WAITING_APPROVAL),
         (TaskLifecycleStatus.RUNNING, TaskLifecycleStatus.COMPLETED),
     ],
 )

@@ -62,6 +62,7 @@ _ALLOWED_LIFECYCLE_TRANSITIONS: dict[
     TaskLifecycleStatus.PAUSED: frozenset(
         {
             TaskLifecycleStatus.RUNNING,
+            TaskLifecycleStatus.WAITING_APPROVAL,
             TaskLifecycleStatus.FAILED,
             TaskLifecycleStatus.CANCELLED,
         }
