@@ -1,17 +1,78 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 import pytest
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.runtime import ExecutionInfo, Runtime
 
+from deepfix.database import SQLiteDatabase
 from deepfix.investigation.token_budget import (
     TokenBudgetCallbackHandler,
+    TokenBudgetConflict,
     TokenBudgetExhausted,
     TokenBudgetMiddleware,
     TokenBudgetStore,
 )
+
+
+def test_parallel_reservations_cannot_oversubscribe_budget(tmp_path) -> None:
+    store = TokenBudgetStore(tmp_path / "state.db")
+    store.initialize("task-1", input_cap=100, output_cap=50)
+    barrier = Barrier(2)
+
+    def reserve(call_id):
+        barrier.wait()
+        try:
+            store.reserve(
+                "task-1",
+                call_id,
+                input_tokens=70,
+                output_tokens=30,
+            )
+            return "reserved"
+        except TokenBudgetExhausted:
+            return "blocked"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(reserve, ["call-1", "call-2"]))
+
+    assert sorted(results) == ["blocked", "reserved"]
+
+
+def test_reservation_replay_is_idempotent_but_conflicting_payload_fails(
+    tmp_path,
+) -> None:
+    store = TokenBudgetStore(tmp_path / "state.db")
+    store.initialize("task-1", input_cap=100, output_cap=50)
+    first = store.reserve(
+        "task-1", "call-1", input_tokens=20, output_tokens=10
+    )
+
+    assert (
+        store.reserve(
+            "task-1", "call-1", input_tokens=20, output_tokens=10
+        )
+        == first
+    )
+    with pytest.raises(TokenBudgetConflict, match="identity"):
+        store.reserve(
+            "task-1", "call-1", input_tokens=21, output_tokens=10
+        )
+
+
+def test_store_accepts_shared_sqlite_database(tmp_path) -> None:
+    database = SQLiteDatabase(tmp_path / "state.db")
+    first = TokenBudgetStore(database=database)
+    second = TokenBudgetStore(database=database)
+    first.initialize("task-1", input_cap=100, output_cap=50)
+    first.reserve("task-1", "call-1", input_tokens=20, output_tokens=10)
+
+    assert second.available("task-1").input_tokens == 80
+    assert second.available("task-1").output_tokens == 40
 
 
 def test_reservation_blocks_call_that_cannot_fit(tmp_path) -> None:

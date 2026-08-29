@@ -20,6 +20,11 @@ from deepfix.task_domain.models import (
 )
 
 if TYPE_CHECKING:
+    from deepfix.investigation.token_budget import (
+        TokenBalance,
+        TokenReservation,
+        TokenUsage,
+    )
     from deepfix.verification import VerificationPolicy
 
 
@@ -97,6 +102,190 @@ class TaskRepository:
     ) -> VerificationPolicy | None:
         with self.database.connection() as connection:
             return self._load_verification_policy(connection, task_id, version)
+
+    def initialize_token_budget(
+        self,
+        task_id: str,
+        *,
+        input_cap: int,
+        output_cap: int,
+    ) -> None:
+        from deepfix.investigation.token_budget import TokenBudgetConflict
+
+        if input_cap <= 0 or output_cap <= 0:
+            raise ValueError("token caps must be positive")
+        with self.database.unit_of_work(immediate=True) as connection:
+            row = connection.execute(
+                """
+                SELECT input_cap, output_cap FROM token_budgets
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO token_budgets(
+                        task_id, input_cap, output_cap,
+                        settled_input, settled_output, breached, updated_at
+                    ) VALUES (?, ?, ?, 0, 0, 0, ?)
+                    """,
+                    (task_id, input_cap, output_cap, _now()),
+                )
+                return
+            if (int(row[0]), int(row[1])) != (input_cap, output_cap):
+                raise TokenBudgetConflict("token budget caps cannot change")
+
+    def reserve_tokens(
+        self,
+        task_id: str,
+        call_id: str,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> TokenReservation:
+        from deepfix.investigation.token_budget import (
+            TokenBudgetConflict,
+            TokenBudgetExhausted,
+            TokenReservation,
+        )
+
+        if input_tokens < 0 or output_tokens < 0:
+            raise ValueError("token reservation cannot be negative")
+        reservation_id = _token_reservation_id(task_id, call_id)
+        with self.database.unit_of_work(immediate=True) as connection:
+            existing = self._load_token_reservation(connection, reservation_id)
+            if existing is not None:
+                if (
+                    existing.task_id != task_id
+                    or existing.call_id != call_id
+                    or existing.reserved_input_tokens != input_tokens
+                    or existing.reserved_output_tokens != output_tokens
+                ):
+                    raise TokenBudgetConflict("token reservation identity conflict")
+                return existing
+            budget = self._token_budget_row(connection, task_id)
+            if bool(budget[4]):
+                raise TokenBudgetExhausted("token budget breach blocks new calls")
+            outstanding = connection.execute(
+                """
+                SELECT COALESCE(SUM(reserved_input), 0),
+                       COALESCE(SUM(reserved_output), 0)
+                FROM token_reservations
+                WHERE task_id = ? AND status = 'reserved'
+                """,
+                (task_id,),
+            ).fetchone()
+            available_input = int(budget[0]) - int(budget[2]) - int(outstanding[0])
+            available_output = int(budget[1]) - int(budget[3]) - int(outstanding[1])
+            if input_tokens > available_input or output_tokens > available_output:
+                raise TokenBudgetExhausted(
+                    "token reservation exceeds available budget"
+                )
+            reservation = TokenReservation(
+                reservation_id=reservation_id,
+                task_id=task_id,
+                call_id=call_id,
+                reserved_input_tokens=input_tokens,
+                reserved_output_tokens=output_tokens,
+                status="reserved",
+            )
+            connection.execute(
+                """
+                INSERT INTO token_reservations(
+                    reservation_id, task_id, call_id,
+                    reserved_input, reserved_output, status,
+                    actual_input, actual_output, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'reserved', NULL, NULL, ?)
+                """,
+                (
+                    reservation_id,
+                    task_id,
+                    call_id,
+                    input_tokens,
+                    output_tokens,
+                    _now(),
+                ),
+            )
+            return reservation
+
+    def settle_tokens(
+        self,
+        reservation_id: str,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> TokenReservation:
+        if input_tokens < 0 or output_tokens < 0:
+            raise ValueError("actual token usage cannot be negative")
+        with self.database.unit_of_work(immediate=True) as connection:
+            return self._settle_tokens(
+                connection,
+                reservation_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                status="settled",
+            )
+
+    def charge_unknown_tokens(self, reservation_id: str) -> TokenReservation:
+        with self.database.unit_of_work(immediate=True) as connection:
+            reservation = self._load_token_reservation(connection, reservation_id)
+            if reservation is None:
+                raise KeyError(reservation_id)
+            return self._settle_tokens(
+                connection,
+                reservation_id,
+                input_tokens=reservation.reserved_input_tokens,
+                output_tokens=reservation.reserved_output_tokens,
+                status="unknown",
+            )
+
+    def available_tokens(self, task_id: str) -> TokenBalance:
+        from deepfix.investigation.token_budget import TokenBalance
+
+        with self.database.connection() as connection:
+            budget = self._token_budget_row(connection, task_id)
+            outstanding = connection.execute(
+                """
+                SELECT COALESCE(SUM(reserved_input), 0),
+                       COALESCE(SUM(reserved_output), 0)
+                FROM token_reservations
+                WHERE task_id = ? AND status = 'reserved'
+                """,
+                (task_id,),
+            ).fetchone()
+        return TokenBalance(
+            input_tokens=max(
+                0,
+                int(budget[0]) - int(budget[2]) - int(outstanding[0]),
+            ),
+            output_tokens=max(
+                0,
+                int(budget[1]) - int(budget[3]) - int(outstanding[1]),
+            ),
+            breached=bool(budget[4]),
+        )
+
+    def token_usage(self, task_id: str) -> TokenUsage:
+        from deepfix.investigation.token_budget import TokenUsage
+
+        with self.database.connection() as connection:
+            budget = self._token_budget_row(connection, task_id)
+            row = connection.execute(
+                """
+                SELECT COUNT(*),
+                       COALESCE(SUM(CASE WHEN status = 'unknown' THEN 1 ELSE 0 END), 0)
+                FROM token_reservations
+                WHERE task_id = ? AND status IN ('settled', 'unknown')
+                """,
+                (task_id,),
+            ).fetchone()
+        return TokenUsage(
+            input_tokens=int(budget[2]),
+            output_tokens=int(budget[3]),
+            model_calls=int(row[0]),
+            estimated=bool(row[1]),
+        )
 
     def save_legacy_projection(self, task) -> None:
         from deepfix.task_domain.migration import (
@@ -263,6 +452,35 @@ class TaskRepository:
                     payload TEXT NOT NULL,
                     PRIMARY KEY(task_id, version),
                     UNIQUE(policy_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS token_budgets (
+                    task_id TEXT PRIMARY KEY,
+                    input_cap INTEGER NOT NULL,
+                    output_cap INTEGER NOT NULL,
+                    settled_input INTEGER NOT NULL,
+                    settled_output INTEGER NOT NULL,
+                    breached INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS token_reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    call_id TEXT NOT NULL,
+                    reserved_input INTEGER NOT NULL,
+                    reserved_output INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    actual_input INTEGER,
+                    actual_output INTEGER,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(task_id, call_id)
                 )
                 """
             )
@@ -461,6 +679,114 @@ class TaskRepository:
         row = connection.execute(query, parameters).fetchone()
         return VerificationPolicy.model_validate_json(row[0]) if row else None
 
+    def _settle_tokens(
+        self,
+        connection: sqlite3.Connection,
+        reservation_id: str,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        status: str,
+    ) -> TokenReservation:
+        from deepfix.investigation.token_budget import (
+            TokenBudgetConflict,
+        )
+
+        current = self._load_token_reservation(connection, reservation_id)
+        if current is None:
+            raise KeyError(reservation_id)
+        if current.status != "reserved":
+            if (
+                current.actual_input_tokens == input_tokens
+                and current.actual_output_tokens == output_tokens
+                and current.status == status
+            ):
+                return current
+            raise TokenBudgetConflict("token reservation settlement conflict")
+        breached = (
+            input_tokens > current.reserved_input_tokens
+            or output_tokens > current.reserved_output_tokens
+        )
+        connection.execute(
+            """
+            UPDATE token_budgets SET
+                settled_input = settled_input + ?,
+                settled_output = settled_output + ?,
+                breached = CASE WHEN ? THEN 1 ELSE breached END,
+                updated_at = ?
+            WHERE task_id = ?
+            """,
+            (
+                input_tokens,
+                output_tokens,
+                int(breached),
+                _now(),
+                current.task_id,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE token_reservations SET
+                status = ?, actual_input = ?, actual_output = ?, updated_at = ?
+            WHERE reservation_id = ? AND status = 'reserved'
+            """,
+            (
+                status,
+                input_tokens,
+                output_tokens,
+                _now(),
+                reservation_id,
+            ),
+        )
+        return current.model_copy(
+            update={
+                "status": status,
+                "actual_input_tokens": input_tokens,
+                "actual_output_tokens": output_tokens,
+            }
+        )
+
+    @staticmethod
+    def _token_budget_row(connection: sqlite3.Connection, task_id: str):
+        row = connection.execute(
+            """
+            SELECT input_cap, output_cap, settled_input, settled_output, breached
+            FROM token_budgets WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(task_id)
+        return row
+
+    @staticmethod
+    def _load_token_reservation(
+        connection: sqlite3.Connection,
+        reservation_id: str,
+    ) -> TokenReservation | None:
+        from deepfix.investigation.token_budget import TokenReservation
+
+        row = connection.execute(
+            """
+            SELECT task_id, call_id, reserved_input, reserved_output,
+                   status, actual_input, actual_output
+            FROM token_reservations WHERE reservation_id = ?
+            """,
+            (reservation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return TokenReservation(
+            reservation_id=reservation_id,
+            task_id=str(row[0]),
+            call_id=str(row[1]),
+            reserved_input_tokens=int(row[2]),
+            reserved_output_tokens=int(row[3]),
+            status=str(row[4]),
+            actual_input_tokens=(int(row[5]) if row[5] is not None else None),
+            actual_output_tokens=(int(row[6]) if row[6] is not None else None),
+        )
+
     def _backfill_historical_task(self, task_id: str) -> None:
         from deepfix.models import TaskState
 
@@ -549,6 +875,14 @@ def _definition_hash(definition: TaskDefinition) -> str:
         definition.model_dump(mode="json"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _token_reservation_id(task_id: str, call_id: str) -> str:
+    values = ["token-reservation", task_id.strip(), call_id.strip()]
+    if any(not value for value in values):
+        raise ValueError("token reservation identity cannot be empty")
+    digest = hashlib.sha256("|".join(values).encode()).hexdigest()[:32]
+    return f"token-reservation_{digest}"
 
 
 def _now() -> str:

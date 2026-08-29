@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Callable
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
@@ -16,9 +15,9 @@ from langgraph.config import get_config
 from pydantic import Field
 
 from deepfix.compaction.models import StrictModel
-from deepfix.investigation.identity import stable_investigation_id
-from deepfix.persistence import open_sqlite_connection
+from deepfix.database import SQLiteDatabase
 from deepfix.prompting import model_request_task_id
+from deepfix.task_domain.repository import TaskRepository
 
 
 class TokenBudgetExhausted(RuntimeError):
@@ -54,42 +53,26 @@ class TokenReservation(StrictModel):
 
 
 class TokenBudgetStore:
-    def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path).expanduser().resolve()
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize_schema()
+    def __init__(
+        self,
+        database_path: str | Path | None = None,
+        *,
+        database: SQLiteDatabase | None = None,
+    ) -> None:
+        if database is not None and database_path is not None:
+            raise ValueError("provide database_path or database, not both")
+        if database is None and database_path is None:
+            raise ValueError("database_path or database is required")
+        self.database = database or SQLiteDatabase(database_path)
+        self.database_path = self.database.path
+        self.tasks = TaskRepository(self.database)
 
     def initialize(self, task_id: str, *, input_cap: int, output_cap: int) -> None:
-        if input_cap <= 0 or output_cap <= 0:
-            raise ValueError("token caps must be positive")
-        with open_sqlite_connection(self.database_path) as connection:
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                row = connection.execute(
-                    """
-                    SELECT input_cap, output_cap FROM token_budgets
-                    WHERE task_id = ?
-                    """,
-                    (task_id,),
-                ).fetchone()
-                if row is None:
-                    connection.execute(
-                        """
-                        INSERT INTO token_budgets(
-                            task_id, input_cap, output_cap,
-                            settled_input, settled_output, breached, updated_at
-                        ) VALUES (?, ?, ?, 0, 0, 0, ?)
-                        """,
-                        (task_id, input_cap, output_cap, _now()),
-                    )
-                    connection.commit()
-                    return
-                if (int(row[0]), int(row[1])) != (input_cap, output_cap):
-                    raise TokenBudgetConflict("token budget caps cannot change")
-                connection.rollback()
-            except Exception:
-                connection.rollback()
-                raise
+        self.tasks.initialize_token_budget(
+            task_id,
+            input_cap=input_cap,
+            output_cap=output_cap,
+        )
 
     def reserve(
         self,
@@ -99,71 +82,12 @@ class TokenBudgetStore:
         input_tokens: int,
         output_tokens: int,
     ) -> TokenReservation:
-        if input_tokens < 0 or output_tokens < 0:
-            raise ValueError("token reservation cannot be negative")
-        reservation_id = stable_investigation_id(
-            "token-reservation", task_id, call_id
+        return self.tasks.reserve_tokens(
+            task_id,
+            call_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
-        with open_sqlite_connection(self.database_path) as connection:
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                existing = self._load_reservation(connection, reservation_id)
-                if existing is not None:
-                    if (
-                        existing.task_id != task_id
-                        or existing.call_id != call_id
-                        or existing.reserved_input_tokens != input_tokens
-                        or existing.reserved_output_tokens != output_tokens
-                    ):
-                        raise TokenBudgetConflict("token reservation identity conflict")
-                    connection.rollback()
-                    return existing
-                budget = self._budget_row(connection, task_id)
-                if bool(budget[4]):
-                    raise TokenBudgetExhausted("token budget breach blocks new calls")
-                outstanding = connection.execute(
-                    """
-                    SELECT COALESCE(SUM(reserved_input), 0),
-                           COALESCE(SUM(reserved_output), 0)
-                    FROM token_reservations
-                    WHERE task_id = ? AND status = 'reserved'
-                    """,
-                    (task_id,),
-                ).fetchone()
-                available_input = int(budget[0]) - int(budget[2]) - int(outstanding[0])
-                available_output = int(budget[1]) - int(budget[3]) - int(outstanding[1])
-                if input_tokens > available_input or output_tokens > available_output:
-                    raise TokenBudgetExhausted("token reservation exceeds available budget")
-                reservation = TokenReservation(
-                    reservation_id=reservation_id,
-                    task_id=task_id,
-                    call_id=call_id,
-                    reserved_input_tokens=input_tokens,
-                    reserved_output_tokens=output_tokens,
-                    status="reserved",
-                )
-                connection.execute(
-                    """
-                    INSERT INTO token_reservations(
-                        reservation_id, task_id, call_id,
-                        reserved_input, reserved_output, status,
-                        actual_input, actual_output, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'reserved', NULL, NULL, ?)
-                    """,
-                    (
-                        reservation_id,
-                        task_id,
-                        call_id,
-                        input_tokens,
-                        output_tokens,
-                        _now(),
-                    ),
-                )
-                connection.commit()
-                return reservation
-            except Exception:
-                connection.rollback()
-                raise
 
     def settle(
         self,
@@ -172,204 +96,20 @@ class TokenBudgetStore:
         input_tokens: int,
         output_tokens: int,
     ) -> TokenReservation:
-        if input_tokens < 0 or output_tokens < 0:
-            raise ValueError("actual token usage cannot be negative")
-        return self._settle(
+        return self.tasks.settle_tokens(
             reservation_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            status="settled",
         )
 
     def charge_unknown(self, reservation_id: str) -> TokenReservation:
-        with open_sqlite_connection(self.database_path) as connection:
-            reservation = self._load_reservation(connection, reservation_id)
-        if reservation is None:
-            raise KeyError(reservation_id)
-        return self._settle(
-            reservation_id,
-            input_tokens=reservation.reserved_input_tokens,
-            output_tokens=reservation.reserved_output_tokens,
-            status="unknown",
-        )
+        return self.tasks.charge_unknown_tokens(reservation_id)
 
     def available(self, task_id: str) -> TokenBalance:
-        with open_sqlite_connection(self.database_path) as connection:
-            budget = self._budget_row(connection, task_id)
-            outstanding = connection.execute(
-                """
-                SELECT COALESCE(SUM(reserved_input), 0),
-                       COALESCE(SUM(reserved_output), 0)
-                FROM token_reservations
-                WHERE task_id = ? AND status = 'reserved'
-                """,
-                (task_id,),
-            ).fetchone()
-        return TokenBalance(
-            input_tokens=max(
-                0,
-                int(budget[0]) - int(budget[2]) - int(outstanding[0]),
-            ),
-            output_tokens=max(
-                0,
-                int(budget[1]) - int(budget[3]) - int(outstanding[1]),
-            ),
-            breached=bool(budget[4]),
-        )
+        return self.tasks.available_tokens(task_id)
 
     def usage(self, task_id: str) -> TokenUsage:
-        with open_sqlite_connection(self.database_path) as connection:
-            budget = self._budget_row(connection, task_id)
-            row = connection.execute(
-                """
-                SELECT COUNT(*),
-                       COALESCE(SUM(CASE WHEN status = 'unknown' THEN 1 ELSE 0 END), 0)
-                FROM token_reservations
-                WHERE task_id = ? AND status IN ('settled', 'unknown')
-                """,
-                (task_id,),
-            ).fetchone()
-        return TokenUsage(
-            input_tokens=int(budget[2]),
-            output_tokens=int(budget[3]),
-            model_calls=int(row[0]),
-            estimated=bool(row[1]),
-        )
-
-    def _settle(
-        self,
-        reservation_id: str,
-        *,
-        input_tokens: int,
-        output_tokens: int,
-        status: Literal["settled", "unknown"],
-    ) -> TokenReservation:
-        with open_sqlite_connection(self.database_path) as connection:
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                current = self._load_reservation(connection, reservation_id)
-                if current is None:
-                    raise KeyError(reservation_id)
-                if current.status != "reserved":
-                    if (
-                        current.actual_input_tokens == input_tokens
-                        and current.actual_output_tokens == output_tokens
-                        and current.status == status
-                    ):
-                        connection.rollback()
-                        return current
-                    raise TokenBudgetConflict("token reservation settlement conflict")
-                breached = (
-                    input_tokens > current.reserved_input_tokens
-                    or output_tokens > current.reserved_output_tokens
-                )
-                connection.execute(
-                    """
-                    UPDATE token_budgets SET
-                        settled_input = settled_input + ?,
-                        settled_output = settled_output + ?,
-                        breached = CASE WHEN ? THEN 1 ELSE breached END,
-                        updated_at = ?
-                    WHERE task_id = ?
-                    """,
-                    (
-                        input_tokens,
-                        output_tokens,
-                        int(breached),
-                        _now(),
-                        current.task_id,
-                    ),
-                )
-                connection.execute(
-                    """
-                    UPDATE token_reservations SET
-                        status = ?, actual_input = ?, actual_output = ?, updated_at = ?
-                    WHERE reservation_id = ? AND status = 'reserved'
-                    """,
-                    (
-                        status,
-                        input_tokens,
-                        output_tokens,
-                        _now(),
-                        reservation_id,
-                    ),
-                )
-                connection.commit()
-                return current.model_copy(
-                    update={
-                        "status": status,
-                        "actual_input_tokens": input_tokens,
-                        "actual_output_tokens": output_tokens,
-                    }
-                )
-            except Exception:
-                connection.rollback()
-                raise
-
-    @staticmethod
-    def _budget_row(connection, task_id: str):
-        row = connection.execute(
-            """
-            SELECT input_cap, output_cap, settled_input, settled_output, breached
-            FROM token_budgets WHERE task_id = ?
-            """,
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(task_id)
-        return row
-
-    @staticmethod
-    def _load_reservation(connection, reservation_id: str) -> TokenReservation | None:
-        row = connection.execute(
-            """
-            SELECT task_id, call_id, reserved_input, reserved_output,
-                   status, actual_input, actual_output
-            FROM token_reservations WHERE reservation_id = ?
-            """,
-            (reservation_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return TokenReservation(
-            reservation_id=reservation_id,
-            task_id=str(row[0]),
-            call_id=str(row[1]),
-            reserved_input_tokens=int(row[2]),
-            reserved_output_tokens=int(row[3]),
-            status=str(row[4]),
-            actual_input_tokens=(int(row[5]) if row[5] is not None else None),
-            actual_output_tokens=(int(row[6]) if row[6] is not None else None),
-        )
-
-    def _initialize_schema(self) -> None:
-        with open_sqlite_connection(self.database_path) as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS token_budgets (
-                    task_id TEXT PRIMARY KEY,
-                    input_cap INTEGER NOT NULL,
-                    output_cap INTEGER NOT NULL,
-                    settled_input INTEGER NOT NULL,
-                    settled_output INTEGER NOT NULL,
-                    breached INTEGER NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS token_reservations (
-                    reservation_id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL,
-                    call_id TEXT NOT NULL,
-                    reserved_input INTEGER NOT NULL,
-                    reserved_output INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    actual_input INTEGER,
-                    actual_output INTEGER,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(task_id, call_id)
-                );
-                """
-            )
-            connection.commit()
+        return self.tasks.token_usage(task_id)
 
 
 class TokenBudgetMiddleware(AgentMiddleware):
@@ -479,9 +219,7 @@ class TokenBudgetCallbackHandler(BaseCallbackHandler):
             output_cap=self.output_cap,
         )
         message_chars = sum(
-            len(str(getattr(message, "content", "")))
-            for batch in messages
-            for message in batch
+            len(str(getattr(message, "content", ""))) for batch in messages for message in batch
         )
         estimated_input = max(1, math.ceil(message_chars / 4))
         estimated_input += self.input_safety_margin
@@ -534,8 +272,10 @@ class TokenBudgetCallbackHandler(BaseCallbackHandler):
 
 def _estimate_request_tokens(request: ModelRequest) -> int:
     system_text = request.system_message.text if request.system_message else ""
-    content = system_text + "\n" + "\n".join(
-        str(getattr(message, "content", "")) for message in request.messages
+    content = (
+        system_text
+        + "\n"
+        + "\n".join(str(getattr(message, "content", "")) for message in request.messages)
     )
     return max(1, math.ceil(len(content) / 4))
 
@@ -580,7 +320,3 @@ def _configured_task_id() -> str:
     except RuntimeError:
         return ""
     return str(config.get("configurable", {}).get("thread_id", "")).strip()
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat(timespec="microseconds")
