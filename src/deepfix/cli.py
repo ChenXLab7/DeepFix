@@ -13,10 +13,12 @@ from deepfix.backend import build_backend
 from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config, state_database_path
+from deepfix.database import SQLiteDatabase
 from deepfix.extensions import AgentExtensions, build_research_extensions
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.receipts import ToolExecutionReceiptStore
 from deepfix.investigation.store import InvestigationStore
+from deepfix.investigation.token_budget import TokenBudgetStore
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import TaskState, TaskStatus
 from deepfix.operations import OperationJournalStore, OperationReconciler
@@ -147,7 +149,8 @@ def main(
     args = build_parser().parse_args(argv)
     read_input = input_fn or input
     write_output = output_fn or print
-    repository = TaskRepository(state_database_path())
+    database = SQLiteDatabase(state_database_path())
+    repository = TaskRepository(database)
 
     if args.command == "list":
         print_task_list(repository, output_fn=write_output)
@@ -191,7 +194,8 @@ def main(
     workspace_factory = WorkspaceFactory(
         config.workspaces_path or config.database_path.parent / "workspaces"
     )
-    verification_policy_store = VerificationPolicyStore(config.database_path)
+    verification_policy_store = VerificationPolicyStore(tasks=repository)
+    _token_budget_store = TokenBudgetStore(database=database)
     with build_research_client() as client:
         extensions = build_cli_research_extensions(
             config,
@@ -199,7 +203,7 @@ def main(
             client,
             artifact_backend,
         )
-        with repository.checkpoint_connection() as connection:
+        with database.connection() as connection:
             checkpointer = SqliteSaver(connection)
             agent = build_agent(
                 config,

@@ -10,10 +10,12 @@ from deepfix.config import ApprovalMode
 from deepfix.database import SQLiteDatabase
 from deepfix.models import TaskState, TaskStatus
 from deepfix.task_domain.models import (
+    AdjudicationDecision,
     TaskDefinitionConflict,
     TaskLifecycleStatus,
 )
 from deepfix.task_domain.repository import TaskRepository
+from deepfix.verification import VerificationPolicy
 
 
 @pytest.fixture
@@ -60,8 +62,6 @@ def test_legacy_save_cannot_overwrite_immutable_problem(repository, task) -> Non
 def test_unmigrated_fields_continue_to_round_trip(repository, task) -> None:
     task.hypotheses = ["H1"]
     task.changed_files = ["src/value.py"]
-    task.verification_policy_id = "policy-1"
-    task.verification_policy_version = 2
     task.pending_actions = [
         {"name": "execute", "args": {"command": "python -m pytest -q"}}
     ]
@@ -71,8 +71,6 @@ def test_unmigrated_fields_continue_to_round_trip(repository, task) -> None:
 
     assert restored.hypotheses == ["H1"]
     assert restored.changed_files == ["src/value.py"]
-    assert restored.verification_policy_id == "policy-1"
-    assert restored.verification_policy_version == 2
     assert restored.pending_actions == task.pending_actions
 
 
@@ -99,8 +97,47 @@ def test_legacy_payload_does_not_own_definition_or_lifecycle(repository, task) -
         "status",
         "paused_from",
         "pause_reason",
+        "verification_policy_id",
+        "verification_policy_version",
+        "resolution",
     ):
         assert key not in payload
+
+
+def test_policy_and_adjudication_override_legacy_semantic_projection(
+    repository,
+    task,
+) -> None:
+    task.verification_policy_id = "stale-policy"
+    task.verification_policy_version = 99
+    task.resolution = "not_reproduced"
+    repository.save_legacy_projection(task)
+    policy = VerificationPolicy(
+        policy_id="canonical-policy",
+        task_id=task.task_id,
+        version=1,
+        required_oracles=[],
+        supplemental_oracles=[],
+        conflict_rules=[],
+    )
+    repository.save_verification_policy(policy)
+    lifecycle = repository.get_lifecycle(task.task_id)
+    repository.record_adjudication(
+        AdjudicationDecision(
+            decision_id="decision-1",
+            task_id=task.task_id,
+            outcome="fixed",
+            evidence_ids=["evidence-1"],
+            operation_ids=[],
+            decided_at=lifecycle.updated_at,
+        )
+    )
+
+    restored = repository.get(task.task_id)
+
+    assert restored.verification_policy_id == "canonical-policy"
+    assert restored.verification_policy_version == 1
+    assert restored.resolution == "fixed"
 
 
 def test_legacy_phase_changes_do_not_increment_business_lifecycle(
@@ -209,6 +246,37 @@ def test_historical_task_without_conversation_gets_stable_source_id(tmp_path) ->
         "user",
         historical.user_problem,
     )
+
+
+def test_historical_resolution_backfills_to_canonical_adjudication(tmp_path) -> None:
+    database = SQLiteDatabase(tmp_path / "deepfix.db")
+    historical = TaskState.create(tmp_path, "历史已完成任务", ApprovalMode.MANUAL)
+    historical.resolution = "not_reproduced"
+    historical.status = TaskStatus.COMPLETED
+    payload = json.dumps(historical.to_dict(), ensure_ascii=False)
+    with database.connection() as connection:
+        connection.execute(
+            """
+            CREATE TABLE tasks (
+                task_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO tasks VALUES (?, ?, ?)",
+            (historical.task_id, payload, "2026-08-01T00:00:00+00:00"),
+        )
+        connection.commit()
+    repository = TaskRepository(database)
+
+    restored = repository.get(historical.task_id)
+
+    assert restored.resolution == "not_reproduced"
+    decision = repository.latest_adjudication(historical.task_id)
+    assert decision is not None
+    assert decision.outcome == "not_reproduced"
 
 
 def test_first_backfill_is_atomic_when_projection_write_fails(

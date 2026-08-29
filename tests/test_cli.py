@@ -176,6 +176,17 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
     monkeypatch.setenv("DEEPFIX_HOME", str(database_path.parent))
     monkeypatch.setattr(cli_module, "state_database_path", lambda: database_path)
 
+    class FakeTokenBudgetStore:
+        def __init__(self, *, database):
+            captures["budget_database"] = database
+
+    monkeypatch.setattr(
+        cli_module,
+        "TokenBudgetStore",
+        FakeTokenBudgetStore,
+        raising=False,
+    )
+
     def fake_build_agent(
         config,
         checkpointer,
@@ -250,6 +261,14 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
     assert (
         captures["agent_verification_policy_store"]
         is captures["service_verification_policy_store"]
+    )
+    assert (
+        captures["service_verification_policy_store"].tasks
+        is captures["service_repository"]
+    )
+    assert (
+        captures["budget_database"]
+        is captures["service_repository"].database
     )
     assert captures["agent_backend"] is not None
     assert {item.tool.name for item in captures["extensions"].tools} == {

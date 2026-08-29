@@ -26,15 +26,18 @@ TASK_DEFINITION_FIELDS = frozenset(
 
 TASK_LIFECYCLE_FIELDS = frozenset({"status", "paused_from", "pause_reason"})
 
+TASK_POLICY_REFERENCE_FIELDS = frozenset(
+    {"verification_policy_id", "verification_policy_version"}
+)
+
+TASK_ADJUDICATION_FIELDS = frozenset({"resolution"})
+
 PLAN_2_LEGACY_FIELDS = frozenset(
     {
-        "verification_policy_id",
-        "verification_policy_version",
         "required_oracle_count",
         "passed_required_oracle_count",
         "supplemental_failure_count",
         "unresolved_operation_ids",
-        "resolution",
         "conversation",
         "evidence",
         "hypotheses",
@@ -103,7 +106,13 @@ def task_definition_from_legacy(
 
 def legacy_payload_from_task(task: TaskState) -> dict[str, object]:
     payload = task.to_dict()
-    known_fields = TASK_DEFINITION_FIELDS | TASK_LIFECYCLE_FIELDS | PLAN_2_LEGACY_FIELDS
+    known_fields = (
+        TASK_DEFINITION_FIELDS
+        | TASK_LIFECYCLE_FIELDS
+        | TASK_POLICY_REFERENCE_FIELDS
+        | TASK_ADJUDICATION_FIELDS
+        | PLAN_2_LEGACY_FIELDS
+    )
     unknown_fields = set(payload) - known_fields
     if unknown_fields:
         names = ", ".join(sorted(unknown_fields))
@@ -118,6 +127,9 @@ def reconstruct_task_state(
     *,
     legacy_phase_status: str | None,
     legacy_paused_from: str | None,
+    verification_policy_id: str | None = None,
+    verification_policy_version: int | None = None,
+    resolution: str | None = None,
 ) -> TaskState:
     payload = dict(legacy_payload)
     payload.update(
@@ -134,6 +146,9 @@ def reconstruct_task_state(
             "status": _legacy_status(lifecycle, legacy_phase_status).value,
             "paused_from": legacy_paused_from,
             "pause_reason": lifecycle.reason,
+            "verification_policy_id": verification_policy_id,
+            "verification_policy_version": verification_policy_version,
+            "resolution": resolution,
         }
     )
     return TaskState.from_dict(payload)

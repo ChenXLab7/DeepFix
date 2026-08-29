@@ -4,6 +4,8 @@ import pytest
 
 from deepfix.database import SQLiteDatabase
 from deepfix.task_domain.models import (
+    AdjudicationDecision,
+    AdjudicationDecisionConflict,
     TaskDefinition,
     TaskDefinitionConflict,
     TaskLifecycleConflict,
@@ -216,3 +218,56 @@ def test_task_repository_rejects_required_oracle_downgrade(
 
     with pytest.raises(VerificationPolicyConflict, match="cannot be removed"):
         repository.save_verification_policy(downgraded)
+
+
+def test_adjudication_persists_only_supporting_ids(repository, definition) -> None:
+    repository.create_definition(definition)
+    decision = AdjudicationDecision(
+        decision_id="decision-1",
+        task_id=definition.task_id,
+        outcome="fixed",
+        evidence_ids=["evidence-1"],
+        operation_ids=["operation-1"],
+        decided_at="2026-08-29T00:00:00+00:00",
+    )
+
+    repository.record_adjudication(decision)
+
+    assert repository.latest_adjudication(definition.task_id) == decision
+    with repository.checkpoint_connection() as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(adjudication_decisions)"
+            )
+        }
+    assert columns == {
+        "decision_id",
+        "task_id",
+        "outcome",
+        "evidence_ids_json",
+        "operation_ids_json",
+        "decided_at",
+    }
+
+
+def test_adjudication_replay_is_idempotent_but_changed_content_conflicts(
+    repository,
+    definition,
+) -> None:
+    repository.create_definition(definition)
+    decision = AdjudicationDecision(
+        decision_id="decision-1",
+        task_id=definition.task_id,
+        outcome="fixed",
+        evidence_ids=["evidence-1"],
+        operation_ids=[],
+        decided_at="2026-08-29T00:00:00+00:00",
+    )
+    repository.record_adjudication(decision)
+
+    repository.record_adjudication(decision)
+    changed = decision.model_copy(update={"outcome": "failed"})
+
+    with pytest.raises(AdjudicationDecisionConflict, match="identity"):
+        repository.record_adjudication(changed)

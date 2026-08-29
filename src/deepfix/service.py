@@ -21,6 +21,7 @@ from deepfix.debug import append_debug_record
 from deepfix.investigation.classification import is_pytest_verification
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import InvestigationCoordinationError
+from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.models import InvestigationRecoveryMetadata
 from deepfix.investigation.receipts import receipt_task_segment
 from deepfix.memory import WorkingMemoryStore
@@ -28,6 +29,8 @@ from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus,
 from deepfix.operations import OperationReconciler
 from deepfix.persistence import TaskRepository
 from deepfix.research.store import ResearchEvidenceStore
+from deepfix.task_domain.migration import task_definition_from_legacy
+from deepfix.task_domain.models import AdjudicationDecision, TaskLifecycleStatus
 from deepfix.verification import (
     VerificationPolicyBuilder,
     VerificationPolicyStore,
@@ -74,6 +77,7 @@ class BugfixService:
             self.config.approval_mode,
             self.config.project_python,
         )
+        verification = None
         if self.workspace_factory is not None:
             workspace = self.workspace_factory.create(
                 task.task_id,
@@ -86,7 +90,6 @@ class BugfixService:
             task.confinement_level = "guarded_local"
             if self.verification_policy_store is not None:
                 verification = VerificationPolicyBuilder().build(task, workspace)
-                self.verification_policy_store.save(verification)
                 task.verification_policy_id = verification.policy_id
                 task.verification_policy_version = verification.version
                 task.required_oracle_count = len(verification.required_oracles)
@@ -99,7 +102,16 @@ class BugfixService:
         message = {"id": message_id, "role": "user", "content": task.user_problem}
         task.conversation.append(message)
         task.transition_to(TaskStatus.INVESTIGATING)
-        self._save(task)
+        self.repository.create_definition(task_definition_from_legacy(task))
+        if verification is not None:
+            self.repository.save_verification_policy(verification)
+        self.repository.transition_lifecycle(
+            task.task_id,
+            TaskLifecycleStatus.RUNNING,
+            expected_version=1,
+        )
+        self._sync_context(task)
+        self.repository.save_legacy_projection(task)
         return self._invoke(
             task,
             {"messages": [HumanMessage(id=message_id, content=task.user_problem)]},
@@ -293,12 +305,9 @@ class BugfixService:
         return self._apply_outcome(task, outcome)
 
     def _refresh_verification(self, task: TaskState) -> None:
-        if (
-            self.verification_policy_store is None
-            or not task.verification_policy_id
-        ):
+        if not task.verification_policy_id:
             return
-        policy = self.verification_policy_store.load(
+        policy = self.repository.load_verification_policy(
             task.task_id,
             task.verification_policy_version,
         )
@@ -515,8 +524,8 @@ class BugfixService:
             )
         else:
             if task.successful_changed_files:
-                if self.verification_policy_store is not None and task.verification_policy_id:
-                    policy = self.verification_policy_store.load(
+                if task.verification_policy_id:
+                    policy = self.repository.load_verification_policy(
                         task.task_id,
                         task.verification_policy_version,
                     )
@@ -555,6 +564,8 @@ class BugfixService:
             task.transition_to(TaskStatus.REVIEWING)
             task.transition_to(TaskStatus.COMPLETED)
         self._save(task)
+        if task.status is TaskStatus.COMPLETED:
+            self._record_adjudication(task)
         return task
 
     def _return_to_investigating(self, task: TaskState) -> None:
@@ -602,7 +613,32 @@ class BugfixService:
 
     def _save(self, task: TaskState) -> None:
         self._sync_context(task)
-        self.repository.save(task)
+        self.repository.save_legacy_projection(task)
+
+    def _record_adjudication(self, task: TaskState) -> None:
+        if task.resolution not in {"fixed", "not_reproduced"}:
+            return
+        lifecycle = self.repository.get_lifecycle(task.task_id)
+        evidence_ids = sorted(
+            {
+                item.evidence_id
+                for item in self.compaction_store.list_evidence(task.task_id)
+            }
+        )
+        decision = AdjudicationDecision(
+            decision_id=stable_investigation_id(
+                "adjudication",
+                task.task_id,
+                str(lifecycle.version),
+                task.resolution,
+            ),
+            task_id=task.task_id,
+            outcome=task.resolution,
+            evidence_ids=evidence_ids,
+            operation_ids=[],
+            decided_at=lifecycle.updated_at,
+        )
+        self.repository.record_adjudication(decision)
 
     def _sanitize_investigation_recovery(
         self,

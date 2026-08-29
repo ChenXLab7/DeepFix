@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 
 from deepfix.database import SQLiteDatabase
 from deepfix.task_domain.models import (
+    AdjudicationDecision,
+    AdjudicationDecisionConflict,
     TaskDefinition,
     TaskDefinitionConflict,
     TaskLifecycle,
@@ -102,6 +104,70 @@ class TaskRepository:
     ) -> VerificationPolicy | None:
         with self.database.connection() as connection:
             return self._load_verification_policy(connection, task_id, version)
+
+    def record_adjudication(self, decision: AdjudicationDecision) -> None:
+        with self.database.unit_of_work(immediate=True) as connection:
+            row = connection.execute(
+                """
+                SELECT task_id, outcome, evidence_ids_json,
+                       operation_ids_json, decided_at
+                FROM adjudication_decisions WHERE decision_id = ?
+                """,
+                (decision.decision_id,),
+            ).fetchone()
+            if row is not None:
+                existing = AdjudicationDecision(
+                    decision_id=decision.decision_id,
+                    task_id=str(row[0]),
+                    outcome=str(row[1]),
+                    evidence_ids=json.loads(str(row[2])),
+                    operation_ids=json.loads(str(row[3])),
+                    decided_at=str(row[4]),
+                )
+                if existing == decision:
+                    return
+                raise AdjudicationDecisionConflict(
+                    "adjudication decision identity conflict"
+                )
+            connection.execute(
+                """
+                INSERT INTO adjudication_decisions(
+                    decision_id, task_id, outcome, evidence_ids_json,
+                    operation_ids_json, decided_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision.decision_id,
+                    decision.task_id,
+                    decision.outcome,
+                    _canonical_json(decision.evidence_ids),
+                    _canonical_json(decision.operation_ids),
+                    decision.decided_at,
+                ),
+            )
+
+    def latest_adjudication(self, task_id: str) -> AdjudicationDecision | None:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT decision_id, outcome, evidence_ids_json,
+                       operation_ids_json, decided_at
+                FROM adjudication_decisions
+                WHERE task_id = ?
+                ORDER BY decided_at DESC, rowid DESC LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return AdjudicationDecision(
+            decision_id=str(row[0]),
+            task_id=task_id,
+            outcome=str(row[1]),
+            evidence_ids=json.loads(str(row[2])),
+            operation_ids=json.loads(str(row[3])),
+            decided_at=str(row[4]),
+        )
 
     def initialize_token_budget(
         self,
@@ -379,12 +445,25 @@ class TaskRepository:
             ).fetchone()
         if row is None:
             raise KeyError(task_id)
+        policy = self.load_verification_policy(task_id)
+        adjudication = self.latest_adjudication(task_id)
+        resolution = (
+            adjudication.outcome
+            if adjudication is not None
+            and adjudication.outcome in {"fixed", "not_reproduced"}
+            else None
+        )
         return reconstruct_task_state(
             definition,
             lifecycle,
             json.loads(str(row[2])),
             legacy_phase_status=str(row[0]) if row[0] is not None else None,
             legacy_paused_from=str(row[1]) if row[1] is not None else None,
+            verification_policy_id=(policy.policy_id if policy is not None else None),
+            verification_policy_version=(
+                policy.version if policy is not None else None
+            ),
+            resolution=resolution,
         )
 
     def list_recent(self, limit: int = 20) -> list:
@@ -465,6 +544,18 @@ class TaskRepository:
                     settled_output INTEGER NOT NULL,
                     breached INTEGER NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS adjudication_decisions (
+                    decision_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES task_definitions(task_id),
+                    outcome TEXT NOT NULL,
+                    evidence_ids_json TEXT NOT NULL,
+                    operation_ids_json TEXT NOT NULL,
+                    decided_at TEXT NOT NULL
                 )
                 """
             )
@@ -799,7 +890,24 @@ class TaskRepository:
             ).fetchone()
         if row is None:
             raise KeyError(task_id)
-        self.save_legacy_projection(TaskState.from_dict(json.loads(str(row[0]))))
+        task = TaskState.from_dict(json.loads(str(row[0])))
+        self.save_legacy_projection(task)
+        if task.resolution in {"fixed", "not_reproduced"}:
+            lifecycle = self.get_lifecycle(task.task_id)
+            self.record_adjudication(
+                AdjudicationDecision(
+                    decision_id=_adjudication_id(
+                        task.task_id,
+                        lifecycle.version,
+                        task.resolution,
+                    ),
+                    task_id=task.task_id,
+                    outcome=task.resolution,
+                    evidence_ids=sorted(set(task.external_evidence_ids)),
+                    operation_ids=[],
+                    decided_at=lifecycle.updated_at,
+                )
+            )
 
     def _backfill_all_historical_tasks(self) -> None:
         with self.database.connection() as connection:
@@ -883,6 +991,12 @@ def _token_reservation_id(task_id: str, call_id: str) -> str:
         raise ValueError("token reservation identity cannot be empty")
     digest = hashlib.sha256("|".join(values).encode()).hexdigest()[:32]
     return f"token-reservation_{digest}"
+
+
+def _adjudication_id(task_id: str, version: int, outcome: str) -> str:
+    values = ["adjudication", task_id.strip(), str(version), outcome.strip()]
+    digest = hashlib.sha256("|".join(values).encode()).hexdigest()[:32]
+    return f"adjudication_{digest}"
 
 
 def _now() -> str:
