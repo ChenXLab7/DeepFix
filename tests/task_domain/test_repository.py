@@ -174,11 +174,19 @@ def test_normalized_task_tables_exclude_other_domains(repository) -> None:
     }
 
     with repository.checkpoint_connection() as connection:
-        for table in ("task_definitions", "task_lifecycle"):
+        for table in (
+            "task_definitions",
+            "task_lifecycle",
+            "verification_policies",
+            "adjudication_decisions",
+            "token_budgets",
+            "token_reservations",
+        ):
             columns = {
                 row[1]
                 for row in connection.execute(f"PRAGMA table_info({table})")
             }
+            assert columns
             assert columns.isdisjoint(forbidden)
 
 

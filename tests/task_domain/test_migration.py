@@ -198,6 +198,7 @@ def test_historical_whole_payload_backfills_without_rewriting_source(tmp_path) -
 
     restored = repository.get(historical.task_id)
     first_definition = repository.get_definition(historical.task_id)
+    first_lifecycle = repository.get_lifecycle(historical.task_id)
     restored.hypotheses = ["H1"]
     repository.save_legacy_projection(restored)
 
@@ -208,6 +209,7 @@ def test_historical_whole_payload_backfills_without_rewriting_source(tmp_path) -
         ).fetchone()[0]
     assert source_payload == historical_payload
     assert repository.get_definition(historical.task_id) == first_definition
+    assert repository.get_lifecycle(historical.task_id) == first_lifecycle
     assert repository.get(historical.task_id).hypotheses == ["H1"]
 
 

@@ -37,6 +37,7 @@ def coordinator_fixture(tmp_path: Path) -> InvestigationCoordinator:
             user_problem="sign bug",
             approval_mode="manual",
             status=TaskStatus.INVESTIGATING,
+            workspace_baseline_id="baseline-task-a",
         )
     )
     compaction = CompactionStore(database)
