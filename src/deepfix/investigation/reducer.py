@@ -77,6 +77,16 @@ class InvestigationStateReducer:
         hypothesis_updates = []
         supported = set(assessment.supported_hypothesis_ids)
         rejected = set(assessment.rejected_hypothesis_ids)
+        evidence_ids = _unique(
+            [
+                *assessment.deterministic_evidence_ids,
+                *(
+                    evidence_id
+                    for criterion in assessment.criterion_assessments
+                    for evidence_id in criterion.evidence_ids
+                ),
+            ]
+        )
         for hypothesis in state.hypotheses:
             if hypothesis.hypothesis_id in supported:
                 hypothesis_updates.append(
@@ -84,6 +94,9 @@ class InvestigationStateReducer:
                         update={
                             "state": "supported",
                             "reason": "supported by Experiment assessment",
+                            "evidence_ids": _unique(
+                                [*hypothesis.evidence_ids, *evidence_ids]
+                            ),
                         }
                     )
                 )
@@ -93,19 +106,14 @@ class InvestigationStateReducer:
                         update={
                             "state": "rejected",
                             "reason": "rejected by Experiment assessment",
+                            "evidence_ids": _unique(
+                                [*hypothesis.evidence_ids, *evidence_ids]
+                            ),
                         }
                     )
                 )
             else:
                 hypothesis_updates.append(hypothesis)
-        evidence_ids = [
-            *assessment.deterministic_evidence_ids,
-            *(
-                evidence_id
-                for criterion in assessment.criterion_assessments
-                for evidence_id in criterion.evidence_ids
-            ),
-        ]
         root_ids = sorted(
             {
                 root_id

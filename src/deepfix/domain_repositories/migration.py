@@ -10,6 +10,8 @@ from deepfix.compaction.models import (
     ApprovalEvidence,
     ArtifactReference,
     FileChangeEvidence,
+    HypothesisRecord,
+    ProvenancedText,
     ResearchStatusEvidence,
     StrictModel,
     SystemTestEvidence,
@@ -22,6 +24,13 @@ from deepfix.domain_repositories.evidence import (
     restore_deterministic_evidence,
     restore_external_evidence,
 )
+from deepfix.domain_repositories.investigation import InvestigationRepository
+from deepfix.investigation.models import (
+    InvestigationHypothesis,
+    InvestigationState,
+    UnresolvedQuestion,
+)
+from deepfix.memory import ProgressSnapshot
 from deepfix.research.models import ExternalEvidence, ResearchQuery, SearchCandidate
 
 
@@ -59,6 +68,7 @@ class DomainMigrator:
                 self._verify_artifact if self.artifact_root is not None else None
             ),
         )
+        self.investigation = InvestigationRepository(self.database)
         self._initialize_schema()
 
     def migrate_deterministic_evidence(self, task_id: str) -> DomainMigrationReport:
@@ -231,6 +241,105 @@ class DomainMigrator:
             self._save_report(report)
         return report
 
+    def migrate_investigation(self, task_id: str) -> DomainMigrationReport:
+        task_id = _required(task_id, "task_id")
+        existing = self._load_report("investigation", task_id)
+        if existing is not None:
+            return existing
+
+        state = self._legacy_investigation_state(task_id)
+        current_hypotheses = [] if state is None else state.hypotheses
+        missing_references: list[str] = []
+        for hypothesis in current_hypotheses:
+            missing = self.investigation.missing_current_evidence_ids(
+                task_id,
+                hypothesis.evidence_ids,
+            )
+            if missing:
+                missing_references.extend(
+                    f"hypothesis:{hypothesis.hypothesis_id}:evidence:{evidence_id}"
+                    for evidence_id in missing
+                )
+                continue
+            self.investigation.backfill_current_hypothesis(task_id, hypothesis)
+
+        historical_hypotheses, historical_questions = self._historical_investigation(
+            task_id
+        )
+        current_by_id = {
+            item.hypothesis_id: item for item in current_hypotheses
+        }
+        for historical, source_id in historical_hypotheses:
+            current = current_by_id.get(historical.hypothesis_id)
+            if current is not None and current.statement != historical.text:
+                self.investigation.record_historical_conflict(
+                    task_id,
+                    current.hypothesis_id,
+                    current_statement=current.statement,
+                    historical_statement=historical.text,
+                    source_id=source_id,
+                )
+
+        source_questions = [
+            UnresolvedQuestion(
+                question_id=_stable_question_id(task_id, text),
+                task_id=task_id,
+                text=text,
+                status="open",
+                source_ids=source_ids,
+                resolution_evidence_ids=[],
+                created_at=created_at,
+            )
+            for text, source_ids, created_at in historical_questions
+        ]
+        for question in source_questions:
+            self.investigation.open_question(question)
+
+        source_projection = _investigation_projection(
+            current_hypotheses,
+            source_questions,
+        )
+        target_projection = _investigation_projection(
+            self.investigation.list_hypotheses(task_id),
+            self.investigation.list_questions(task_id),
+        )
+        source_ids = {f"{kind}:{identity}" for kind, identity, _ in source_projection}
+        target_ids = {f"{kind}:{identity}" for kind, identity, _ in target_projection}
+        source_payloads = {
+            f"{kind}:{identity}": payload
+            for kind, identity, payload in source_projection
+        }
+        target_payloads = {
+            f"{kind}:{identity}": payload
+            for kind, identity, payload in target_projection
+        }
+        identity_mismatches = sorted(source_ids ^ target_ids)
+        hash_mismatches = sorted(
+            identity
+            for identity in source_ids & target_ids
+            if source_payloads[identity] != target_payloads[identity]
+        )
+        report = DomainMigrationReport(
+            domain="investigation",
+            task_id=task_id,
+            source_count=len(source_projection),
+            target_count=len(target_projection),
+            source_hash=_canonical_hash(source_projection),
+            target_hash=_canonical_hash(target_projection),
+            identity_mismatches=identity_mismatches,
+            hash_mismatches=hash_mismatches,
+            missing_references=sorted(set(missing_references)),
+            ready_to_switch=(
+                len(source_projection) == len(target_projection)
+                and not identity_mismatches
+                and not hash_mismatches
+                and not missing_references
+            ),
+        )
+        if report.ready_to_switch:
+            self._save_report(report)
+        return report
+
     def _legacy_rows(self, task_id: str) -> list[tuple[str, str, str]]:
         with self.database.connection() as connection:
             table = connection.execute(
@@ -291,6 +400,103 @@ class DomainMigrator:
             [SearchCandidate.model_validate_json(str(row[0])) for row in candidate_rows],
             [ExternalEvidence.model_validate_json(str(row[0])) for row in evidence_rows],
         )
+
+    def _legacy_investigation_state(self, task_id: str) -> InvestigationState | None:
+        with self.database.connection() as connection:
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'investigation_state'
+                """
+            ).fetchone()
+            row = (
+                None
+                if table is None
+                else connection.execute(
+                    "SELECT payload FROM investigation_state WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+            )
+        return (
+            None
+            if row is None
+            else InvestigationState.model_validate_json(str(row[0]))
+        )
+
+    def _historical_investigation(
+        self,
+        task_id: str,
+    ) -> tuple[
+        list[tuple[HypothesisRecord, str]],
+        list[tuple[str, list[str], str]],
+    ]:
+        hypotheses: list[tuple[HypothesisRecord, str]] = []
+        questions: dict[str, tuple[str, list[str], str]] = {}
+        with self.database.connection() as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            snapshot_rows = (
+                connection.execute(
+                    """
+                    SELECT version, payload, created_at FROM compaction_snapshots
+                    WHERE task_id = ? ORDER BY version
+                    """,
+                    (task_id,),
+                ).fetchall()
+                if "compaction_snapshots" in tables
+                else []
+            )
+            memory_rows = (
+                connection.execute(
+                    """
+                    SELECT version, payload, created_at FROM working_memory
+                    WHERE task_id = ? ORDER BY version
+                    """,
+                    (task_id,),
+                ).fetchall()
+                if "working_memory" in tables
+                else []
+            )
+
+        for version, payload, created_at in snapshot_rows:
+            snapshot = json.loads(str(payload))
+            for raw in [
+                *snapshot.get("active_hypotheses", []),
+                *snapshot.get("rejected_hypotheses", []),
+                *snapshot.get("confirmed_hypotheses", []),
+            ]:
+                item = HypothesisRecord.model_validate(raw)
+                source_id = _historical_hypothesis_source(
+                    item,
+                    default=f"snapshot:{version}:{item.hypothesis_id}",
+                )
+                hypotheses.append((item, source_id))
+            for raw in snapshot.get("unresolved_questions", []):
+                item = ProvenancedText.model_validate(raw)
+                source_ids = [
+                    f"{source.kind}:{source.ref_id}" for source in item.sources
+                ] or [f"snapshot:{version}"]
+                _merge_historical_question(
+                    questions,
+                    item.text,
+                    source_ids,
+                    str(created_at),
+                )
+
+        for version, payload, created_at in memory_rows:
+            memory = ProgressSnapshot.model_validate_json(str(payload))
+            for item in memory.unresolved_questions:
+                _merge_historical_question(
+                    questions,
+                    item,
+                    [f"working_memory:{version}"],
+                    str(created_at),
+                )
+        return hypotheses, list(questions.values())
 
     def _artifact_reference(self, virtual_path: str) -> ArtifactReference | None:
         if self.artifact_root is None:
@@ -439,6 +645,70 @@ def _research_projection(
         for item in evidence
     )
     return sorted(records, key=lambda item: (item[0], item[1]))
+
+
+def _investigation_projection(
+    hypotheses: list[InvestigationHypothesis],
+    questions: list[UnresolvedQuestion],
+) -> list[tuple[str, str, str]]:
+    records = [
+        (
+            "hypothesis",
+            item.hypothesis_id,
+            _canonical_payload(item.model_dump(mode="json")),
+        )
+        for item in hypotheses
+    ]
+    records.extend(
+        (
+            "question",
+            item.question_id,
+            _canonical_payload(item.model_dump(mode="json")),
+        )
+        for item in questions
+    )
+    return sorted(records, key=lambda item: (item[0], item[1]))
+
+
+def _historical_hypothesis_source(
+    item: HypothesisRecord,
+    *,
+    default: str,
+) -> str:
+    if not item.sources:
+        return default
+    source = item.sources[0]
+    return f"{source.kind}:{source.ref_id}"
+
+
+def _stable_question_id(task_id: str, text: str) -> str:
+    digest = hashlib.sha256(
+        f"{task_id}\0{_normalize_text(text)}".encode()
+    ).hexdigest()[:24]
+    return f"question_{digest}"
+
+
+def _normalize_text(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+def _merge_historical_question(
+    questions: dict[str, tuple[str, list[str], str]],
+    text: str,
+    source_ids: list[str],
+    created_at: str,
+) -> None:
+    key = _normalize_text(text)
+    existing = questions.get(key)
+    if existing is None:
+        questions[key] = (text, list(dict.fromkeys(source_ids)), created_at)
+        return
+    existing_text, existing_sources, existing_created_at = existing
+    questions[key] = (
+        existing_text,
+        list(dict.fromkeys([*existing_sources, *source_ids])),
+        min(existing_created_at, created_at),
+    )
 
 
 def _required(value: str, name: str) -> str:

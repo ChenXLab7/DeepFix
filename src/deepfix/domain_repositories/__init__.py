@@ -10,6 +10,13 @@ from deepfix.domain_repositories.evidence import (
     EvidenceVerification,
     VerificationEvidenceView,
 )
+from deepfix.domain_repositories.investigation import (
+    HypothesisIdentityConflict,
+    HypothesisTransitionError,
+    InvestigationEvidenceMissing,
+    InvestigationRepository,
+    QuestionIdentityConflict,
+)
 
 __all__ = [
     "ArtifactIntegrityError",
@@ -19,5 +26,10 @@ __all__ = [
     "EvidenceKind",
     "EvidenceRepository",
     "EvidenceVerification",
+    "HypothesisIdentityConflict",
+    "HypothesisTransitionError",
+    "InvestigationEvidenceMissing",
+    "InvestigationRepository",
+    "QuestionIdentityConflict",
     "VerificationEvidenceView",
 ]

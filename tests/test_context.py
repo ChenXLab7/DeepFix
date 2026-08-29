@@ -274,12 +274,24 @@ def test_save_progress_accepts_supported_as_investigation_alias(tmp_path):
     investigation = InvestigationStore(database)
     task_id = "task-supported-alias"
     hypothesis_id = "hyp-supported-alias"
+    evidence_id = "evidence-supported-alias"
+    CompactionStore(database).save_evidence(
+        task_id,
+        SystemTestEvidence(
+            evidence_id=evidence_id,
+            command="python -m pytest -q",
+            exit_code=1,
+            summary="1 failed",
+            tool_call_id="call-supported-alias",
+            source_message_id="message-supported-alias",
+        ),
+    )
     state = investigation.ensure_started(task_id)
     hypothesis = InvestigationHypothesis(
         hypothesis_id=hypothesis_id,
         statement="边界条件错误",
         state="supported",
-        evidence_ids=[],
+        evidence_ids=[evidence_id],
         checked_locations=[],
         reason="已由调查工具验证",
     )

@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+from deepfix.database import SQLiteDatabase
+from deepfix.domain_repositories.investigation import InvestigationRepository
 from deepfix.investigation.experiments import (
     ExperimentAssessment,
     ExperimentResult,
@@ -24,14 +26,41 @@ class InvestigationStateConflict(RuntimeError):
 
 
 class InvestigationStore:
-    def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path).expanduser().resolve()
+    def __init__(self, database_path: SQLiteDatabase | str | Path) -> None:
+        self.database = (
+            database_path
+            if isinstance(database_path, SQLiteDatabase)
+            else SQLiteDatabase(database_path)
+        )
+        self.database_path = self.database.path
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.repository = InvestigationRepository(self.database)
         self._initialize()
 
     def load(self, task_id: str) -> InvestigationState | None:
         with open_sqlite_connection(self.database_path) as connection:
-            return self._load(connection, task_id)
+            legacy = self._load(connection, task_id)
+        if legacy is None:
+            return None
+        current = {
+            item.hypothesis_id: item
+            for item in self.repository.list_hypotheses(task_id)
+        }
+        if not current:
+            return legacy
+        merged = {item.hypothesis_id: item for item in legacy.hypotheses}
+        merged.update(current)
+        hypotheses = list(merged.values())[-64:]
+        return legacy.model_copy(
+            update={
+                "hypotheses": hypotheses,
+                "supported_hypothesis_ids": [
+                    item.hypothesis_id
+                    for item in hypotheses
+                    if item.state == "supported"
+                ][-64:],
+            }
+        )
 
     def ensure_started(self, task_id: str) -> InvestigationState:
         existing = self.load(task_id)
@@ -67,12 +96,20 @@ class InvestigationStore:
                     connection.rollback()
                     if current is None:
                         raise InvestigationStateConflict("重放事件缺少物化状态")
-                    return current
+                    replayed = self.load(next_state.task_id)
+                    if replayed is None:
+                        raise InvestigationStateConflict("重放事件缺少物化状态")
+                    return replayed
                 if existing or current_version != expected_version:
                     raise InvestigationStateConflict("investigation state 版本冲突")
 
                 committed = next_state.model_copy(update={"version": current_version + 1})
                 self._insert_events(connection, events)
+                self.repository.project_hypotheses(
+                    connection,
+                    committed.task_id,
+                    committed.hypotheses,
+                )
                 self._upsert_state(connection, committed)
                 connection.commit()
                 return committed
@@ -136,7 +173,10 @@ class InvestigationStore:
                     connection.rollback()
                     if current is None:
                         raise InvestigationStateConflict("重放缺少物化状态")
-                    return current
+                    replayed = self.load(next_state.task_id)
+                    if replayed is None:
+                        raise InvestigationStateConflict("重放缺少物化状态")
+                    return replayed
                 if current_version != expected_version:
                     raise InvestigationStateConflict("investigation state 版本冲突")
                 committed = next_state.model_copy(update={"version": current_version + 1})
@@ -173,6 +213,11 @@ class InvestigationStore:
                         event_payload,
                         created_at,
                     ),
+                )
+                self.repository.project_hypotheses(
+                    connection,
+                    committed.task_id,
+                    committed.hypotheses,
                 )
                 self._upsert_state(connection, committed)
                 connection.commit()
@@ -256,60 +301,11 @@ class InvestigationStore:
         with open_sqlite_connection(self.database_path) as connection:
             connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS investigation_events (
-                    task_id TEXT NOT NULL,
-                    event_id TEXT NOT NULL,
-                    sequence INTEGER NOT NULL,
-                    event_type TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (task_id, event_id),
-                    UNIQUE (task_id, sequence)
-                )
-                """
-            )
-            connection.execute(
-                """
                 CREATE TABLE IF NOT EXISTS investigation_state (
                     task_id TEXT PRIMARY KEY,
                     version INTEGER NOT NULL,
                     payload TEXT NOT NULL,
                     updated_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS strategy_decisions (
-                    task_id TEXT NOT NULL,
-                    decision_id TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (task_id, decision_id)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS experiment_results (
-                    task_id TEXT NOT NULL,
-                    experiment_id TEXT NOT NULL,
-                    result_payload TEXT NOT NULL,
-                    assessment_payload TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (task_id, experiment_id)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS experiment_events (
-                    task_id TEXT NOT NULL,
-                    event_id TEXT NOT NULL,
-                    experiment_id TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (task_id, event_id)
                 )
                 """
             )

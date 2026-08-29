@@ -122,6 +122,36 @@ class InvestigationHypothesis(StrictModel):
     proposed_change: ProposedChange | None = None
     expected_effect: str | None = None
     reason: str = Field(min_length=1)
+    reopens_hypothesis_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_reopen_identity(self) -> InvestigationHypothesis:
+        if self.reopens_hypothesis_id == self.hypothesis_id:
+            raise ValueError("reopens_hypothesis_id 必须引用不同的旧假设")
+        return self
+
+
+class UnresolvedQuestion(StrictModel):
+    question_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+    status: Literal["open", "resolved"]
+    source_ids: list[str] = Field(default_factory=list)
+    resolution_evidence_ids: list[str] = Field(default_factory=list)
+    created_at: str = Field(min_length=1)
+    resolved_at: str | None = None
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> UnresolvedQuestion:
+        if self.status == "open" and (
+            self.resolution_evidence_ids or self.resolved_at is not None
+        ):
+            raise ValueError("open question 不能包含解决证据或 resolved_at")
+        if self.status == "resolved" and (
+            not self.resolution_evidence_ids or self.resolved_at is None
+        ):
+            raise ValueError("resolved question 必须包含解决证据和 resolved_at")
+        return self
 
 
 class ExperimentClaimRecord(StrictModel):
