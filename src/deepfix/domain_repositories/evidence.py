@@ -174,9 +174,7 @@ class EvidenceRepository:
             raise ArtifactIntegrityError("External Evidence Artifact path mismatch")
         actual_hash = hashlib.sha256(artifact_content.encode("utf-8")).hexdigest()
         if actual_hash != artifact_reference.content_hash:
-            raise ArtifactIntegrityError(
-                f"Artifact verification failed: {artifact_reference.path}"
-            )
+            raise ArtifactIntegrityError(f"Artifact verification failed: {artifact_reference.path}")
         return self._record(
             evidence_id=evidence.evidence_id,
             task_id=evidence.task_id,
@@ -201,15 +199,12 @@ class EvidenceRepository:
             "kind": current.kind.value,
             "origin": current.origin,
             "authority": current.authority.value,
-            "verification_state": _verification_from_text(
-                evidence.local_verification
-            ).value,
+            "verification_state": _verification_from_text(evidence.local_verification).value,
             "payload_type": type(evidence).__name__,
             "payload": evidence.model_dump(mode="json"),
             "provenance_root_ids": current.provenance_root_ids,
             "artifact_references": [
-                reference.model_dump(mode="json")
-                for reference in current.artifact_references
+                reference.model_dump(mode="json") for reference in current.artifact_references
             ],
         }
         content_hash = _canonical_hash(semantic)
@@ -353,9 +348,7 @@ class EvidenceRepository:
                 ).fetchone()
                 if existing is not None:
                     if str(existing[0]) != payload:
-                        raise EvidenceIdentityConflict(
-                            "Research candidate identity conflict"
-                        )
+                        raise EvidenceIdentityConflict("Research candidate identity conflict")
                     continue
                 connection.execute(
                     """
@@ -447,10 +440,13 @@ class EvidenceRepository:
 
     def research_summary(self, task_id: str) -> tuple[int, list[str]]:
         attempts = self.list_research_attempts(task_id)
+        executed_attempts = [
+            attempt for attempt in attempts if attempt.providers or attempt.provider_errors
+        ]
         return (
-            len(attempts),
+            len(executed_attempts),
             _ordered_unique(
-                [error for attempt in attempts for error in attempt.provider_errors]
+                [error for attempt in executed_attempts for error in attempt.provider_errors]
             ),
         )
 
@@ -554,9 +550,7 @@ class EvidenceRepository:
             "payload_type": _required(payload_type, "payload_type"),
             "payload": payload,
             "provenance_root_ids": roots,
-            "artifact_references": [
-                reference.model_dump(mode="json") for reference in references
-            ],
+            "artifact_references": [reference.model_dump(mode="json") for reference in references],
         }
         content_hash = _canonical_hash(semantic)
         with self.database.unit_of_work(immediate=True) as connection:
@@ -634,9 +628,7 @@ class EvidenceRepository:
             raise ArtifactIntegrityError("Artifact verifier is required")
         for reference in references:
             if not self.artifact_verifier(reference):
-                raise ArtifactIntegrityError(
-                    f"Artifact verification failed: {reference.path}"
-                )
+                raise ArtifactIntegrityError(f"Artifact verification failed: {reference.path}")
 
     def _initialize_schema(self) -> None:
         with self.database.unit_of_work() as connection:
@@ -664,9 +656,7 @@ class EvidenceRepository:
             )
             columns = {
                 str(row[1])
-                for row in connection.execute(
-                    "PRAGMA table_info(evidence_records)"
-                ).fetchall()
+                for row in connection.execute("PRAGMA table_info(evidence_records)").fetchall()
             }
             if "revision" not in columns:
                 connection.execute(

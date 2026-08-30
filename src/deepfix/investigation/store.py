@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from deepfix.database import SQLiteDatabase
 from deepfix.domain_repositories.investigation import InvestigationRepository
+from deepfix.domain_repositories.migration import domain_is_switched
 from deepfix.investigation.experiments import (
     ExperimentAssessment,
     ExperimentResult,
@@ -26,15 +27,28 @@ class InvestigationStateConflict(RuntimeError):
 
 
 class InvestigationStore:
-    def __init__(self, database_path: SQLiteDatabase | str | Path) -> None:
+    def __init__(
+        self,
+        database_path: SQLiteDatabase | str | Path,
+        *,
+        repositories=None,
+    ) -> None:
         self.database = (
-            database_path
-            if isinstance(database_path, SQLiteDatabase)
-            else SQLiteDatabase(database_path)
+            repositories.database
+            if repositories is not None
+            else (
+                database_path
+                if isinstance(database_path, SQLiteDatabase)
+                else SQLiteDatabase(database_path)
+            )
         )
         self.database_path = self.database.path
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        self.repository = InvestigationRepository(self.database)
+        self.repository = (
+            repositories.investigation
+            if repositories is not None
+            else InvestigationRepository(self.database)
+        )
         self._initialize()
 
     def load(self, task_id: str) -> InvestigationState | None:
@@ -389,12 +403,17 @@ class InvestigationStore:
             ],
         )
 
-    @staticmethod
     def _upsert_state(
+        self,
         connection: sqlite3.Connection,
         state: InvestigationState,
     ) -> None:
         updated_at = datetime.now(UTC).isoformat(timespec="microseconds")
+        legacy_state = state
+        if domain_is_switched(self.database, "investigation", state.task_id):
+            legacy_state = state.model_copy(
+                update={"hypotheses": [], "supported_hypothesis_ids": []}
+            )
         connection.execute(
             """
             INSERT INTO investigation_state(task_id, version, payload, updated_at)
@@ -404,7 +423,12 @@ class InvestigationStore:
                 payload = excluded.payload,
                 updated_at = excluded.updated_at
             """,
-            (state.task_id, state.version, state.model_dump_json(), updated_at),
+            (
+                legacy_state.task_id,
+                legacy_state.version,
+                legacy_state.model_dump_json(),
+                updated_at,
+            ),
         )
 
 

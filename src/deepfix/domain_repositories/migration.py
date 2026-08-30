@@ -932,6 +932,11 @@ def domain_is_switched(
     domain: str,
     task_id: str,
 ) -> bool:
+    aliases = (
+        ("evidence", "deterministic_evidence")
+        if domain in {"evidence", "deterministic_evidence"}
+        else (domain, domain)
+    )
     with database.connection() as connection:
         table = connection.execute(
             """
@@ -943,9 +948,10 @@ def domain_is_switched(
             return False
         row = connection.execute(
             """
-            SELECT 1 FROM domain_migrations WHERE domain = ? AND task_id = ?
+            SELECT 1 FROM domain_migrations
+            WHERE domain IN (?, ?) AND task_id = ?
             """,
-            (domain, task_id),
+            (*aliases, task_id),
         ).fetchone()
     return row is not None
 

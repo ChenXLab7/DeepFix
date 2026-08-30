@@ -42,18 +42,39 @@ _EVIDENCE_TYPES: dict[str, type[BaseModel]] = {
 
 
 class CompactionStore:
-    def __init__(self, database_path: SQLiteDatabase | str | Path) -> None:
+    def __init__(
+        self,
+        database_path: SQLiteDatabase | str | Path,
+        *,
+        repositories=None,
+    ) -> None:
         self.database = (
-            database_path
-            if isinstance(database_path, SQLiteDatabase)
-            else SQLiteDatabase(database_path)
+            repositories.database
+            if repositories is not None
+            else (
+                database_path
+                if isinstance(database_path, SQLiteDatabase)
+                else SQLiteDatabase(database_path)
+            )
         )
         self.database_path = self.database.path
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
-        self.evidence_repository = EvidenceRepository(self.database)
-        self.investigation_repository = InvestigationRepository(self.database)
-        self.history_repository = HistoryRepository(self.database)
+        self.evidence_repository = (
+            repositories.evidence
+            if repositories is not None
+            else EvidenceRepository(self.database)
+        )
+        self.investigation_repository = (
+            repositories.investigation
+            if repositories is not None
+            else InvestigationRepository(self.database)
+        )
+        self.history_repository = (
+            repositories.history
+            if repositories is not None
+            else HistoryRepository(self.database)
+        )
 
     def save_evidence(self, task_id: str, evidence: DeterministicEvidence) -> None:
         self.evidence_repository.record_deterministic(

@@ -94,6 +94,22 @@ def test_research_attempt_audit_redacts_provider_secrets_and_tracks_candidates(
     )
 
 
+def test_research_summary_does_not_count_candidate_link_placeholders(
+    tmp_path: Path,
+):
+    repository = EvidenceRepository(tmp_path / "deepfix.db")
+    repository.record_research_attempt(
+        task_id="task-1",
+        query_id="placeholder-1",
+        sanitized_query="pytest timeout",
+        providers=[],
+        provider_errors=[],
+    )
+    repository.record_research_candidates("placeholder-1", [_candidate()])
+
+    assert repository.research_summary("task-1") == (0, [])
+
+
 def test_external_evidence_update_preserves_immutable_revision_history(tmp_path: Path):
     content = "verified artifact body"
     reference = _reference(content)

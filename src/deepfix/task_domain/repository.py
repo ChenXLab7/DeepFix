@@ -354,13 +354,28 @@ class TaskRepository:
         )
 
     def save_legacy_projection(self, task) -> None:
+        from deepfix.domain_repositories.migration import domain_is_switched
         from deepfix.task_domain.migration import (
             legacy_payload_from_task,
             lifecycle_status_for_legacy,
             task_definition_from_legacy,
         )
 
-        payload = legacy_payload_from_task(task)
+        switched_domains = {
+            domain
+            for domain in (
+                "evidence",
+                "research",
+                "investigation",
+                "execution",
+                "history",
+            )
+            if domain_is_switched(self.database, domain, task.task_id)
+        }
+        payload = legacy_payload_from_task(
+            task,
+            switched_domains=switched_domains,
+        )
         serialized = _canonical_json(payload)
         payload_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         updated_at = _now()

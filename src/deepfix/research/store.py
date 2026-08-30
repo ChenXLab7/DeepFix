@@ -33,11 +33,16 @@ class ResearchEvidenceStore:
         *,
         artifact_verifier: ArtifactVerifier | None = None,
         artifact_root: str | Path | None = None,
+        repositories=None,
     ) -> None:
         self.database = (
-            database_path
-            if isinstance(database_path, SQLiteDatabase)
-            else SQLiteDatabase(database_path)
+            repositories.database
+            if repositories is not None
+            else (
+                database_path
+                if isinstance(database_path, SQLiteDatabase)
+                else SQLiteDatabase(database_path)
+            )
         )
         self.database_path = self.database.path
         self.artifact_root = (
@@ -50,9 +55,13 @@ class ResearchEvidenceStore:
             if self.artifact_root is not None
             else None
         )
-        self.evidence_repository = EvidenceRepository(
-            self.database,
-            artifact_verifier=verifier,
+        self.evidence_repository = (
+            repositories.evidence
+            if repositories is not None
+            else EvidenceRepository(
+                self.database,
+                artifact_verifier=verifier,
+            )
         )
         self._initialize_legacy_tables()
 

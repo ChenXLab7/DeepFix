@@ -130,26 +130,18 @@ class LegacyLoopRunner:
         usage = trace_usage.model_copy(
             update={
                 "input_tokens": (
-                    ledger_usage.input_tokens
-                    if ledger_usage
-                    else trace_usage.input_tokens
+                    ledger_usage.input_tokens if ledger_usage else trace_usage.input_tokens
                 ),
                 "output_tokens": (
-                    ledger_usage.output_tokens
-                    if ledger_usage
-                    else trace_usage.output_tokens
+                    ledger_usage.output_tokens if ledger_usage else trace_usage.output_tokens
                 ),
                 "model_calls": (
-                    ledger_usage.model_calls
-                    if ledger_usage
-                    else trace_usage.model_calls
+                    ledger_usage.model_calls if ledger_usage else trace_usage.model_calls
                 ),
                 "tool_calls": tool_calls,
                 "wall_seconds": elapsed,
                 "usage_estimated": (
-                    ledger_usage.estimated
-                    if ledger_usage
-                    else trace_usage.usage_estimated
+                    ledger_usage.estimated if ledger_usage else trace_usage.usage_estimated
                 ),
             }
         )
@@ -174,9 +166,7 @@ def _task_outcome(
             return task.resolution, None
         return "failed", "completed_without_resolution"
     if task.status is TaskStatus.WAITING_APPROVAL:
-        actions = {
-            str(item.get("policy_action", "ask")) for item in task.pending_actions
-        }
+        actions = {str(item.get("policy_action", "ask")) for item in task.pending_actions}
         if "ask" in actions:
             return "blocked", "manual_approval_required"
         if "deny" in actions:
@@ -271,7 +261,7 @@ def _bind_python_command(command: str, project_python: Path) -> str:
     if match is None:
         raise ValueError("oracle command must start with python")
     executable = subprocess.list2cmdline([str(project_python)])
-    return f"{executable}{stripped[match.end():]}"
+    return f"{executable}{stripped[match.end() :]}"
 
 
 @contextmanager
@@ -289,18 +279,28 @@ def _default_service_factory(
     from deepfix.cli import build_cli_research_extensions, build_research_client
     from deepfix.compaction.evidence import EvidenceCollector
     from deepfix.compaction.store import CompactionStore
+    from deepfix.domain_repositories import DomainRepositories
     from deepfix.investigation.coordinator import InvestigationCoordinator
     from deepfix.investigation.store import InvestigationStore
     from deepfix.memory import WorkingMemoryStore
-    from deepfix.persistence import TaskRepository
     from deepfix.research.store import ResearchEvidenceStore
 
-    repository = TaskRepository(config.database_path)
+    repositories = DomainRepositories.create(config.database_path)
+    repository = repositories.tasks
     working_memory_store = WorkingMemoryStore(config.database_path)
-    compaction_store = CompactionStore(config.database_path)
-    research_evidence_store = ResearchEvidenceStore(config.database_path)
+    compaction_store = CompactionStore(
+        config.database_path,
+        repositories=repositories,
+    )
+    research_evidence_store = ResearchEvidenceStore(
+        config.database_path,
+        repositories=repositories,
+    )
     investigation = InvestigationCoordinator(
-        store=InvestigationStore(config.database_path),
+        store=InvestigationStore(
+            config.database_path,
+            repositories=repositories,
+        ),
         tasks=repository,
         compaction_store=compaction_store,
         evidence_collector=EvidenceCollector(
@@ -333,6 +333,7 @@ def _default_service_factory(
                 investigation=investigation,
                 backend=backend,
                 compaction_model_callbacks=compaction_callbacks,
+                repositories=repositories,
             )
             yield BugfixService(
                 agent,
@@ -343,6 +344,7 @@ def _default_service_factory(
                 research_evidence_store,
                 compaction_store,
                 investigation,
+                repositories=repositories,
             )
 
 

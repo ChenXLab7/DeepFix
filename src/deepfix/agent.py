@@ -40,6 +40,7 @@ from deepfix.compaction.tools import build_compact_conversation_tool
 from deepfix.config import AppConfig, ModelRoleConfig
 from deepfix.context import build_save_progress_tool
 from deepfix.debug import LLMTraceMiddleware
+from deepfix.domain_repositories import DomainRepositories
 from deepfix.extensions import AgentExtensions, merge_extensions
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.experiments import ExecutorNarrativeResult
@@ -110,6 +111,7 @@ def build_agent(
     extensions: AgentExtensions | None = None,
     research_evidence_store: ResearchEvidenceStore | None = None,
     verification_policy_store: VerificationPolicyStore | None = None,
+    repositories: DomainRepositories | None = None,
     *,
     allowed_skill_roots: tuple[str | Path, ...] = (),
     backend=None,
@@ -126,20 +128,27 @@ def build_agent(
     main_model = build_main_model(config)
     compaction_model = build_compaction_model(config)
     if compaction_model_callbacks:
-        compaction_model = compaction_model.with_config(
-            callbacks=list(compaction_model_callbacks)
-        )
+        compaction_model = compaction_model.with_config(callbacks=list(compaction_model_callbacks))
     resolved_backend = backend or build_backend(config)
-    tasks = task_repository or TaskRepository(config.database_path)
-    compaction = compaction_store or CompactionStore(config.database_path)
+    tasks = task_repository or (
+        repositories.tasks if repositories is not None else TaskRepository(config.database_path)
+    )
+    compaction = compaction_store or CompactionStore(
+        config.database_path,
+        repositories=repositories,
+    )
     research = research_evidence_store or ResearchEvidenceStore(
-        config.database_path
+        config.database_path,
+        repositories=repositories,
     )
     evidence_collector = EvidenceCollector(compaction, research)
     investigation_store = (
         investigation.store
         if investigation is not None
-        else InvestigationStore(config.database_path)
+        else InvestigationStore(
+            config.database_path,
+            repositories=repositories,
+        )
     )
     investigation = investigation or InvestigationCoordinator(
         store=investigation_store,
@@ -147,9 +156,7 @@ def build_agent(
         compaction_store=compaction,
         evidence_collector=evidence_collector,
     )
-    policy_store = verification_policy_store or VerificationPolicyStore(
-        config.database_path
-    )
+    policy_store = verification_policy_store or VerificationPolicyStore(tasks=tasks)
     navigation_feedback = LegacyNavigationFeedbackSource(
         investigation_store,
         compaction,
@@ -174,7 +181,11 @@ def build_agent(
         protected_builder=protected_builder,
         model=compaction_model,
     )
-    save_progress = build_save_progress_tool(working_memory_store)
+    save_progress = build_save_progress_tool(
+        working_memory_store,
+        compaction_store=compaction,
+        investigation_store=investigation_store,
+    )
     compact_conversation = build_compact_conversation_tool(coordinator)
     record_hypothesis = build_record_hypothesis_tool(investigation)
     continue_investigation = build_continue_investigation_tool(investigation)
@@ -248,9 +259,7 @@ def build_agent(
     return create_deep_agent(
         model=main_model,
         system_prompt=(
-            EXPERIMENT_EXECUTOR_SYSTEM_PROMPT
-            if _experiment_mode
-            else CORE_REPAIR_PROMPT
+            EXPERIMENT_EXECUTOR_SYSTEM_PROMPT if _experiment_mode else CORE_REPAIR_PROMPT
         ),
         tools=[
             save_progress,
@@ -283,10 +292,14 @@ def build_agent(
             InvestigationMiddleware(
                 investigation,
                 ToolExecutionReceiptStore(
-                    config.artifacts_path / "investigation_receipts"
+                    config.artifacts_path / "investigation_receipts",
+                    repository=(repositories.execution if repositories is not None else None),
                 ),
                 capabilities,
-                operation_journal=OperationJournalStore(config.database_path),
+                operation_journal=OperationJournalStore(
+                    config.database_path,
+                    repositories=repositories,
+                ),
             ),
             *prompt_policy_middleware,
             ProtectedContextMiddleware(protected_builder),
@@ -307,11 +320,7 @@ def build_agent(
         response_format=(ExecutorNarrativeResult if _experiment_mode else RepairOutcome),
         interrupt_on=merge_interrupt_on(core_interrupts, resolved.tools),
         checkpointer=checkpointer,
-        name=(
-            "deepfix_experiment_executor"
-            if _experiment_mode
-            else "deepfix_repair_agent"
-        ),
+        name=("deepfix_experiment_executor" if _experiment_mode else "deepfix_repair_agent"),
     )
 
 

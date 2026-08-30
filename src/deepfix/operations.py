@@ -76,12 +76,25 @@ class OperationJournalEntry(NewOperationEntry):
 
 
 class OperationJournalStore:
-    def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path).expanduser().resolve()
+    def __init__(
+        self,
+        database_path: str | Path,
+        *,
+        repositories=None,
+    ) -> None:
+        self.database_path = (
+            repositories.database.path
+            if repositories is not None
+            else Path(database_path).expanduser().resolve()
+        )
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         from deepfix.domain_repositories.execution import ExecutionRepository
 
-        self.repository = ExecutionRepository(self.database_path)
+        self.repository = (
+            repositories.execution
+            if repositories is not None
+            else ExecutionRepository(self.database_path)
+        )
 
     def prepare(self, entry: NewOperationEntry) -> OperationJournalEntry:
         return self.repository.prepare(entry)

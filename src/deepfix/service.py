@@ -10,6 +10,7 @@ from langgraph.types import Command
 
 from deepfix.approval import ApprovalPolicy, PolicyAction
 from deepfix.compaction.errors import ContextCoordinationError
+from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.identity import (
     ensure_message_ids,
     stable_conversation_message_id,
@@ -18,6 +19,9 @@ from deepfix.compaction.models import FileChangeEvidence, SystemTestEvidence
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import AppConfig, redact_config_secrets
 from deepfix.debug import append_debug_record
+from deepfix.domain_repositories import DomainRepositories
+from deepfix.domain_repositories.execution import create_execution_approval
+from deepfix.domain_repositories.migration import DomainMigrator, domain_is_switched
 from deepfix.investigation.classification import is_pytest_verification
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import InvestigationCoordinationError
@@ -54,6 +58,8 @@ class BugfixService:
         workspace_factory: WorkspaceFactory | None = None,
         verification_policy_store: VerificationPolicyStore | None = None,
         execution_backend: object | None = None,
+        repositories: DomainRepositories | None = None,
+        domain_migrator: DomainMigrator | None = None,
     ) -> None:
         self.agent = agent
         self.repository = repository
@@ -61,14 +67,20 @@ class BugfixService:
         self.config = config
         self.working_memory_store = working_memory_store
         self.research_evidence_store = research_evidence_store
+        self.repositories = repositories or DomainRepositories.create(repository.database)
         self.compaction_store = compaction_store or CompactionStore(
-            config.database_path
+            config.database_path,
+            repositories=self.repositories,
         )
         self.investigation = investigation
         self.operation_reconciler = operation_reconciler
         self.workspace_factory = workspace_factory
         self.verification_policy_store = verification_policy_store
         self.execution_backend = execution_backend
+        self.domain_migrator = domain_migrator or DomainMigrator(
+            self.repositories.database,
+            artifact_root=config.artifacts_path,
+        )
 
     def start(self, problem: str) -> TaskState:
         task = TaskState.create(
@@ -110,6 +122,7 @@ class BugfixService:
             TaskLifecycleStatus.RUNNING,
             expected_version=1,
         )
+        self._migrate_task_authorities(task.task_id)
         self._sync_context(task)
         self.repository.save_legacy_projection(task)
         return self._invoke(
@@ -122,7 +135,7 @@ class BugfixService:
         task_id: str,
         user_message: str | None = None,
     ) -> TaskState:
-        task = self.repository.get(task_id)
+        task = self._load_current_task(task_id)
         resumed_from_pause = task.status is TaskStatus.PAUSED
         if resumed_from_pause:
             task.resume()
@@ -154,9 +167,7 @@ class BugfixService:
             return task
         if not self._record_lifecycle(
             task,
-            lambda: self.investigation.record_user_information(
-                task.task_id, message_id
-            ),
+            lambda: self.investigation.record_user_information(task.task_id, message_id),
         ):
             return task
         return self._invoke(
@@ -165,10 +176,10 @@ class BugfixService:
         )
 
     def pending_actions(self, task_id: str) -> list[dict[str, object]]:
-        return deepcopy(self.repository.get(task_id).pending_actions)
+        return deepcopy(self._load_current_task(task_id).pending_actions)
 
     def pause_task(self, task_id: str, reason: str = "用户暂停任务") -> TaskState:
-        task = self.repository.get(task_id)
+        task = self._load_current_task(task_id)
         if task.status in {
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
@@ -178,7 +189,7 @@ class BugfixService:
         return self._pause(task, reason)
 
     def decide(self, task_id: str, decisions: list[str]) -> TaskState:
-        task = self.repository.get(task_id)
+        task = self._load_current_task(task_id)
         if task.status is not TaskStatus.WAITING_APPROVAL:
             raise ValueError("任务当前不在等待审批状态")
         return self._resume_actions(task, decisions)
@@ -281,9 +292,7 @@ class BugfixService:
         if self.operation_reconciler is not None:
             task.unresolved_operation_ids = [
                 item.operation_id
-                for item in self.operation_reconciler.journal.list_incomplete(
-                    task.task_id
-                )
+                for item in self.operation_reconciler.journal.list_incomplete(task.task_id)
             ]
         self._refresh_verification(task)
         if task.consecutive_test_failures >= self.config.max_consecutive_test_failures:
@@ -320,26 +329,19 @@ class BugfixService:
         ]
         evaluation = evaluate_required_oracles(policy, tests)
         task.required_oracle_count = len(policy.required_oracles)
-        task.passed_required_oracle_count = len(
-            evaluation.passed_required_oracle_ids
-        )
-        task.supplemental_failure_count = len(
-            evaluation.conflicting_evidence_ids
-        )
+        task.passed_required_oracle_count = len(evaluation.passed_required_oracle_ids)
+        task.supplemental_failure_count = len(evaluation.conflicting_evidence_ids)
 
     def _handle_interrupts(self, task: TaskState, interrupts: object) -> TaskState:
         task.pending_actions = self._normalize_actions(interrupts)
-        task.shell_calls += sum(
-            action["name"] == "execute" for action in task.pending_actions
-        )
+        task.shell_calls += sum(action["name"] == "execute" for action in task.pending_actions)
         if task.shell_calls > self.config.max_shell_calls:
             return self._pause(task, "已达到 Shell 最大执行次数")
 
         task.transition_to(TaskStatus.WAITING_APPROVAL)
         self._save(task)
         if all(
-            action["policy_action"] == PolicyAction.ALLOW.value
-            for action in task.pending_actions
+            action["policy_action"] == PolicyAction.ALLOW.value for action in task.pending_actions
         ):
             return self._resume_actions(
                 task,
@@ -412,9 +414,7 @@ class BugfixService:
                 ):
                     approved_test = True
             else:
-                graph_decisions.append(
-                    {"type": "reject", "message": rejection_reason}
-                )
+                graph_decisions.append({"type": "reject", "message": rejection_reason})
             records.append(
                 ApprovalRecord(
                     operation=name,
@@ -443,6 +443,11 @@ class BugfixService:
     def _record_tool_results(self, task: TaskState, result: Mapping[str, Any]) -> None:
         raw_messages = result.get("messages", [])
         messages = ensure_message_ids(task.task_id, raw_messages).messages
+        EvidenceCollector(
+            self.compaction_store,
+            self.research_evidence_store,
+        ).collect(task.task_id, messages, task)
+        self._sync_context(task)
         calls: dict[str, tuple[str, Mapping[str, object]]] = {}
         for message in messages:
             if isinstance(message, AIMessage):
@@ -458,23 +463,22 @@ class BugfixService:
             task.processed_tool_call_ids.append(call_id)
             name, args = calls.get(call_id, (str(message.name or ""), {}))
             command = str(args.get("command", ""))
-            if name != "execute" or not self._is_pytest(
-                command, task.project_python
-            ):
+            if name != "execute" or not self._is_pytest(command, task.project_python):
                 continue
             artifact = message.artifact
             if not isinstance(artifact, Mapping) or "exit_code" not in artifact:
                 continue
             exit_code = int(artifact["exit_code"])
-            task.test_results.append(
-                TestResult(
-                    command=command,
-                    exit_code=exit_code,
-                    summary=str(message.content),
-                    tool_call_id=call_id,
-                    source_message_id=str(message.id),
+            if not any(item.tool_call_id == call_id for item in task.test_results):
+                task.test_results.append(
+                    TestResult(
+                        command=command,
+                        exit_code=exit_code,
+                        summary=str(message.content),
+                        tool_call_id=call_id,
+                        source_message_id=str(message.id),
+                    )
                 )
-            )
             if task.changed_files:
                 if exit_code == 0:
                     task.consecutive_test_failures = 0
@@ -534,16 +538,12 @@ class BugfixService:
                         for item in self.compaction_store.list_evidence(task.task_id)
                         if isinstance(item, SystemTestEvidence)
                     ]
-                    if policy is None or not evaluate_required_oracles(
-                        policy, tests
-                    ).fixed_allowed:
+                    if policy is None or not evaluate_required_oracles(policy, tests).fixed_allowed:
                         return self._pause(
                             task,
                             "required verification oracle 未全部满足，不能标记为已修复",
                         )
-                if not any(
-                    result.exit_code != 0 for result in task.test_results
-                ):
+                if not any(result.exit_code != 0 for result in task.test_results):
                     return self._pause(
                         task,
                         "缺少修复前的失败测试证据，不能标记为已修复",
@@ -557,8 +557,7 @@ class BugfixService:
             else:
                 task.resolution = "not_reproduced"
                 task.final_summary = (
-                    "未复现用户描述的问题：当前环境中所运行的 pytest 测试通过，"
-                    "且未修改代码。"
+                    "未复现用户描述的问题：当前环境中所运行的 pytest 测试通过，且未修改代码。"
                 )
             self._return_to_investigating(task)
             task.transition_to(TaskStatus.REVIEWING)
@@ -584,9 +583,7 @@ class BugfixService:
             except InvestigationCoordinationError as exc:
                 if exc.recovery.task_id == task.task_id:
                     task.investigation_recovery = exc.recovery
-                task.final_summary = (
-                    f"{reason}；调查生命周期记录失败：{exc.recovery.error_code}"
-                )
+                task.final_summary = f"{reason}；调查生命周期记录失败：{exc.recovery.error_code}"
                 self._save(task)
         return task
 
@@ -603,27 +600,76 @@ class BugfixService:
                 self._save(task)
                 return False
             task.investigation_recovery = exc.recovery
-            task.final_summary = (
-                f"调查生命周期需要恢复：{exc.recovery.error_code}"
-            )
+            task.final_summary = f"调查生命周期需要恢复：{exc.recovery.error_code}"
             if task.status is not TaskStatus.PAUSED:
                 task.transition_to(TaskStatus.PAUSED)
             self._save(task)
             return False
 
     def _save(self, task: TaskState) -> None:
+        self._project_execution_approvals(task)
         self._sync_context(task)
         self.repository.save_legacy_projection(task)
+
+    def _load_current_task(self, task_id: str) -> TaskState:
+        self._migrate_task_authorities(task_id)
+        task = self.repository.get(task_id)
+        self._sync_context(task)
+        return task
+
+    def _migrate_task_authorities(self, task_id: str) -> None:
+        migrations = (
+            ("evidence", self.domain_migrator.migrate_deterministic_evidence),
+            ("research", self.domain_migrator.migrate_research),
+            ("investigation", self.domain_migrator.migrate_investigation),
+            ("execution", self.domain_migrator.migrate_execution),
+            ("history", self.domain_migrator.migrate_history),
+        )
+        for domain, migrate in migrations:
+            try:
+                migrate(task_id)
+            except Exception as exc:  # noqa: BLE001 - legacy remains authoritative
+                self._record_domain_migration_failure(task_id, domain, exc)
+
+    def _record_domain_migration_failure(
+        self,
+        task_id: str,
+        domain: str,
+        error: Exception,
+    ) -> None:
+        try:
+            append_debug_record(
+                self.config.artifacts_path / "debug" / "llm_calls.jsonl",
+                {
+                    "event": "domain_migration_failed",
+                    "task_id": task_id,
+                    "domain": domain,
+                    "error_type": type(error).__name__,
+                    "error_detail": redact_config_secrets(str(error), self.config),
+                },
+            )
+        except OSError:
+            return
+
+    def _project_execution_approvals(self, task: TaskState) -> None:
+        for ordinal, record in enumerate(task.approvals):
+            self.repositories.execution.record_approval(
+                create_execution_approval(
+                    task_id=task.task_id,
+                    operation=record.operation,
+                    decision=record.decision,
+                    risk=record.risk,
+                    legacy_ordinal=ordinal,
+                    created_at=f"legacy:{ordinal:08d}",
+                )
+            )
 
     def _record_adjudication(self, task: TaskState) -> None:
         if task.resolution not in {"fixed", "not_reproduced"}:
             return
         lifecycle = self.repository.get_lifecycle(task.task_id)
         evidence_ids = sorted(
-            {
-                item.evidence_id
-                for item in self.compaction_store.list_evidence(task.task_id)
-            }
+            {item.evidence_id for item in self.compaction_store.list_evidence(task.task_id)}
         )
         decision = AdjudicationDecision(
             decision_id=stable_investigation_id(
@@ -674,10 +720,7 @@ class BugfixService:
         latest = self.working_memory_store.latest(task.task_id)
         if latest is not None:
             task.working_memory_version = latest.version
-            evidence_keys = {
-                (item.source, item.observation)
-                for item in task.evidence
-            }
+            evidence_keys = {(item.source, item.observation) for item in task.evidence}
             for item in latest.snapshot.evidence:
                 key = (item.source, item.observation)
                 if key not in evidence_keys:
@@ -692,34 +735,74 @@ class BugfixService:
                 )
             )
 
+        deterministic_evidence = self.compaction_store.list_evidence(task.task_id)
         successful_changed_files: list[str] = []
+        changed_files: list[str] = []
         latest_change_verification = "not_applicable"
-        for item in self.compaction_store.list_evidence(task.task_id):
-            if isinstance(item, FileChangeEvidence) and item.status == "succeeded":
-                successful_changed_files = list(
-                    dict.fromkeys([*successful_changed_files, item.path])
-                )
-                latest_change_verification = "pending"
+        current_tests: list[TestResult] = []
+        for item in deterministic_evidence:
+            if isinstance(item, FileChangeEvidence):
+                changed_files = list(dict.fromkeys([*changed_files, item.path]))
+                if item.status == "succeeded":
+                    successful_changed_files = list(
+                        dict.fromkeys([*successful_changed_files, item.path])
+                    )
+                    latest_change_verification = "pending"
             elif (
                 isinstance(item, SystemTestEvidence)
                 and latest_change_verification != "not_applicable"
             ):
-                latest_change_verification = (
-                    "passed" if item.exit_code == 0 else "failed"
+                latest_change_verification = "passed" if item.exit_code == 0 else "failed"
+            if isinstance(item, SystemTestEvidence):
+                current_tests.append(
+                    TestResult(
+                        command=item.command,
+                        exit_code=item.exit_code,
+                        summary=item.summary,
+                        tool_call_id=item.tool_call_id,
+                        source_message_id=item.source_message_id,
+                    )
                 )
+        if domain_is_switched(self.repositories.database, "evidence", task.task_id):
+            task.changed_files = changed_files
+            task.test_results = current_tests
+        else:
+            task.changed_files = list(dict.fromkeys([*task.changed_files, *changed_files]))
         task.successful_changed_files = successful_changed_files
         task.latest_change_verification = latest_change_verification
+
+        if domain_is_switched(
+            self.repositories.database,
+            "investigation",
+            task.task_id,
+        ):
+            task.hypotheses = [
+                item.statement
+                for item in self.repositories.investigation.list_hypotheses(task.task_id)
+                if item.state != "rejected"
+            ]
+
+        if domain_is_switched(
+            self.repositories.database,
+            "execution",
+            task.task_id,
+        ):
+            task.approvals = [
+                ApprovalRecord(item.operation, item.decision, item.risk)
+                for item in self.repositories.execution.list_approvals(task.task_id)
+            ]
+            task.unresolved_operation_ids = [
+                item.operation_id
+                for item in self.repositories.execution.list_incomplete(task.task_id)
+            ]
 
         task.context_metrics = self.working_memory_store.metrics(task.task_id)
         external_evidence = self.research_evidence_store.list_evidence(task.task_id)
         task.external_evidence_ids = [item.evidence_id for item in external_evidence]
-        query_count, provider_errors = self.research_evidence_store.query_summary(
-            task.task_id
-        )
+        query_count, provider_errors = self.research_evidence_store.query_summary(task.task_id)
         task.research_query_count = query_count
         task.research_provider_errors = [
-            _bounded_provider_error(error)
-            for error in provider_errors[:10]
+            _bounded_provider_error(error) for error in provider_errors[:10]
         ]
         if self.config.artifacts_path.exists():
             task.offloaded_artifacts = sorted(
@@ -727,9 +810,7 @@ class BugfixService:
                 for path in self.config.artifacts_path.rglob("*")
                 if path.is_file()
                 and _artifact_belongs_to_task(
-                    relative_path := path.relative_to(
-                        self.config.artifacts_path
-                    ).as_posix(),
+                    relative_path := path.relative_to(self.config.artifacts_path).as_posix(),
                     task,
                 )
             )
@@ -745,9 +826,7 @@ def _bounded_provider_error(value: str, limit: int = 300) -> str:
 
 def _artifact_belongs_to_task(relative_path: str, task: TaskState) -> bool:
     normalized = relative_path.replace("\\", "/").lstrip("/")
-    last_compaction = (
-        task.context_metrics.last_compaction_artifact or ""
-    ).replace("\\", "/")
+    last_compaction = (task.context_metrics.last_compaction_artifact or "").replace("\\", "/")
     artifact_prefix = ".deepfix-artifacts/"
     last_compaction = last_compaction.removeprefix(artifact_prefix)
     exact_paths = {

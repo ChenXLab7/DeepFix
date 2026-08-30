@@ -26,9 +26,7 @@ TASK_DEFINITION_FIELDS = frozenset(
 
 TASK_LIFECYCLE_FIELDS = frozenset({"status", "paused_from", "pause_reason"})
 
-TASK_POLICY_REFERENCE_FIELDS = frozenset(
-    {"verification_policy_id", "verification_policy_version"}
-)
+TASK_POLICY_REFERENCE_FIELDS = frozenset({"verification_policy_id", "verification_policy_version"})
 
 TASK_ADJUDICATION_FIELDS = frozenset({"resolution"})
 
@@ -69,6 +67,27 @@ PLAN_2_LEGACY_FIELDS = frozenset(
     }
 )
 
+MIGRATED_LEGACY_FIELDS = {
+    "evidence": frozenset(
+        {
+            "changed_files",
+            "successful_changed_files",
+            "latest_change_verification",
+            "test_results",
+        }
+    ),
+    "research": frozenset(
+        {
+            "external_evidence_ids",
+            "research_query_count",
+            "research_provider_errors",
+        }
+    ),
+    "investigation": frozenset({"hypotheses"}),
+    "execution": frozenset({"approvals", "unresolved_operation_ids"}),
+    "history": frozenset(),
+}
+
 LEGACY_TO_LIFECYCLE = {
     TaskStatus.CREATED: TaskLifecycleStatus.CREATED,
     TaskStatus.CLARIFYING: TaskLifecycleStatus.PAUSED,
@@ -104,7 +123,11 @@ def task_definition_from_legacy(
     )
 
 
-def legacy_payload_from_task(task: TaskState) -> dict[str, object]:
+def legacy_payload_from_task(
+    task: TaskState,
+    *,
+    switched_domains: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, object]:
     payload = task.to_dict()
     known_fields = (
         TASK_DEFINITION_FIELDS
@@ -117,7 +140,8 @@ def legacy_payload_from_task(task: TaskState) -> dict[str, object]:
     if unknown_fields:
         names = ", ".join(sorted(unknown_fields))
         raise ValueError(f"TaskState fields lack an authority assignment: {names}")
-    return {key: payload[key] for key in PLAN_2_LEGACY_FIELDS}
+    omitted = frozenset().union(*(MIGRATED_LEGACY_FIELDS[domain] for domain in switched_domains))
+    return {key: payload[key] for key in PLAN_2_LEGACY_FIELDS if key not in omitted}
 
 
 def reconstruct_task_state(

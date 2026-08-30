@@ -24,6 +24,7 @@ from deepfix.compaction.models import (
 )
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config
+from deepfix.domain_repositories.migration import domain_is_switched
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import (
     InvestigationStagnationError,
@@ -31,6 +32,7 @@ from deepfix.investigation.errors import (
 )
 from deepfix.investigation.models import (
     AgentPhase,
+    InvestigationHypothesis,
     InvestigationRecoveryMetadata,
 )
 from deepfix.investigation.receipts import (
@@ -39,7 +41,13 @@ from deepfix.investigation.receipts import (
 )
 from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
-from deepfix.models import Evidence, RepairOutcome, TaskState, TaskStatus
+from deepfix.models import (
+    ApprovalRecord,
+    Evidence,
+    RepairOutcome,
+    TaskState,
+    TaskStatus,
+)
 from deepfix.models import TestResult as RepairTestResult
 from deepfix.operations import (
     NewOperationEntry,
@@ -98,9 +106,7 @@ def make_interrupt(name: str, args: dict[str, object]):
         "__interrupt__": (
             Interrupt(
                 value={
-                    "action_requests": [
-                        {"name": name, "args": args, "description": "待审批操作"}
-                    ],
+                    "action_requests": [{"name": name, "args": args, "description": "待审批操作"}],
                     "review_configs": [
                         {
                             "action_name": name,
@@ -200,13 +206,9 @@ def test_pause_syncs_successful_change_as_pending_verification(app_config):
 
     paused = service._pause(task, "调查协调需要恢复：investigation_state_commit_failed")
 
-    assert paused.successful_changed_files == [
-        "python_programs/find_first_in_sorted.py"
-    ]
+    assert paused.successful_changed_files == ["python_programs/find_first_in_sorted.py"]
     assert paused.latest_change_verification == "pending"
-    assert paused.pause_reason == (
-        "调查协调需要恢复：investigation_state_commit_failed"
-    )
+    assert paused.pause_reason == ("调查协调需要恢复：investigation_state_commit_failed")
 
 
 @pytest.fixture
@@ -255,9 +257,7 @@ def make_service(
 
 def test_service_creates_workspace_and_policy_before_agent_invocation(app_config):
     fake_agent = FakeAgent(outcome())
-    workspace_factory = WorkspaceFactory(
-        app_config.database_path.parent / "workspaces"
-    )
+    workspace_factory = WorkspaceFactory(app_config.database_path.parent / "workspaces")
     policy_store = VerificationPolicyStore(app_config.database_path)
     service, _ = make_service(
         app_config,
@@ -288,9 +288,9 @@ def test_repository_suite_failure_blocks_fixed_at_service_boundary(app_config):
         "运行 python -m pytest tests/test_value.py -q 并修复",
         app_config.approval_mode,
     )
-    workspace = WorkspaceFactory(
-        app_config.database_path.parent / "policy-workspaces"
-    ).create(task.task_id, app_config.project_root)
+    workspace = WorkspaceFactory(app_config.database_path.parent / "policy-workspaces").create(
+        task.task_id, app_config.project_root
+    )
     task.project_root = str(workspace.root)
     task.workspace_root = str(workspace.root)
     task.workspace_baseline_id = workspace.baseline.baseline_id
@@ -361,9 +361,7 @@ def test_repository_suite_failure_blocks_fixed_at_service_boundary(app_config):
 def test_unresolved_operation_pauses_before_agent_invocation(app_config):
     fake_agent = FakeAgent(outcome())
     journal = OperationJournalStore(app_config.database_path)
-    receipts = ToolExecutionReceiptStore(
-        app_config.artifacts_path / "investigation_receipts"
-    )
+    receipts = ToolExecutionReceiptStore(app_config.artifacts_path / "investigation_receipts")
     reconciler = OperationReconciler(journal, receipts)
     service, repository = make_service(
         app_config,
@@ -482,7 +480,7 @@ def test_start_passes_problem_and_stable_thread_id(app_config):
 def test_service_syncs_only_current_task_research_summary_on_every_save(app_config):
     research_store = ResearchEvidenceStore(app_config.database_path)
     fake_agent = FakeAgent(outcome(), outcome(question="继续"))
-    service, repository = make_service(
+    service, _ = make_service(
         app_config,
         fake_agent,
         research_store=research_store,
@@ -499,7 +497,7 @@ def test_service_syncs_only_current_task_research_summary_on_every_save(app_conf
         )
 
     continued = service.continue_task(task.task_id, "继续")
-    persisted = repository.get(task.task_id)
+    persisted = service._load_current_task(task.task_id)
 
     assert continued.external_evidence_ids == [current.evidence_id]
     assert persisted.external_evidence_ids == [current.evidence_id]
@@ -527,8 +525,7 @@ def test_external_excerpt_never_enters_local_task_evidence(app_config):
     continued = service.continue_task(task.task_id, "继续")
 
     assert all(
-        "EXTERNAL EXCERPT MUST STAY OUT" not in item.observation
-        for item in continued.evidence
+        "EXTERNAL EXCERPT MUST STAY OUT" not in item.observation for item in continued.evidence
     )
 
 
@@ -644,10 +641,7 @@ def test_agent_failure_redacts_both_model_role_keys(tmp_path, monkeypatch):
     assert task.status is TaskStatus.FAILED
     assert "main-secret-value" not in persisted.final_summary
     assert "compact-secret-value" not in persisted.final_summary
-    assert (
-        persisted.final_summary
-        == "Agent 执行失败: auth failed [REDACTED] [REDACTED]"
-    )
+    assert persisted.final_summary == "Agent 执行失败: auth failed [REDACTED] [REDACTED]"
 
 
 def test_shell_budget_pauses_before_command_is_resumed(app_config):
@@ -691,6 +685,35 @@ def test_changed_file_budget_pauses_before_approved_edit_is_resumed(app_config):
     assert paused.pending_actions
 
 
+def test_changed_file_budget_counts_current_evidence_after_domain_switch(app_config):
+    limited = replace(app_config, max_changed_files=1)
+    fake_agent = FakeAgent(
+        make_interrupt(
+            "edit_file",
+            {"file_path": "/src/new.py", "old_string": "x", "new_string": "y"},
+        )
+    )
+    service, _ = make_service(limited, fake_agent)
+    task = service.start("计算错误")
+    service.compaction_store.save_evidence(
+        task.task_id,
+        FileChangeEvidence(
+            evidence_id="existing-file-change",
+            path="/src/existing.py",
+            operation="edit",
+            status="succeeded",
+            tool_call_id="existing-edit",
+            source_message_id="existing-message",
+        ),
+    )
+
+    paused = service.decide(task.task_id, ["approve"])
+
+    assert paused.status is TaskStatus.PAUSED
+    assert len(fake_agent.invoke_calls) == 1
+    assert "最大修改文件数" in paused.final_summary
+
+
 def test_consecutive_test_failure_budget_pauses_task(app_config):
     limited = replace(app_config, max_consecutive_test_failures=1)
     failed_result = passing_outcome()
@@ -707,6 +730,17 @@ def test_consecutive_test_failure_budget_pauses_task(app_config):
     service, _ = make_service(limited, fake_agent)
 
     awaiting_approval = service.start("测试失败")
+    service.compaction_store.save_evidence(
+        awaiting_approval.task_id,
+        FileChangeEvidence(
+            evidence_id="approved-file-change",
+            path="/src/calc.py",
+            operation="edit",
+            status="succeeded",
+            tool_call_id="approved-edit",
+            source_message_id="approved-message",
+        ),
+    )
     task = service.decide(awaiting_approval.task_id, ["approve"])
 
     assert task.status is TaskStatus.PAUSED
@@ -714,19 +748,84 @@ def test_consecutive_test_failure_budget_pauses_task(app_config):
     assert "连续测试失败" in task.final_summary
 
 
+def test_new_task_switches_empty_legacy_domains_after_validated_migration(app_config):
+    service, _ = make_service(
+        app_config,
+        FakeAgent(make_interrupt("execute", {"command": "pytest -q"})),
+    )
+
+    task = service.start("测试失败")
+
+    assert all(
+        domain_is_switched(service.repositories.database, domain, task.task_id)
+        for domain in (
+            "evidence",
+            "research",
+            "investigation",
+            "execution",
+            "history",
+        )
+    )
+
+
+def test_existing_task_is_migrated_and_hydrated_before_service_decisions(app_config):
+    service, repository = make_service(app_config, FakeAgent())
+    task = TaskState.create(app_config.project_root, "计算错误", ApprovalMode.MANUAL)
+    task.transition_to(TaskStatus.INVESTIGATING)
+    repository.save(task)
+    legacy = FileChangeEvidence(
+        evidence_id="legacy-file-change",
+        path="/src/calc.py",
+        operation="edit",
+        status="succeeded",
+        tool_call_id="legacy-edit",
+        source_message_id="legacy-message",
+    )
+    with repository.database.unit_of_work() as connection:
+        connection.execute(
+            """
+            INSERT INTO deterministic_evidence(
+                task_id, evidence_id, kind, payload, created_at
+            ) VALUES (?, ?, 'file', ?, '2026-08-30T00:00:00+00:00')
+            """,
+            (task.task_id, legacy.evidence_id, legacy.model_dump_json()),
+        )
+
+    paused = service.pause_task(task.task_id)
+
+    assert domain_is_switched(
+        service.repositories.database,
+        "evidence",
+        task.task_id,
+    )
+    assert paused.changed_files == ["/src/calc.py"]
+    assert service.repositories.evidence.get(
+        task.task_id,
+        legacy.evidence_id,
+    ).payload == legacy.model_dump(mode="json")
+    with repository.database.connection() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM deterministic_evidence WHERE task_id = ?",
+                (task.task_id,),
+            ).fetchone()[0]
+            == 1
+        )
+
+
 def test_rejected_action_records_approval_and_resumes_agent(app_config):
     fake_agent = FakeAgent(
         make_interrupt("write_file", {"file_path": "/src/calc.py", "content": "x"}),
         outcome(),
     )
-    service, repository = make_service(app_config, fake_agent)
+    service, _ = make_service(app_config, fake_agent)
     task = service.start("计算错误")
 
     result = service.decide(task.task_id, ["reject"])
 
     assert result.approvals[-1].operation == "write_file"
     assert result.approvals[-1].decision == "reject"
-    assert repository.get(task.task_id).approvals[-1].decision == "reject"
+    assert service._load_current_task(task.task_id).approvals[-1].decision == "reject"
 
 
 def test_continue_clarifying_task_appends_message_without_new_task(app_config):
@@ -921,9 +1020,7 @@ def test_repeated_graph_message_history_does_not_duplicate_test_result(app_confi
     first = passing_outcome()
     first["structured_response"] = outcome()["structured_response"]
     second = passing_outcome()
-    second["structured_response"] = outcome(question="还需要版本信息")[
-        "structured_response"
-    ]
+    second["structured_response"] = outcome(question="还需要版本信息")["structured_response"]
     fake_agent = FakeAgent(first, second)
     service, _ = make_service(app_config, fake_agent)
     task = service.start("测试失败")
@@ -933,7 +1030,7 @@ def test_repeated_graph_message_history_does_not_duplicate_test_result(app_confi
     assert len(continued.test_results) == 1
 
 
-def test_service_syncs_latest_memory_without_promoting_hypothesis_to_diagnosis(
+def test_service_syncs_latest_memory_without_overriding_current_investigation(
     app_config,
     memory_store,
 ):
@@ -965,7 +1062,7 @@ def test_service_syncs_latest_memory_without_promoting_hypothesis_to_diagnosis(
 
     assert continued.working_memory_version == 1
     assert Evidence("tests/test_calc.py:18", "期望 2，实际 -2") in continued.evidence
-    assert "符号处理重复取反" in continued.hypotheses
+    assert continued.hypotheses == []
     assert continued.diagnosis is None
 
 
@@ -1041,9 +1138,7 @@ def test_nothing_to_compact_does_not_increment_success_metric(
     assert memory_store.metrics(task.task_id).active_compaction_count == 0
 
 
-def test_uncoordinated_context_overflow_is_an_ordinary_agent_failure(
-    app_config, memory_store
-):
+def test_uncoordinated_context_overflow_is_an_ordinary_agent_failure(app_config, memory_store):
     service, repository = make_service(
         app_config,
         FakeAgent(ContextOverflowError("context exceeded")),
@@ -1137,10 +1232,7 @@ def test_investigation_error_pauses_and_persists_metadata(app_config):
 
     assert task.status is TaskStatus.PAUSED
     assert task.investigation_recovery.error_code == "investigation_stagnated"
-    assert (
-        repository.get(task.task_id).investigation_recovery
-        == task.investigation_recovery
-    )
+    assert repository.get(task.task_id).investigation_recovery == task.investigation_recovery
 
 
 def test_investigation_recovery_redacts_detail_and_writes_debug_event(app_config):
@@ -1152,14 +1244,9 @@ def test_investigation_recovery_redacts_detail_and_writes_debug_event(app_config
     task = service.start("receipt persistence fails")
     persisted = repository.get(task.task_id)
     log_path = app_config.artifacts_path / "debug" / "llm_calls.jsonl"
-    records = [
-        json.loads(line)
-        for line in log_path.read_text(encoding="utf-8").splitlines()
-    ]
+    records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
 
-    assert persisted.investigation_recovery.error_detail == (
-        "disk rejected [REDACTED]"
-    )
+    assert persisted.investigation_recovery.error_detail == ("disk rejected [REDACTED]")
     assert all("secret" not in line for line in log_path.read_text(encoding="utf-8").splitlines())
     assert records[-1] == {
         "event": "investigation_recovery",
@@ -1192,9 +1279,7 @@ def test_diagnostic_artifact_system_error_pauses_only_at_service_boundary(
     task = service.start("recover archived traceback")
 
     assert task.status is TaskStatus.PAUSED
-    assert task.investigation_recovery.error_code == (
-        "diagnostic_artifact_backend_read_failed"
-    )
+    assert task.investigation_recovery.error_code == ("diagnostic_artifact_backend_read_failed")
     assert repository.get(task.task_id).status is TaskStatus.PAUSED
 
 
@@ -1251,18 +1336,13 @@ def test_user_information_records_lifecycle_and_clears_recovery(app_config):
     service.agent = FakeAgent(outcome(question="continue"))
 
     resumed = service.continue_task(task.task_id, "Python 3.12")
-    event_types = [
-        event.event_type
-        for event in coordinator.store.list_events(task.task_id)
-    ]
+    event_types = [event.event_type for event in coordinator.store.list_events(task.task_id)]
 
     assert resumed.investigation_recovery is None
     assert "user_information_received" in event_types
 
 
-@pytest.mark.parametrize(
-    "error_type", [ProtectedContextLoadError, ContextRecoveryRequired]
-)
+@pytest.mark.parametrize("error_type", [ProtectedContextLoadError, ContextRecoveryRequired])
 def test_context_recovery_error_pauses_and_persists_metadata(
     app_config,
     error_type,
@@ -1313,18 +1393,10 @@ def test_recovery_metadata_clears_only_after_successful_resumed_invoke(app_confi
 def test_service_records_only_current_task_artifacts(app_config, memory_store):
     service, _ = make_service(app_config, FakeAgent(), memory_store)
     task = TaskState.create(app_config.project_root, "测试失败", ApprovalMode.MANUAL)
-    current_history = (
-        app_config.artifacts_path / "conversation_history" / f"{task.task_id}.md"
-    )
-    foreign_history = (
-        app_config.artifacts_path / "conversation_history" / "other-task.md"
-    )
-    current_research = (
-        app_config.artifacts_path / "research" / task.task_id / "evidence.md"
-    )
-    foreign_research = (
-        app_config.artifacts_path / "research" / "other-task" / "evidence.md"
-    )
+    current_history = app_config.artifacts_path / "conversation_history" / f"{task.task_id}.md"
+    foreign_history = app_config.artifacts_path / "conversation_history" / "other-task.md"
+    current_research = app_config.artifacts_path / "research" / task.task_id / "evidence.md"
+    foreign_research = app_config.artifacts_path / "research" / "other-task" / "evidence.md"
     for path in (
         current_history,
         foreign_history,
@@ -1333,9 +1405,7 @@ def test_service_records_only_current_task_artifacts(app_config, memory_store):
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("artifact", encoding="utf-8")
-    receipt_store = ToolExecutionReceiptStore(
-        app_config.artifacts_path / "investigation_receipts"
-    )
+    receipt_store = ToolExecutionReceiptStore(app_config.artifacts_path / "investigation_receipts")
     current_receipt = receipt_from_result(
         task.task_id,
         {
@@ -1366,13 +1436,15 @@ def test_service_records_only_current_task_artifacts(app_config, memory_store):
     )
     receipt_store.save(current_receipt)
     receipt_store.save(foreign_receipt)
-    current_receipt_path = next(
-        path
-        for path in (app_config.artifacts_path / "investigation_receipts").rglob(
-            "*.json"
+    current_receipt_path = (
+        next(
+            path
+            for path in (app_config.artifacts_path / "investigation_receipts").rglob("*.json")
+            if task.task_id in path.read_text(encoding="utf-8")
         )
-        if task.task_id in path.read_text(encoding="utf-8")
-    ).relative_to(app_config.artifacts_path).as_posix()
+        .relative_to(app_config.artifacts_path)
+        .as_posix()
+    )
 
     service._save(task)
 
@@ -1381,3 +1453,78 @@ def test_service_records_only_current_task_artifacts(app_config, memory_store):
         current_receipt_path,
         f"research/{task.task_id}/evidence.md",
     ]
+
+
+def test_service_restores_switched_fields_from_domain_authorities(app_config):
+    service, repository = make_service(app_config, FakeAgent())
+    task = TaskState.create(app_config.project_root, "parser fails", ApprovalMode.MANUAL)
+    repository.save(task)
+    service.repositories.evidence.record_deterministic(
+        task.task_id,
+        FileChangeEvidence(
+            evidence_id="file-1",
+            path="parser.py",
+            operation="edit",
+            status="succeeded",
+            tool_call_id="edit-1",
+            source_message_id="message-edit-1",
+        ),
+        provenance_root_ids=["edit-1"],
+    )
+    service.repositories.evidence.record_deterministic(
+        task.task_id,
+        SystemTestEvidence(
+            evidence_id="test-1",
+            command="pytest parser.py -q",
+            exit_code=0,
+            summary="1 passed",
+            tool_call_id="test-1",
+            source_message_id="message-test-1",
+        ),
+        provenance_root_ids=["test-1"],
+    )
+    service.repositories.investigation.record_hypothesis(
+        task.task_id,
+        InvestigationHypothesis(
+            hypothesis_id="hypothesis-1",
+            statement="parser branch is wrong",
+            state="supported",
+            evidence_ids=["test-1"],
+            checked_locations=[],
+            reason="test evidence supports the branch diagnosis",
+        ),
+    )
+    task.approvals = [ApprovalRecord("edit_file", "approve", "L1")]
+    with repository.database.unit_of_work() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS domain_migrations (
+                domain TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                switched_at TEXT NOT NULL,
+                PRIMARY KEY(domain, task_id)
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO domain_migrations(domain, task_id, report_json, switched_at)
+            VALUES (?, ?, '{}', '2026-08-30T00:00:00+00:00')
+            """,
+            [(domain, task.task_id) for domain in ("evidence", "investigation", "execution")],
+        )
+
+    service._save(task)
+    restored = repository.get(task.task_id)
+    assert restored.changed_files == []
+    assert restored.test_results == []
+    assert restored.hypotheses == []
+    assert restored.approvals == []
+
+    service._sync_context(restored)
+
+    assert restored.changed_files == ["parser.py"]
+    assert [item.command for item in restored.test_results] == ["pytest parser.py -q"]
+    assert restored.hypotheses == ["parser branch is wrong"]
+    assert restored.approvals == [ApprovalRecord("edit_file", "approve", "L1")]

@@ -14,6 +14,7 @@ from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config, state_database_path
 from deepfix.database import SQLiteDatabase
+from deepfix.domain_repositories import DomainRepositories
 from deepfix.extensions import AgentExtensions, build_research_extensions
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.receipts import ToolExecutionReceiptStore
@@ -150,7 +151,8 @@ def main(
     read_input = input_fn or input
     write_output = output_fn or print
     database = SQLiteDatabase(state_database_path())
-    repository = TaskRepository(database)
+    repositories = DomainRepositories.create(database)
+    repository = repositories.tasks
 
     if args.command == "list":
         print_task_list(repository, output_fn=write_output)
@@ -176,10 +178,19 @@ def main(
         )
 
     working_memory_store = WorkingMemoryStore(config.database_path)
-    compaction_store = CompactionStore(config.database_path)
-    research_evidence_store = ResearchEvidenceStore(config.database_path)
+    compaction_store = CompactionStore(
+        config.database_path,
+        repositories=repositories,
+    )
+    research_evidence_store = ResearchEvidenceStore(
+        config.database_path,
+        repositories=repositories,
+    )
     investigation = InvestigationCoordinator(
-        store=InvestigationStore(config.database_path),
+        store=InvestigationStore(
+            config.database_path,
+            repositories=repositories,
+        ),
         tasks=repository,
         compaction_store=compaction_store,
         evidence_collector=EvidenceCollector(
@@ -187,9 +198,13 @@ def main(
         ),
     )
     artifact_backend = build_backend(config)
-    operation_journal = OperationJournalStore(config.database_path)
+    operation_journal = OperationJournalStore(
+        config.database_path,
+        repositories=repositories,
+    )
     receipt_store = ToolExecutionReceiptStore(
-        config.artifacts_path / "investigation_receipts"
+        config.artifacts_path / "investigation_receipts",
+        repository=repositories.execution,
     )
     workspace_factory = WorkspaceFactory(
         config.workspaces_path or config.database_path.parent / "workspaces"
@@ -216,6 +231,7 @@ def main(
                 investigation=investigation,
                 verification_policy_store=verification_policy_store,
                 backend=artifact_backend,
+                repositories=repositories,
             )
             service = BugfixService(
                 agent,
@@ -233,6 +249,7 @@ def main(
                 workspace_factory=workspace_factory,
                 verification_policy_store=verification_policy_store,
                 execution_backend=artifact_backend,
+                repositories=repositories,
             )
             if args.command == "new":
                 task = service.start(args.problem)

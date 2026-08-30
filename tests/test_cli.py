@@ -198,6 +198,7 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
         investigation=None,
         verification_policy_store=None,
         backend=None,
+        repositories=None,
     ):
         captures["agent_store"] = working_memory_store
         captures["agent_research_store"] = research_evidence_store
@@ -207,6 +208,7 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
         captures["agent_backend"] = backend
         captures["agent_investigation"] = investigation
         captures["agent_verification_policy_store"] = verification_policy_store
+        captures["agent_repositories"] = repositories
         return object()
 
     class FakeService:
@@ -231,6 +233,7 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
                 "verification_policy_store"
             ]
             captures["service_execution_backend"] = kwargs["execution_backend"]
+            captures["service_repositories"] = kwargs["repositories"]
             self.config = config
 
         def start(self, problem):
@@ -258,6 +261,15 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
     assert captures["agent_repository"] is captures["service_repository"]
     assert captures["agent_compaction_store"] is captures["service_compaction_store"]
     assert captures["agent_investigation"] is captures["service_investigation"]
+    assert captures["agent_repositories"] is captures["service_repositories"]
+    assert (
+        captures["agent_repository"]
+        is captures["agent_repositories"].tasks
+    )
+    assert (
+        captures["agent_compaction_store"].evidence_repository
+        is captures["agent_repositories"].evidence
+    )
     assert (
         captures["agent_verification_policy_store"]
         is captures["service_verification_policy_store"]
