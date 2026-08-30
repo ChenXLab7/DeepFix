@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -582,6 +583,12 @@ class InvestigationRepository:
                 )
                 """
             )
+
+
+def stable_question_id(task_id: str, text: str) -> str:
+    normalized = " ".join(text.split()).casefold()
+    digest = hashlib.sha256(f"{task_id}\0{normalized}".encode()).hexdigest()[:24]
+    return f"question_{digest}"
 
 
 def _required(value: str, name: str) -> str:

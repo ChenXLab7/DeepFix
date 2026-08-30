@@ -31,6 +31,7 @@ from deepfix.compaction.models import (
     ProvenancedClaim,
     ProvenancedText,
     ProvenanceRef,
+    SnapshotCoverage,
     TaskAnchor,
     UserConstraint,
     UserConstraintCandidate,
@@ -120,6 +121,19 @@ class CompactionSnapshotBuilder:
                     ),
                     *(unit.unit_id for unit in value.compressed_units),
                 ]
+            ),
+            "coverage": SnapshotCoverage(
+                last_user_message_id=value.task_anchor.latest_user_message_id,
+                covered_message_ids=_ordered_unique(
+                    [
+                        message_id
+                        for unit in value.compressed_units
+                        for message_id in unit.message_ids
+                    ]
+                ),
+                covered_work_unit_ids=_ordered_unique(
+                    [unit.unit_id for unit in value.compressed_units]
+                ),
             ),
             "task_goal": value.task_anchor.task_goal,
             "user_constraints": constraints,

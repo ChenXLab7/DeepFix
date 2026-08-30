@@ -237,6 +237,7 @@ class CompactionSnapshot(StrictModel):
     abandoned_at: str | None = None
     abandon_reason: str | None = None
     source_work_unit_ids: list[str]
+    coverage: SnapshotCoverage = Field(default_factory=SnapshotCoverage)
     task_goal: str
     user_constraints: list[UserConstraint]
     confirmed_facts: list[ProvenancedClaim]
@@ -300,6 +301,7 @@ class ContextRecoveryMetadata(StrictModel):
         "snapshot_validate",
         "snapshot_write",
         "snapshot_verify",
+        "snapshot_activate",
         "compacted_model_call",
         "overflow_retry",
     ]

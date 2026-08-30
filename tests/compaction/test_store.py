@@ -9,7 +9,7 @@ from deepfix.compaction.models import (
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode
 from deepfix.models import TaskState
-from deepfix.persistence import TaskRepository
+from deepfix.persistence import TaskRepository, open_sqlite_connection
 from deepfix.research.store import ResearchEvidenceStore
 
 
@@ -34,7 +34,14 @@ def _snapshot(version: int, *, input_marker: str):
         conflicts=[],
         unresolved_questions=[],
         next_steps=[],
-        artifact_references=[],
+        artifact_references=[
+            ArtifactReference(
+                path="/.deepfix-artifacts/conversation_history/task-a.md",
+                kind="conversation_history",
+                content_hash="c" * 64,
+                work_unit_ids=[],
+            )
+        ],
         content_hash=input_marker * 64,
     )
 
@@ -144,3 +151,23 @@ def test_failure_records_are_idempotent_by_attempt_and_stage(tmp_path):
     store.record_failure(failure)
 
     assert store.list_failures("task-a") == [failure]
+
+
+def test_compaction_store_writes_history_authority_not_legacy_snapshot_table(
+    tmp_path,
+):
+    database = tmp_path / "deepfix.sqlite3"
+    store = CompactionStore(database)
+
+    saved = store.save_prepared_snapshot(_snapshot(1, input_marker="a"), "input-1")
+
+    assert saved.version == 1
+    with open_sqlite_connection(database) as connection:
+        history_count = connection.execute(
+            "SELECT COUNT(*) FROM history_snapshots"
+        ).fetchone()[0]
+        legacy_count = connection.execute(
+            "SELECT COUNT(*) FROM compaction_snapshots"
+        ).fetchone()[0]
+    assert history_count == 1
+    assert legacy_count == 0

@@ -123,6 +123,10 @@ class _RecordingStore:
         self.calls.append("snapshot_verify")
         return self.actual.get_snapshot(task_id, version)
 
+    def activate_from_event(self, task_id, event):
+        self.calls.append("snapshot_activate")
+        return self.actual.activate_from_event(task_id, event)
+
     def __getattr__(self, name):
         return getattr(self.actual, name)
 
@@ -184,9 +188,10 @@ def test_prepare_orders_artifact_before_snapshot_and_never_mutates_messages(tmp_
         "snapshot_validate",
         "snapshot_write",
         "snapshot_verify",
+        "snapshot_activate",
     ]
     assert list(request.messages) == original
-    assert prepared.snapshot.lifecycle == "prepared"
+    assert prepared.snapshot.lifecycle == "active"
     assert {unit.unit_id for unit in prepared.retention.compressed_units}
 
 
@@ -210,11 +215,13 @@ def test_success_returns_event_and_identical_prepare_reuses_snapshot(tmp_path):
     assert event["retained_message_ids"] == sorted(first.retention.retained_message_ids)
     assert event["input_hash"] == first.input_hash
     assert first.snapshot.version == second.snapshot.version == 1
-    assert store.get_snapshot("task-a", 1).lifecycle == "prepared"
+    assert store.get_snapshot("task-a", 1).lifecycle == "active"
     assert received[0][0].id == first.snapshot_message.id
 
 
-def test_handler_failure_returns_no_event_and_snapshot_stays_prepared(tmp_path):
+def test_handler_failure_returns_no_event_but_activation_precedes_message_replacement(
+    tmp_path,
+):
     coordinator, store, _ = _coordinator(tmp_path)
 
     with pytest.raises(RuntimeError, match="model failed"):
@@ -223,7 +230,7 @@ def test_handler_failure_returns_no_event_and_snapshot_stays_prepared(tmp_path):
             lambda messages: (_ for _ in ()).throw(RuntimeError("model failed")),
         )
 
-    assert store.get_snapshot("task-a", 1).lifecycle == "prepared"
+    assert store.get_snapshot("task-a", 1).lifecycle == "active"
 
 
 def _failure(code="artifact_write_failed"):
@@ -317,6 +324,14 @@ class _StageFailStore:
             raise RuntimeError("verify failed")
         return self.actual.get_snapshot(task_id, version)
 
+    def activate_from_event(self, task_id, event):
+        if self.stage == "snapshot_activate":
+            raise RuntimeError("activation failed")
+        if self.stage == "snapshot_activate_after_commit":
+            self.actual.activate_from_event(task_id, event)
+            raise RuntimeError("activation response lost")
+        return self.actual.activate_from_event(task_id, event)
+
     def __getattr__(self, name):
         return getattr(self.actual, name)
 
@@ -358,6 +373,7 @@ def _stage_failure_coordinator(tmp_path, stage):
         "snapshot_validate",
         "snapshot_write",
         "snapshot_verify",
+        "snapshot_activate",
     ],
 )
 def test_each_normal_preparation_failure_calls_original_handler_once(tmp_path, stage):
@@ -383,6 +399,7 @@ def test_each_normal_preparation_failure_calls_original_handler_once(tmp_path, s
         "snapshot_validate",
         "snapshot_write",
         "snapshot_verify",
+        "snapshot_activate",
     ],
 )
 def test_each_emergency_preparation_failure_skips_unsafe_handler(tmp_path, stage):
@@ -397,6 +414,41 @@ def test_each_emergency_preparation_failure_skips_unsafe_handler(tmp_path, stage
 
     assert calls == []
     assert captured.value.recovery.stage == stage
+
+
+def test_post_commit_activation_failure_does_not_mask_normal_passthrough(tmp_path):
+    coordinator, store = _stage_failure_coordinator(
+        tmp_path,
+        "snapshot_activate_after_commit",
+    )
+    calls = []
+
+    result = coordinator.invoke_automatic(
+        _request(ratio=0.85),
+        lambda messages: calls.append(messages)
+        or ModelResponse(result=[AIMessage(content="ok")]),
+    )
+
+    assert isinstance(result, ModelResponse)
+    assert calls == [_messages()]
+    assert store.get_snapshot("task-a", 1).lifecycle == "active"
+    assert store.list_failures("task-a")[0].stage == "snapshot_activate"
+
+
+def test_post_commit_activation_failure_does_not_mask_emergency_recovery(tmp_path):
+    coordinator, store = _stage_failure_coordinator(
+        tmp_path,
+        "snapshot_activate_after_commit",
+    )
+
+    with pytest.raises(ContextRecoveryRequired) as captured:
+        coordinator.invoke_automatic(
+            _request(zone="emergency", ratio=0.91),
+            lambda messages: pytest.fail("unsafe handler must not run"),
+        )
+
+    assert captured.value.recovery.stage == "snapshot_activate"
+    assert store.get_snapshot("task-a", 1).lifecycle == "active"
 
 
 def test_normal_failure_passthrough_once_and_same_input_skips_reprepare(tmp_path):
@@ -440,6 +492,47 @@ class _VerifyFailStore:
 
     def __getattr__(self, name):
         return getattr(self.actual, name)
+
+
+class _CoverageCorruptStore:
+    def __init__(self, actual):
+        self.actual = actual
+
+    def save_prepared_snapshot(self, snapshot, input_hash):
+        return self.actual.save_prepared_snapshot(snapshot, input_hash)
+
+    def get_snapshot(self, task_id, version):
+        snapshot = self.actual.get_snapshot(task_id, version)
+        return snapshot.model_copy(
+            update={
+                "coverage": snapshot.coverage.model_copy(
+                    update={"covered_message_ids": []}
+                )
+            }
+        )
+
+    def __getattr__(self, name):
+        return getattr(self.actual, name)
+
+
+def test_invalid_history_coverage_preserves_original_messages(tmp_path):
+    database = tmp_path / "deepfix.sqlite3"
+    actual = CompactionStore(database)
+    coordinator, _, _ = _coordinator(
+        tmp_path,
+        store=_CoverageCorruptStore(actual),
+    )
+    calls = []
+
+    result = coordinator.invoke_automatic(
+        _request(ratio=0.85),
+        lambda messages: calls.append(messages)
+        or ModelResponse(result=[AIMessage(content="ok")]),
+    )
+
+    assert isinstance(result, ModelResponse)
+    assert calls == [_messages()]
+    assert actual.list_failures("task-a")[0].stage == "snapshot_verify"
 
 
 def test_passthrough_abandons_snapshot_prepared_before_failure(tmp_path):

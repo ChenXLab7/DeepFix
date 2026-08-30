@@ -38,6 +38,7 @@ from deepfix.compaction.models import (
     CompactionSnapshot,
     ContextRecoveryMetadata,
     DeepFixCompactionEvent,
+    WorkUnit,
 )
 from deepfix.compaction.snapshot import (
     BuildSnapshotInput,
@@ -374,8 +375,13 @@ class CompactionCoordinator:
                 request.task_id,
                 saved.version,
             )
+            _validate_history_coverage(
+                verified,
+                retention.compressed_units,
+                request.protected_context.task_anchor.latest_user_message_id,
+            )
             if (
-                verified.lifecycle != "prepared"
+                verified.lifecycle not in {"prepared", "active"}
                 or verified.content_hash != saved.content_hash
                 or verified.model_dump(mode="json") != saved.model_dump(mode="json")
             ):
@@ -411,11 +417,42 @@ class CompactionCoordinator:
             conversation_artifact=artifact,
             input_hash=input_hash,
         )
+        try:
+            active = self.snapshot_store.activate_from_event(
+                request.task_id,
+                event,
+            )
+            if (
+                active.lifecycle != "active"
+                or active.content_hash != verified.content_hash
+            ):
+                raise ValueError("Snapshot activation verification failed")
+        except CompactionPreparationError as exc:
+            raise _rebind_error(
+                exc,
+                request,
+                attempt_id,
+                input_hash,
+                artifact=artifact,
+                prepared_version=saved.version,
+            ) from exc
+        except Exception as exc:
+            raise _new_preparation_error(
+                SnapshotPersistenceError,
+                request,
+                attempt_id,
+                input_hash,
+                "snapshot_activate",
+                "snapshot_activation_failed",
+                artifact=artifact,
+                prepared_version=saved.version,
+            ) from exc
+        snapshot_message = _snapshot_message(request.task_id, active, artifact)
         return PreparedCompaction(
             attempt_id=attempt_id,
             input_hash=input_hash,
             artifact_reference=artifact,
-            snapshot=verified,
+            snapshot=active,
             snapshot_message=snapshot_message,
             retention=retention,
             event=event,
@@ -516,7 +553,8 @@ class CompactionCoordinator:
             self._failed_attempts.add(failure.attempt_id)
             if request.budget.zone == "emergency" or request.entrypoint == "overflow_recovery":
                 if failure.prepared_snapshot_version is not None:
-                    self.snapshot_store.abandon_snapshot(
+                    _abandon_if_prepared(
+                        self.snapshot_store,
                         request.task_id,
                         failure.prepared_snapshot_version,
                         "emergency preparation failed",
@@ -525,7 +563,8 @@ class CompactionCoordinator:
             response = handler(request.messages)
             self.memory_store.record_passthrough(request.task_id)
             if failure.prepared_snapshot_version is not None:
-                self.snapshot_store.abandon_snapshot(
+                _abandon_if_prepared(
+                    self.snapshot_store,
                     request.task_id,
                     failure.prepared_snapshot_version,
                     "passthrough produced newer conversation state",
@@ -580,7 +619,8 @@ class CompactionCoordinator:
             self._failed_attempts.add(failure.attempt_id)
             if request.budget.zone == "emergency" or request.entrypoint == "overflow_recovery":
                 if failure.prepared_snapshot_version is not None:
-                    self.snapshot_store.abandon_snapshot(
+                    _abandon_if_prepared(
+                        self.snapshot_store,
                         request.task_id,
                         failure.prepared_snapshot_version,
                         "emergency preparation failed",
@@ -589,7 +629,8 @@ class CompactionCoordinator:
             response = await handler(request.messages)
             self.memory_store.record_passthrough(request.task_id)
             if failure.prepared_snapshot_version is not None:
-                self.snapshot_store.abandon_snapshot(
+                _abandon_if_prepared(
+                    self.snapshot_store,
                     request.task_id,
                     failure.prepared_snapshot_version,
                     "passthrough produced newer conversation state",
@@ -621,6 +662,21 @@ def _with_task_scope(message: AnyMessage, task_id: str) -> AnyMessage:
     additional = dict(message.additional_kwargs)
     additional["_deepfix_task_id"] = task_id
     return message.model_copy(update={"additional_kwargs": additional}, deep=True)
+
+
+def _abandon_if_prepared(
+    store: CompactionStore,
+    task_id: str,
+    version: int,
+    reason: str,
+) -> None:
+    """Best-effort cleanup must never mask the original recovery path."""
+    try:
+        snapshot = store.get_snapshot(task_id, version)
+        if snapshot.lifecycle == "prepared":
+            store.abandon_snapshot(task_id, version, reason)
+    except Exception:  # noqa: BLE001 - cleanup must not mask recovery
+        return
 
 
 def _input_hash(
@@ -680,6 +736,29 @@ def _snapshot_message(
         content=content,
         additional_kwargs={"_deepfix_snapshot_version": snapshot.version},
     )
+
+
+def _validate_history_coverage(
+    snapshot: CompactionSnapshot,
+    compressed_units: Sequence[WorkUnit],
+    latest_user_message_id: str,
+) -> None:
+    expected_message_ids = list(
+        dict.fromkeys(
+            message_id
+            for unit in compressed_units
+            for message_id in unit.message_ids
+        )
+    )
+    expected_work_unit_ids = list(
+        dict.fromkeys(unit.unit_id for unit in compressed_units)
+    )
+    if snapshot.coverage.last_user_message_id != latest_user_message_id:
+        raise ValueError("History coverage latest User Message does not match")
+    if snapshot.coverage.covered_message_ids != expected_message_ids:
+        raise ValueError("History coverage Message IDs do not match")
+    if snapshot.coverage.covered_work_unit_ids != expected_work_unit_ids:
+        raise ValueError("History coverage WorkUnit IDs do not match")
 
 
 def _rebind_error(
@@ -752,6 +831,7 @@ def _recovery_required(
         "snapshot_validate",
         "snapshot_write",
         "snapshot_verify",
+        "snapshot_activate",
         "compacted_model_call",
         "overflow_retry",
     }

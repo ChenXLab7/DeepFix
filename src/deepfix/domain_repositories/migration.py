@@ -9,6 +9,9 @@ from pydantic import Field
 from deepfix.compaction.models import (
     ApprovalEvidence,
     ArtifactReference,
+    CompactionFailureRecord,
+    CompactionSnapshot,
+    DeepFixCompactionEvent,
     FileChangeEvidence,
     HypothesisRecord,
     ProvenancedText,
@@ -29,7 +32,15 @@ from deepfix.domain_repositories.execution import (
     ExecutionRepository,
     create_execution_approval,
 )
-from deepfix.domain_repositories.investigation import InvestigationRepository
+from deepfix.domain_repositories.history import (
+    HistoryRepository,
+    HistorySnapshotRecord,
+    history_record_from_snapshot,
+)
+from deepfix.domain_repositories.investigation import (
+    InvestigationRepository,
+    stable_question_id,
+)
 from deepfix.investigation.models import (
     InvestigationHypothesis,
     InvestigationState,
@@ -80,6 +91,7 @@ class DomainMigrator:
         )
         self.investigation = InvestigationRepository(self.database)
         self.execution = ExecutionRepository(self.database)
+        self.history = HistoryRepository(self.database)
         self._initialize_schema()
 
     def migrate_deterministic_evidence(self, task_id: str) -> DomainMigrationReport:
@@ -293,7 +305,7 @@ class DomainMigrator:
 
         source_questions = [
             UnresolvedQuestion(
-                question_id=_stable_question_id(task_id, text),
+                question_id=stable_question_id(task_id, text),
                 task_id=task_id,
                 text=text,
                 status="open",
@@ -428,6 +440,79 @@ class DomainMigrator:
             self._save_report(report)
         return report
 
+    def migrate_history(self, task_id: str) -> DomainMigrationReport:
+        """Backfill immutable compaction history without mutating legacy rows."""
+        task_id = _required(task_id, "task_id")
+        existing = self._load_report("history", task_id)
+        if existing is not None:
+            return existing
+
+        snapshots, failures, migration_event = self._legacy_history_rows(task_id)
+        source_records = [
+            history_record_from_snapshot(snapshot, input_hash=input_hash)
+            for input_hash, snapshot in snapshots
+        ]
+        missing_references: list[str] = []
+        for record in source_records:
+            invalid_references = [
+                reference.path
+                for reference in record.artifact_references
+                if self.artifact_root is not None
+                and not self._verify_artifact(reference)
+            ]
+            if invalid_references:
+                missing_references.extend(invalid_references)
+                continue
+            self.history.backfill(record)
+        for failure in failures:
+            self.history.record_failure(failure)
+        if migration_event is not None:
+            self.history.record_migration(
+                task_id,
+                migration_event.active_snapshot_version,
+                migration_event,
+            )
+
+        target_records = self.history.list_for_task(task_id)
+        target_failures = self.history.list_failures(task_id)
+        target_event = self.history.migrated_event(task_id)
+        source = _history_projection(source_records, failures, migration_event)
+        target = _history_projection(target_records, target_failures, target_event)
+        source_by_id = {
+            f"{kind}:{identity}": payload for kind, identity, payload in source
+        }
+        target_by_id = {
+            f"{kind}:{identity}": payload for kind, identity, payload in target
+        }
+        source_ids = set(source_by_id)
+        target_ids = set(target_by_id)
+        identity_mismatches = sorted(source_ids ^ target_ids)
+        hash_mismatches = sorted(
+            identity
+            for identity in source_ids & target_ids
+            if source_by_id[identity] != target_by_id[identity]
+        )
+        report = DomainMigrationReport(
+            domain="history",
+            task_id=task_id,
+            source_count=len(source),
+            target_count=len(target),
+            source_hash=_canonical_hash(source),
+            target_hash=_canonical_hash(target),
+            identity_mismatches=identity_mismatches,
+            hash_mismatches=hash_mismatches,
+            missing_references=sorted(set(missing_references)),
+            ready_to_switch=(
+                len(source) == len(target)
+                and not identity_mismatches
+                and not hash_mismatches
+                and not missing_references
+            ),
+        )
+        if report.ready_to_switch:
+            self._save_report(report)
+        return report
+
     def _legacy_rows(self, task_id: str) -> list[tuple[str, str, str]]:
         with self.database.connection() as connection:
             table = connection.execute(
@@ -447,6 +532,70 @@ class DomainMigrator:
                 (task_id,),
             ).fetchall()
         return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
+
+    def _legacy_history_rows(
+        self,
+        task_id: str,
+    ) -> tuple[
+        list[tuple[str, CompactionSnapshot]],
+        list[CompactionFailureRecord],
+        DeepFixCompactionEvent | None,
+    ]:
+        with self.database.connection() as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            snapshot_rows = (
+                connection.execute(
+                    """
+                    SELECT input_hash, payload FROM compaction_snapshots
+                    WHERE task_id = ? ORDER BY version
+                    """,
+                    (task_id,),
+                ).fetchall()
+                if "compaction_snapshots" in tables
+                else []
+            )
+            failure_rows = (
+                connection.execute(
+                    """
+                    SELECT payload FROM compaction_failures
+                    WHERE task_id = ? ORDER BY recorded_at, attempt_id, stage
+                    """,
+                    (task_id,),
+                ).fetchall()
+                if "compaction_failures" in tables
+                else []
+            )
+            migration_row = (
+                connection.execute(
+                    """
+                    SELECT event_payload FROM context_migrations
+                    WHERE task_id = ?
+                    """,
+                    (task_id,),
+                ).fetchone()
+                if "context_migrations" in tables
+                else None
+            )
+        return (
+            [
+                (str(row[0]), CompactionSnapshot.model_validate_json(str(row[1])))
+                for row in snapshot_rows
+            ],
+            [
+                CompactionFailureRecord.model_validate_json(str(row[0]))
+                for row in failure_rows
+            ],
+            (
+                None
+                if migration_row is None
+                else DeepFixCompactionEvent.model_validate_json(str(migration_row[0]))
+            ),
+        )
 
     def _legacy_research_rows(
         self,
@@ -665,6 +814,26 @@ class DomainMigrator:
                     str(created_at),
                 )
 
+        for record in self.history.list_for_task(task_id):
+            for semantic in record.semantic_items:
+                if semantic.kind == "hypothesis":
+                    item = HypothesisRecord.model_validate(semantic.payload)
+                    source_id = (
+                        semantic.provenance_root_ids[0]
+                        if semantic.provenance_root_ids
+                        else f"history:{record.version}:{item.hypothesis_id}"
+                    )
+                    hypotheses.append((item, source_id))
+                elif semantic.kind == "unresolved_question":
+                    item = ProvenancedText.model_validate(semantic.payload)
+                    _merge_historical_question(
+                        questions,
+                        item.text,
+                        semantic.provenance_root_ids
+                        or [f"history:{record.version}"],
+                        record.created_at,
+                    )
+
         for version, payload, created_at in memory_rows:
             memory = ProgressSnapshot.model_validate_json(str(payload))
             for item in memory.unresolved_questions:
@@ -674,7 +843,11 @@ class DomainMigrator:
                     [f"working_memory:{version}"],
                     str(created_at),
                 )
-        return hypotheses, list(questions.values())
+        unique_hypotheses = {
+            (item.hypothesis_id, source_id): (item, source_id)
+            for item, source_id in hypotheses
+        }
+        return list(unique_hypotheses.values()), list(questions.values())
 
     def _artifact_reference(self, virtual_path: str) -> ArtifactReference | None:
         if self.artifact_root is None:
@@ -857,6 +1030,43 @@ def _execution_projection(
     return sorted(records, key=lambda item: (item[0], item[1]))
 
 
+def _history_projection(
+    snapshots: list[HistorySnapshotRecord],
+    failures: list[CompactionFailureRecord],
+    migration_event: DeepFixCompactionEvent | None,
+) -> list[tuple[str, str, str]]:
+    records: list[tuple[str, str, str]] = []
+    for snapshot in snapshots:
+        payload = snapshot.model_dump(mode="json")
+        payload["semantic_items"] = [
+            item.model_dump(mode="json") for item in snapshot.semantic_items
+        ]
+        records.append(
+            (
+                "snapshot",
+                str(snapshot.version),
+                _canonical_payload(payload),
+            )
+        )
+    records.extend(
+        (
+            "failure",
+            f"{item.attempt_id}:{item.stage}",
+            _canonical_payload(item.model_dump(mode="json")),
+        )
+        for item in failures
+    )
+    if migration_event is not None:
+        records.append(
+            (
+                "migration",
+                str(migration_event.active_snapshot_version),
+                _canonical_payload(migration_event.model_dump(mode="json")),
+            )
+        )
+    return sorted(records, key=lambda item: (item[0], item[1]))
+
+
 def _investigation_projection(
     hypotheses: list[InvestigationHypothesis],
     questions: list[UnresolvedQuestion],
@@ -889,13 +1099,6 @@ def _historical_hypothesis_source(
         return default
     source = item.sources[0]
     return f"{source.kind}:{source.ref_id}"
-
-
-def _stable_question_id(task_id: str, text: str) -> str:
-    digest = hashlib.sha256(
-        f"{task_id}\0{_normalize_text(text)}".encode()
-    ).hexdigest()[:24]
-    return f"question_{digest}"
 
 
 def _normalize_text(value: str) -> str:
