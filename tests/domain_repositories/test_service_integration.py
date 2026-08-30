@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from threading import Event
 
 from langchain_core.messages import ToolMessage, message_to_dict
 
@@ -30,6 +33,7 @@ from deepfix.operations import (
     OperationStateSnapshot,
 )
 from deepfix.research.store import ResearchEvidenceStore
+from deepfix.task_domain.migration import MIGRATED_LEGACY_FIELDS
 
 
 def _mark_switched(database: SQLiteDatabase, task_id: str, *domains: str) -> None:
@@ -149,6 +153,114 @@ def test_evidence_marker_accepts_existing_deterministic_evidence_migration_name(
             (task.task_id,),
         ).fetchone()[0]
     assert "changed_files" not in json.loads(str(raw))
+
+
+def test_switched_legacy_fields_are_frozen_while_compatibility_fields_update(tmp_path):
+    database = SQLiteDatabase(tmp_path / "deepfix.db")
+    repositories = DomainRepositories.create(database)
+    task = TaskState.create(tmp_path, "fix parser", ApprovalMode.MANUAL)
+    task.changed_files = ["legacy.py"]
+    task.approvals = [ApprovalRecord("edit_file", "approve", "L1")]
+    task.final_summary = "before switch"
+    repositories.tasks.save_legacy_projection(task)
+    with database.connection() as connection:
+        before = json.loads(
+            str(
+                connection.execute(
+                    "SELECT payload FROM legacy_task_projection WHERE task_id = ?",
+                    (task.task_id,),
+                ).fetchone()[0]
+            )
+        )
+    _mark_switched(
+        database,
+        task.task_id,
+        "evidence",
+        "research",
+        "investigation",
+        "execution",
+        "history",
+    )
+
+    task.changed_files = ["current.py"]
+    task.approvals = [ApprovalRecord("execute", "approve", "L2")]
+    task.final_summary = "after switch"
+    repositories.tasks.save_legacy_projection(task)
+
+    with database.connection() as connection:
+        raw = connection.execute(
+            "SELECT payload FROM legacy_task_projection WHERE task_id = ?",
+            (task.task_id,),
+        ).fetchone()[0]
+    payload = json.loads(str(raw))
+    frozen_fields = frozenset().union(*MIGRATED_LEGACY_FIELDS.values())
+    assert {field: payload[field] for field in frozen_fields} == {
+        field: before[field] for field in frozen_fields
+    }
+    assert payload["final_summary"] == "after switch"
+
+
+def test_switch_marker_and_legacy_projection_save_are_serialized(
+    tmp_path,
+    monkeypatch,
+):
+    database = SQLiteDatabase(tmp_path / "deepfix.db")
+    repositories = DomainRepositories.create(database)
+    task = TaskState.create(tmp_path, "fix parser", ApprovalMode.MANUAL)
+    task.changed_files = ["legacy.py"]
+    repositories.tasks.save_legacy_projection(task)
+    with database.unit_of_work() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS domain_migrations (
+                domain TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                switched_at TEXT NOT NULL,
+                PRIMARY KEY(domain, task_id)
+            )
+            """
+        )
+
+    marker_connection = database.connect()
+    marker_connection.execute("BEGIN IMMEDIATE")
+    marker_connection.execute(
+        """
+        INSERT INTO domain_migrations(domain, task_id, report_json, switched_at)
+        VALUES ('evidence', ?, '{}', '2026-08-30T00:00:00+00:00')
+        """,
+        (task.task_id,),
+    )
+    attempted_save = Event()
+    original_unit_of_work = database.unit_of_work
+
+    @contextmanager
+    def observed_unit_of_work(*, immediate=False):
+        attempted_save.set()
+        with original_unit_of_work(immediate=immediate) as connection:
+            yield connection
+
+    monkeypatch.setattr(database, "unit_of_work", observed_unit_of_work)
+    task.changed_files = ["current.py"]
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(repositories.tasks.save_legacy_projection, task)
+            assert attempted_save.wait(timeout=2)
+            marker_connection.commit()
+            future.result(timeout=5)
+    finally:
+        marker_connection.close()
+
+    with database.connection() as connection:
+        payload = json.loads(
+            str(
+                connection.execute(
+                    "SELECT payload FROM legacy_task_projection WHERE task_id = ?",
+                    (task.task_id,),
+                ).fetchone()[0]
+            )
+        )
+    assert payload["changed_files"] == ["legacy.py"]
 
 
 def test_production_facades_do_not_write_retired_legacy_sources(tmp_path):

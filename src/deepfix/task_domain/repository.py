@@ -354,32 +354,58 @@ class TaskRepository:
         )
 
     def save_legacy_projection(self, task) -> None:
-        from deepfix.domain_repositories.migration import domain_is_switched
+        from deepfix.domain_repositories.migration import (
+            ensure_no_domain_migration_fence,
+            switched_domains_for_task,
+        )
         from deepfix.task_domain.migration import (
+            MIGRATED_LEGACY_FIELDS,
             legacy_payload_from_task,
             lifecycle_status_for_legacy,
             task_definition_from_legacy,
         )
 
-        switched_domains = {
-            domain
-            for domain in (
+        with self.database.unit_of_work(immediate=True) as connection:
+            migration_domains = (
                 "evidence",
                 "research",
                 "investigation",
                 "execution",
                 "history",
             )
-            if domain_is_switched(self.database, domain, task.task_id)
-        }
-        payload = legacy_payload_from_task(
-            task,
-            switched_domains=switched_domains,
-        )
-        serialized = _canonical_json(payload)
-        payload_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-        updated_at = _now()
-        with self.database.unit_of_work(immediate=True) as connection:
+            ensure_no_domain_migration_fence(
+                connection,
+                task.task_id,
+                migration_domains,
+            )
+            switched_domains = switched_domains_for_task(
+                connection,
+                task.task_id,
+                migration_domains,
+            )
+            payload = legacy_payload_from_task(
+                task,
+                switched_domains=switched_domains,
+            )
+            frozen_fields = frozenset().union(
+                *(MIGRATED_LEGACY_FIELDS[domain] for domain in switched_domains)
+            )
+            existing_projection = connection.execute(
+                "SELECT payload FROM legacy_task_projection WHERE task_id = ?",
+                (task.task_id,),
+            ).fetchone()
+            if existing_projection is not None:
+                previous_payload = json.loads(str(existing_projection[0]))
+                payload.update(
+                    {
+                        field: previous_payload[field]
+                        for field in frozen_fields
+                        if field in previous_payload
+                    }
+                )
+            serialized = _canonical_json(payload)
+            payload_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+            updated_at = _now()
             existing_definition = self._get_definition(connection, task.task_id)
             definition = task_definition_from_legacy(
                 task,

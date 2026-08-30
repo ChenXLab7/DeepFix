@@ -6,6 +6,7 @@ import os
 import threading
 import uuid
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,44 @@ from pydantic import Field, JsonValue
 from deepfix.compaction.models import ArtifactReference, StrictModel
 from deepfix.investigation.classification import result_fingerprint
 from deepfix.investigation.identity import stable_investigation_id
+
+_LEGACY_RECEIPT_TASK_LOCKS: dict[tuple[Path, str], threading.RLock] = {}
+_LEGACY_RECEIPT_TASK_LOCKS_GUARD = threading.Lock()
+_LEGACY_RECEIPT_MIGRATED_TASKS: set[tuple[Path, str]] = set()
+
+
+class LegacyReceiptWritesDisabled(RuntimeError):
+    pass
+
+
+def _legacy_receipt_task_key(
+    root_dir: str | Path,
+    task_id: str,
+) -> tuple[Path, str]:
+    return (Path(root_dir).expanduser().resolve(), receipt_task_segment(task_id))
+
+
+@contextmanager
+def legacy_receipt_task_guard(root_dir: str | Path, task_id: str):
+    """Serialize legacy Receipt writes with the one-time execution migration."""
+
+    key = _legacy_receipt_task_key(root_dir, task_id)
+    with _LEGACY_RECEIPT_TASK_LOCKS_GUARD:
+        lock = _LEGACY_RECEIPT_TASK_LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        yield
+
+
+def disable_legacy_receipt_writes(root_dir: str | Path, task_id: str) -> None:
+    key = _legacy_receipt_task_key(root_dir, task_id)
+    with _LEGACY_RECEIPT_TASK_LOCKS_GUARD:
+        _LEGACY_RECEIPT_MIGRATED_TASKS.add(key)
+
+
+def legacy_receipt_writes_disabled(root_dir: str | Path, task_id: str) -> bool:
+    key = _legacy_receipt_task_key(root_dir, task_id)
+    with _LEGACY_RECEIPT_TASK_LOCKS_GUARD:
+        return key in _LEGACY_RECEIPT_MIGRATED_TASKS
 
 
 class ToolExecutionReceipt(StrictModel):
@@ -57,31 +96,36 @@ class ToolExecutionReceiptStore:
         if self.repository is not None:
             self.repository.record_receipt(receipt)
             return
-        path = self._path(receipt.task_id, receipt.tool_call_id)
-        payload = receipt.model_dump_json(indent=2)
-        with self._lock_for(path):
-            existing = self._load_path(path)
-            if existing is not None:
-                if existing == receipt:
-                    return
-                raise RuntimeError("tool execution receipt 回执冲突")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_name(f".r-{uuid.uuid4().hex[:28]}.tmp")
-            try:
-                with temporary.open(
-                    "x",
-                    encoding="utf-8",
-                    newline="",
-                ) as file:
-                    file.write(payload)
-                    file.flush()
-                    os.fsync(file.fileno())
-                os.replace(temporary, path)
-            finally:
-                temporary.unlink(missing_ok=True)
-            content = path.read_text(encoding="utf-8")
-            if content != payload or self._load_path(path) != receipt:
-                raise RuntimeError("tool execution receipt 校验失败")
+        with legacy_receipt_task_guard(self.root_dir, receipt.task_id):
+            if legacy_receipt_writes_disabled(self.root_dir, receipt.task_id):
+                raise LegacyReceiptWritesDisabled(
+                    "legacy Receipt writes are disabled after execution migration"
+                )
+            path = self._path(receipt.task_id, receipt.tool_call_id)
+            payload = receipt.model_dump_json(indent=2)
+            with self._lock_for(path):
+                existing = self._load_path(path)
+                if existing is not None:
+                    if existing == receipt:
+                        return
+                    raise RuntimeError("tool execution receipt 回执冲突")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_name(f".r-{uuid.uuid4().hex[:28]}.tmp")
+                try:
+                    with temporary.open(
+                        "x",
+                        encoding="utf-8",
+                        newline="",
+                    ) as file:
+                        file.write(payload)
+                        file.flush()
+                        os.fsync(file.fileno())
+                    os.replace(temporary, path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                content = path.read_text(encoding="utf-8")
+                if content != payload or self._load_path(path) != receipt:
+                    raise RuntimeError("tool execution receipt 校验失败")
 
     def load(
         self,

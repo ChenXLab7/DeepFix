@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+from contextlib import ExitStack, contextmanager
+from functools import wraps
 from pathlib import Path
+from uuid import uuid4
 
 from pydantic import Field
 
@@ -48,6 +52,8 @@ from deepfix.investigation.models import (
 )
 from deepfix.investigation.receipts import (
     ToolExecutionReceipt,
+    disable_legacy_receipt_writes,
+    legacy_receipt_task_guard,
     receipt_task_segment,
 )
 from deepfix.memory import ProgressSnapshot
@@ -66,6 +72,32 @@ class DomainMigrationReport(StrictModel):
     hash_mismatches: list[str] = Field(default_factory=list)
     missing_references: list[str] = Field(default_factory=list)
     ready_to_switch: bool
+
+
+class DomainMigrationInProgress(RuntimeError):
+    pass
+
+
+def _fenced_migration(domain: str):
+    def decorate(method):
+        @wraps(method)
+        def wrapped(self, task_id: str):
+            with self._migration_fence(domain, task_id):
+                result = method(self, task_id)
+                if (
+                    domain == "execution"
+                    and result.ready_to_switch
+                    and self.artifact_root is not None
+                ):
+                    disable_legacy_receipt_writes(
+                        self.artifact_root / "investigation_receipts",
+                        task_id,
+                    )
+                return result
+
+        return wrapped
+
+    return decorate
 
 
 class DomainMigrator:
@@ -94,6 +126,7 @@ class DomainMigrator:
         self.history = HistoryRepository(self.database)
         self._initialize_schema()
 
+    @_fenced_migration("deterministic_evidence")
     def migrate_deterministic_evidence(self, task_id: str) -> DomainMigrationReport:
         task_id = _required(task_id, "task_id")
         existing = self._load_report("deterministic_evidence", task_id)
@@ -158,6 +191,7 @@ class DomainMigrator:
             self._save_report(report)
         return report
 
+    @_fenced_migration("research")
     def migrate_research(self, task_id: str) -> DomainMigrationReport:
         task_id = _required(task_id, "task_id")
         existing = self._load_report("research", task_id)
@@ -264,6 +298,7 @@ class DomainMigrator:
             self._save_report(report)
         return report
 
+    @_fenced_migration("investigation")
     def migrate_investigation(self, task_id: str) -> DomainMigrationReport:
         task_id = _required(task_id, "task_id")
         existing = self._load_report("investigation", task_id)
@@ -363,6 +398,7 @@ class DomainMigrator:
             self._save_report(report)
         return report
 
+    @_fenced_migration("execution")
     def migrate_execution(self, task_id: str) -> DomainMigrationReport:
         task_id = _required(task_id, "task_id")
         existing = self._load_report("execution", task_id)
@@ -440,6 +476,7 @@ class DomainMigrator:
             self._save_report(report)
         return report
 
+    @_fenced_migration("history")
     def migrate_history(self, task_id: str) -> DomainMigrationReport:
         """Backfill immutable compaction history without mutating legacy rows."""
         task_id = _required(task_id, "task_id")
@@ -897,6 +934,79 @@ class DomainMigrator:
                 (report.domain, report.task_id, report.model_dump_json()),
             )
 
+    @contextmanager
+    def _migration_fence(self, domain: str, task_id: str):
+        normalized_task_id = _required(task_id, "task_id")
+        owner_id = uuid4().hex
+        receipt_root = (
+            None
+            if self.artifact_root is None or domain != "execution"
+            else self.artifact_root / "investigation_receipts"
+        )
+        with ExitStack() as stack:
+            if receipt_root is not None:
+                stack.enter_context(
+                    legacy_receipt_task_guard(receipt_root, normalized_task_id)
+                )
+            try:
+                with self.database.unit_of_work(immediate=True) as connection:
+                    existing = connection.execute(
+                        """
+                        SELECT owner_id, started_at
+                        FROM domain_migration_fences
+                        WHERE domain = ? AND task_id = ?
+                        """,
+                        (domain, normalized_task_id),
+                    ).fetchone()
+                    if existing is not None:
+                        marker = connection.execute(
+                            """
+                            SELECT 1 FROM domain_migrations
+                            WHERE domain = ? AND task_id = ?
+                            """,
+                            (domain, normalized_task_id),
+                        ).fetchone()
+                        stale = connection.execute(
+                            "SELECT ? < datetime('now', '-15 minutes')",
+                            (str(existing[1]),),
+                        ).fetchone()[0]
+                        if marker is None and not bool(stale):
+                            raise DomainMigrationInProgress(
+                                "domain migration already in progress: "
+                                f"{domain}:{normalized_task_id}"
+                            )
+                        connection.execute(
+                            """
+                            DELETE FROM domain_migration_fences
+                            WHERE domain = ? AND task_id = ? AND owner_id = ?
+                            """,
+                            (domain, normalized_task_id, str(existing[0])),
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO domain_migration_fences(
+                            domain, task_id, owner_id, started_at
+                        )
+                        VALUES (?, ?, ?, datetime('now'))
+                        """,
+                        (domain, normalized_task_id, owner_id),
+                    )
+            except sqlite3.IntegrityError as error:
+                raise DomainMigrationInProgress(
+                    f"domain migration already in progress: {domain}:{normalized_task_id}"
+                ) from error
+            try:
+                yield
+            finally:
+                with self.database.unit_of_work(immediate=True) as connection:
+                    connection.execute(
+                        """
+                        DELETE FROM domain_migration_fences
+                        WHERE domain = ? AND task_id = ? AND owner_id = ?
+                        """,
+                        (domain, normalized_task_id, owner_id),
+                    )
+
     def _initialize_schema(self) -> None:
         with self.database.unit_of_work() as connection:
             connection.execute(
@@ -906,6 +1016,17 @@ class DomainMigrator:
                     task_id TEXT NOT NULL,
                     report_json TEXT NOT NULL,
                     switched_at TEXT NOT NULL,
+                    PRIMARY KEY(domain, task_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS domain_migration_fences (
+                    domain TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
                     PRIMARY KEY(domain, task_id)
                 )
                 """
@@ -932,28 +1053,70 @@ def domain_is_switched(
     domain: str,
     task_id: str,
 ) -> bool:
-    aliases = (
-        ("evidence", "deterministic_evidence")
-        if domain in {"evidence", "deterministic_evidence"}
-        else (domain, domain)
-    )
     with database.connection() as connection:
-        table = connection.execute(
-            """
-            SELECT 1 FROM sqlite_master
-            WHERE type = 'table' AND name = 'domain_migrations'
-            """
-        ).fetchone()
-        if table is None:
-            return False
-        row = connection.execute(
-            """
-            SELECT 1 FROM domain_migrations
-            WHERE domain IN (?, ?) AND task_id = ?
-            """,
-            (*aliases, task_id),
-        ).fetchone()
-    return row is not None
+        return domain in switched_domains_for_task(connection, task_id, (domain,))
+
+
+def switched_domains_for_task(
+    connection,
+    task_id: str,
+    domains: tuple[str, ...],
+) -> frozenset[str]:
+    """Read authority-switch markers on the caller's transaction snapshot."""
+
+    table = connection.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'domain_migrations'
+        """
+    ).fetchone()
+    if table is None:
+        return frozenset()
+    stored = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT domain FROM domain_migrations WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+    }
+    switched = set(domains) & stored
+    if stored & {"evidence", "deterministic_evidence"}:
+        switched.update(
+            domain
+            for domain in domains
+            if domain in {"evidence", "deterministic_evidence"}
+        )
+    return frozenset(switched)
+
+
+def ensure_no_domain_migration_fence(
+    connection,
+    task_id: str,
+    domains: tuple[str, ...],
+) -> None:
+    table = connection.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'domain_migration_fences'
+        """
+    ).fetchone()
+    if table is None:
+        return
+    fenced = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT domain FROM domain_migration_fences WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+    }
+    requested = set(domains)
+    if "evidence" in requested:
+        requested.add("deterministic_evidence")
+    conflict = sorted(fenced & requested)
+    if conflict:
+        raise DomainMigrationInProgress(
+            f"legacy projection is fenced by domain migration: {','.join(conflict)}"
+        )
 
 
 def _restore_legacy(kind: str, payload: str):
