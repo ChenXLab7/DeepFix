@@ -71,8 +71,8 @@ Five Repository classes are logical access boundaries over one DeepFix SQLite da
 ### Plan 2: Shared Persistence Foundation and Bounded Task Domain
 
 **Status:** COMPLETE — implementation and offline migration gate recorded in
-`2026-08-28-deepfix-task-persistence-foundation.md` on 2026-08-29. Awaiting
-user review before Plan 3 begins.
+`2026-08-28-deepfix-task-persistence-foundation.md` on 2026-08-29; review approved
+and Plan 3 completed.
 
 **Planned document:** `docs/superpowers/plans/2026-08-28-deepfix-task-persistence-foundation.md`
 
@@ -103,6 +103,11 @@ conversation summaries / report fields
 **Review gate:** Repository code rejects mutation of the original Task Definition; lifecycle contains no investigation/edit/test phases; VerificationPolicy cannot be silently downgraded; budget reservation remains atomic; legacy tasks load through the adapter; no new whole-task JSON write is introduced.
 
 ### Plan 3: Domain Repository Consolidation
+
+**Status:** COMPLETE — Tasks 1–8, migration cutover hardening, bounded repository
+wiring, focused/trusted/core offline gates, and exact completion evidence recorded
+in `2026-08-28-deepfix-domain-repository-consolidation.md` on 2026-08-30.
+Awaiting user review before Plan 4 begins.
 
 **Planned document:** `docs/superpowers/plans/2026-08-28-deepfix-domain-repository-consolidation.md`
 

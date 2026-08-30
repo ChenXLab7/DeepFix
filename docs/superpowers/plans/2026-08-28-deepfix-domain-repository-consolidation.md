@@ -12,6 +12,10 @@
 
 **Program:** `docs/superpowers/plans/2026-08-28-deepfix-state-authority-migration-program.md` Plan 3
 
+**Status:** COMPLETE — implementation, migration cutover hardening, offline gates,
+and completion evidence recorded on 2026-08-30. Awaiting user review before
+Plan 4 begins.
+
 ## Global Constraints
 
 - DeepAgents/LangGraph continue to own the Agent Loop, Messages, native Todo, Checkpoint, interrupt, and resume. This plan adds no Loop, Planner, Task Graph, Checkpointer, Manager, or model-routing abstraction.
@@ -241,7 +245,7 @@ Mutable default arguments shown above are documentation shorthand only; implemen
 - Consumes: `SQLiteDatabase`, existing deterministic Evidence models, `ExternalEvidence`, `ProvenancedClaim`, and `ArtifactReference`.
 - Produces: `EvidenceEnvelope`, authority enums, `EvidenceRepository`, and `VerificationEvidenceView`.
 
-- [ ] **Step 1: Write failing authority, identity, and immutability tests**
+- [x] **Step 1: Write failing authority, identity, and immutability tests**
 
 ```python
 def test_repository_assigns_system_authority_to_test_evidence(tmp_path):
@@ -282,13 +286,13 @@ def test_model_semantic_candidate_cannot_request_system_authority(tmp_path):
     assert item.authority is EvidenceAuthority.MODEL_SEMANTIC
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_evidence_repository.py -q`
 
 Expected: FAIL because `deepfix.domain_repositories.evidence` does not exist.
 
-- [ ] **Step 3: Implement canonical hashing and trusted constructors**
+- [x] **Step 3: Implement canonical hashing and trusted constructors**
 
 Create one `evidence_records` table keyed by `(task_id, evidence_id)` with indexed `kind`, `authority`, and `verification_state`. Store canonical JSON and a SHA-256 `content_hash`; reread and compare the inserted envelope before commit.
 
@@ -305,7 +309,7 @@ _DETERMINISTIC_POLICY = {
 
 `record_deterministic()` derives verification from typed payload fields; `record_semantic_candidate()` always sets `MODEL_SEMANTIC`; `accept_external()` always sets `RESEARCH`. Reject empty provenance roots except for explicitly migrated legacy records, which use a stable `legacy:<table>:<id>` root.
 
-- [ ] **Step 4: Add Artifact-reference verification tests**
+- [x] **Step 4: Add Artifact-reference verification tests**
 
 ```python
 def test_repository_rejects_unverified_artifact_reference(tmp_path):
@@ -321,7 +325,7 @@ def test_repository_rejects_unverified_artifact_reference(tmp_path):
 
 Inject an Artifact verifier callback into `EvidenceRepository`; production wiring uses the existing backend/Artifact root, while tests use a deterministic fake. The Repository never writes Artifact bodies.
 
-- [ ] **Step 5: Run focused tests and static checks**
+- [x] **Step 5: Run focused tests and static checks**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_evidence_repository.py tests/compaction/test_models.py -q`
 
@@ -329,7 +333,7 @@ Run: `.venv\Scripts\ruff check src/deepfix/domain_repositories tests/domain_repo
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 ```powershell
 git add src/deepfix/domain_repositories tests/domain_repositories/test_evidence_repository.py
@@ -352,7 +356,7 @@ git commit -m "feat: add immutable evidence repository"
 - Consumes: Task 1 `EvidenceRepository`; legacy `deterministic_evidence` rows and TaskState evidence/test/change/approval projections.
 - Produces: `migrate_deterministic_evidence(task_id) -> DomainMigrationReport` and a `CompactionStore` Evidence compatibility facade.
 
-- [ ] **Step 1: Write failing stable migration tests**
+- [x] **Step 1: Write failing stable migration tests**
 
 ```python
 def test_deterministic_backfill_preserves_ids_payload_hashes_and_counts(legacy_database):
@@ -372,19 +376,19 @@ def test_backfill_is_idempotent_and_does_not_update_legacy_rows(legacy_database)
     assert read_legacy_rows(legacy_database, "deterministic_evidence") == before
 ```
 
-- [ ] **Step 2: Run migration tests and verify RED**
+- [x] **Step 2: Run migration tests and verify RED**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_evidence_repository.py -k backfill -q`
 
 Expected: FAIL because the migrator/report do not exist.
 
-- [ ] **Step 3: Implement deterministic backfill and validation report**
+- [x] **Step 3: Implement deterministic backfill and validation report**
 
 Add `domain_migrations(domain, task_id, source_hash, target_hash, source_count, target_count, switched_at)` and implement `DomainMigrationReport` with exact mismatch lists. Legacy payloads keep their original `evidence_id`; the canonical envelope hash is computed from the normalized content, while `source_hash` records the canonical ordered legacy rows.
 
 The switch marker may be written only when counts match, all IDs resolve, every Artifact reference verifies, and no payload hash conflict exists.
 
-- [ ] **Step 4: Turn `CompactionStore` Evidence methods into a facade**
+- [x] **Step 4: Turn `CompactionStore` Evidence methods into a facade**
 
 Retain these legacy methods for Plan 3 callers:
 
@@ -403,13 +407,13 @@ def list_evidence(self, task_id):
 
 Once the switch marker exists, these methods must not write `deterministic_evidence`. The table remains read-only for rollback.
 
-- [ ] **Step 5: Run deterministic Evidence regressions**
+- [x] **Step 5: Run deterministic Evidence regressions**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_evidence_repository.py tests/compaction/test_store.py tests/compaction/test_evidence.py tests/test_protected_context.py -q`
 
 Expected: PASS; public payload behavior remains unchanged and new writes exist only in `evidence_records`.
 
-- [ ] **Step 6: Commit Task 2**
+- [x] **Step 6: Commit Task 2**
 
 ```powershell
 git add src/deepfix/domain_repositories/migration.py src/deepfix/compaction/store.py src/deepfix/compaction/evidence.py tests/domain_repositories/test_evidence_repository.py tests/compaction/test_store.py tests/compaction/test_evidence.py
@@ -437,7 +441,7 @@ Pause and report the migrated task count, source/target Evidence counts, hash va
 - Consumes: existing `ResearchQuery`, `SearchCandidate`, `ExternalEvidence`, research Artifacts, and Task 1 Evidence authority.
 - Produces: accepted external Evidence in `evidence_records`, `research_attempts` audit records, and a `ResearchEvidenceStore` compatibility facade.
 
-- [ ] **Step 1: Write failing acquisition/persistence-boundary tests**
+- [x] **Step 1: Write failing acquisition/persistence-boundary tests**
 
 ```python
 def test_repository_records_attempt_metadata_but_performs_no_network_io(tmp_path):
@@ -465,29 +469,29 @@ def test_external_evidence_keeps_independent_provenance_roots(tmp_path, verified
     assert item.provenance_root_ids == ["url:https://example.test/release"]
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_research_migration.py -q`
 
 Expected: FAIL because research-attempt persistence and migration are absent.
 
-- [ ] **Step 3: Add research-attempt audit and external Evidence migration**
+- [x] **Step 3: Add research-attempt audit and external Evidence migration**
 
 Persist sanitized query, provider names, cleaned provider errors, candidate IDs, and Artifact refs in `research_attempts`; do not persist secrets or raw credentials. Migrate `research_queries`, `search_candidates`, and `external_evidence` with stable IDs and retain those tables read-only.
 
 `ExternalEvidence.local_evidence` remains a typed payload relationship. Its linked IDs must resolve to current `evidence_records`; derived Observation/Claim objects sharing one underlying source retain the same provenance root and count as one independent source.
 
-- [ ] **Step 4: Convert the old Store into a facade and switch tool writers**
+- [x] **Step 4: Convert the old Store into a facade and switch tool writers**
 
 Keep `ResearchEvidenceStore.save_query/save_candidates/save_evidence/get_evidence/list_evidence/update_verification/query_summary` signatures. Delegate accepted Evidence and attempts to `EvidenceRepository`; candidate retrieval may remain a compatibility audit query until Plan 4 removes the class name. No repository method performs HTTP.
 
-- [ ] **Step 5: Run research and verification regressions**
+- [x] **Step 5: Run research and verification regressions**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_research_migration.py tests/research tests/test_verification.py tests/test_context.py -q`
 
 Expected: PASS; online-marked tests remain skipped by default.
 
-- [ ] **Step 6: Commit Task 3**
+- [x] **Step 6: Commit Task 3**
 
 ```powershell
 git add src/deepfix/domain_repositories/evidence.py src/deepfix/domain_repositories/migration.py src/deepfix/research/store.py src/deepfix/research/tools.py tests/domain_repositories/test_research_migration.py tests/research/test_store.py tests/research/test_workflow.py
@@ -512,7 +516,7 @@ git commit -m "refactor: consolidate external research evidence"
 - Consumes: current `InvestigationHypothesis`, legacy `InvestigationState`, Working Memory/Snapshot unresolved questions as migration inputs only, and current Evidence IDs.
 - Produces: normalized `hypotheses`, `unresolved_questions`, and investigation event/experiment persistence behind `InvestigationRepository`.
 
-- [ ] **Step 1: Write failing identity and semantic-boundary tests**
+- [x] **Step 1: Write failing identity and semantic-boundary tests**
 
 ```python
 def test_hypothesis_transition_requires_stable_id_and_evidence(tmp_path):
@@ -536,31 +540,31 @@ def test_question_is_not_a_todo_or_task_lifecycle_state(tmp_path):
     assert not hasattr(repository, "can_execute")
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_investigation_repository.py -q`
 
 Expected: FAIL because the normalized repository and `UnresolvedQuestion` do not exist.
 
-- [ ] **Step 3: Implement normalized tables and transition validation**
+- [x] **Step 3: Implement normalized tables and transition validation**
 
 Create `hypotheses`, `unresolved_questions`, `investigation_events`, `experiment_results`, `experiment_events`, and `strategy_decisions` under the Repository. A hypothesis statement is immutable for a stable ID; state may move `candidate → supported/rejected`, and a rejected hypothesis can reopen only under a new ID referencing the rejected ID. Resolving a question requires at least one current Evidence ID.
 
 The existing phase, permit, stagnation, and materialized `InvestigationState` fields remain compatibility data through Plan 4 and are not copied into normalized Hypothesis/Question records.
 
-- [ ] **Step 4: Backfill and convert `InvestigationStore` into a facade**
+- [x] **Step 4: Backfill and convert `InvestigationStore` into a facade**
 
 Backfill hypotheses from current Investigation state first; use Snapshot/Working Memory only to recover missing unresolved questions and tag their source as historical. If the same stable ID exists in both, the current Investigation record wins and any conflicting historical text is retained only as history/conflict metadata.
 
 Keep `InvestigationStore.load/ensure_started/commit/list_events/commit_experiment/save_strategy_decision` working. Its facade delegates domain records to `InvestigationRepository` while preserving the phase-shaped compatibility projection until Plan 4.
 
-- [ ] **Step 5: Run investigation regressions**
+- [x] **Step 5: Run investigation regressions**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_investigation_repository.py tests/investigation/test_store.py tests/investigation/test_migration.py tests/investigation/test_reducer.py tests/navigation/test_feedback.py -q`
 
 Expected: PASS; Todo/navigation behavior is unchanged and Investigation cannot control business lifecycle.
 
-- [ ] **Step 6: Commit Task 4**
+- [x] **Step 6: Commit Task 4**
 
 ```powershell
 git add src/deepfix/domain_repositories/investigation.py src/deepfix/domain_repositories/migration.py src/deepfix/investigation/models.py src/deepfix/investigation/store.py src/deepfix/investigation/reducer.py tests/domain_repositories/test_investigation_repository.py tests/investigation/test_store.py tests/investigation/test_migration.py
@@ -590,7 +594,7 @@ Pause and report Hypothesis/Question counts, conflict handling, proof that Snaps
 - Consumes: existing Operation/Receipt models, ApprovalRecord, Artifact helpers, Workspace state hashes, and shared SQLite.
 - Produces: atomic `observe_with_receipt()`, `ExecutionIntegrity`, compatibility Receipt/Journal facades, and recovery-safe authority.
 
-- [ ] **Step 1: Write failing parallel Receipt and lifecycle tests**
+- [x] **Step 1: Write failing parallel Receipt and lifecycle tests**
 
 ```python
 def test_parallel_receipts_are_atomic_and_idempotent(tmp_path):
@@ -616,13 +620,13 @@ def test_observation_commits_receipt_and_operation_state_together(tmp_path):
     assert repository.load_receipt("task-1", "call-1") is not None
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_execution_repository.py -q`
 
 Expected: FAIL because `ExecutionRepository` does not exist.
 
-- [ ] **Step 3: Implement Execution tables and atomic observation**
+- [x] **Step 3: Implement Execution tables and atomic observation**
 
 Use three semantic tables: `operations`, `receipts`, and `approvals`. Keep Receipt payload small in SQLite; large/raw output remains in `operation_results` Artifact. `observe_with_receipt()` uses one `BEGIN IMMEDIATE` transaction to verify Operation is `started`, insert/replay-check the Receipt, attach verified Artifact refs, and move Operation to `observed`.
 
@@ -640,7 +644,7 @@ COMMITTED commit
 
 If derived Evidence fails, leave the Operation `observed`; resume projects Evidence from the stored Receipt/workspace without rerunning the side effect.
 
-- [ ] **Step 4: Add fault-injection tests**
+- [x] **Step 4: Add fault-injection tests**
 
 ```python
 def test_evidence_commit_failure_never_repeats_external_side_effect(harness):
@@ -659,7 +663,7 @@ def test_unverifiable_started_operation_becomes_unknown_and_blocks_resume(harnes
     assert harness.repository.integrity_view("task-1").has_unknown_operations
 ```
 
-- [ ] **Step 5: Convert Receipt and Journal Stores into facades**
+- [x] **Step 5: Convert Receipt and Journal Stores into facades**
 
 `ToolExecutionReceiptStore` retains Artifact read/write helpers and delegates Receipt metadata to `ExecutionRepository`. `OperationJournalStore` delegates lifecycle operations. The old Receipt JSON files are imported once, then never written after the execution migration marker. `OperationReconciler` consumes `ExecutionRepository` but keeps its current recovery algorithm.
 
@@ -667,13 +671,13 @@ Approval decisions are persisted as immutable `ExecutionApproval` records and se
 
 `operations.artifact_references` stores path plus verified content hash. The compatibility `OperationJournalEntry.artifact_references: list[str]` projection returns only paths to avoid changing the recovery API during Plan 3; the normalized rows remain the authority for integrity checks.
 
-- [ ] **Step 6: Run execution/recovery regressions**
+- [x] **Step 6: Run execution/recovery regressions**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_execution_repository.py tests/investigation/test_receipts.py tests/test_operations.py tests/evaluation/test_fault_injection.py tests/investigation/test_middleware.py -q`
 
 Expected: PASS; parallel Receipt tests are stable and fault injection observes exactly one side effect.
 
-- [ ] **Step 7: Commit Task 5**
+- [x] **Step 7: Commit Task 5**
 
 ```powershell
 git add src/deepfix/domain_repositories/execution.py src/deepfix/domain_repositories/migration.py src/deepfix/investigation/receipts.py src/deepfix/operations.py src/deepfix/investigation/middleware.py tests/domain_repositories/test_execution_repository.py tests/investigation/test_receipts.py tests/test_operations.py tests/evaluation/test_fault_injection.py
@@ -704,7 +708,7 @@ Pause and report parallel Receipt results, Operation lifecycle counts, Artifact 
 - Consumes: `CompactionSnapshot`, coverage/work-unit/message IDs, provenance, Artifact references, active compaction events, current Evidence, and current Investigation records.
 - Produces: `HistorySnapshotRecord`, `HistoricalSemanticItem`, `HistoryRepository`, and current-domain-over-history projection.
 
-- [ ] **Step 1: Write failing history authority tests**
+- [x] **Step 1: Write failing history authority tests**
 
 ```python
 def test_history_record_contains_coverage_and_sources_but_not_current_domain_tables(tmp_path):
@@ -730,19 +734,19 @@ def test_current_domain_record_overrides_stale_snapshot_item(repositories):
     assert only_one_hypothesis(projected, "h-1")
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_history_repository.py -q`
 
 Expected: FAIL because the history-only models and repository are absent.
 
-- [ ] **Step 3: Implement history schema and lifecycle**
+- [x] **Step 3: Implement history schema and lifecycle**
 
 Create `history_snapshots`, `history_semantic_items`, `history_artifact_refs`, `history_coverage`, `compaction_failures`, and `context_migrations`. `HistorySnapshotRecord` holds lifecycle/input hash/coverage/source work units/artifact refs/content hash; historical facts/hypotheses/questions are separate `HistoricalSemanticItem` rows with stable item IDs and provenance roots.
 
 Do not copy current Evidence or Investigation version counters. Prepared replay is idempotent by `(task_id, input_hash)`; only the compaction event's version can activate a prepared record; active records cannot be abandoned.
 
-- [ ] **Step 4: Preserve Artifact-first message replacement atomicity**
+- [x] **Step 4: Preserve Artifact-first message replacement atomicity**
 
 Keep the coordinator order exact:
 
@@ -757,17 +761,17 @@ return replace_messages_only_after_activation(messages, active, event)
 
 Any Artifact, Snapshot, or activation failure returns/raises through the existing graded policy with original messages untouched. Do not make Middleware set task lifecycle directly.
 
-- [ ] **Step 5: Backfill legacy Compaction rows and make `CompactionStore` a facade**
+- [x] **Step 5: Backfill legacy Compaction rows and make `CompactionStore` a facade**
 
 Migrate Snapshots, failures, and context-migration events. Current Evidence/Hypothesis data embedded in legacy Snapshot JSON becomes historical semantic items; current records are read from Evidence/Investigation repositories during projection. Keep old compaction tables read-only.
 
-- [ ] **Step 6: Run history/compaction regressions**
+- [x] **Step 6: Run history/compaction regressions**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_history_repository.py tests/compaction/test_store.py tests/compaction/test_snapshot.py tests/compaction/test_snapshot_drift.py tests/compaction/test_coordinator.py tests/compaction/test_overflow.py -q`
 
 Expected: PASS; stale history never overrides current facts and original messages survive every injected preparation failure.
 
-- [ ] **Step 7: Commit Task 6**
+- [x] **Step 7: Commit Task 6**
 
 ```powershell
 git add src/deepfix/domain_repositories/history.py src/deepfix/domain_repositories/migration.py src/deepfix/compaction/models.py src/deepfix/compaction/store.py src/deepfix/compaction/snapshot.py src/deepfix/compaction/coordinator.py tests/domain_repositories/test_history_repository.py tests/compaction/test_store.py tests/compaction/test_snapshot_drift.py tests/compaction/test_coordinator.py
@@ -801,7 +805,7 @@ Pause and report Snapshot lifecycle coverage, stale-history precedence tests, Ar
 - Consumes: Tasks 1–6 repositories and Plan 2 `SQLiteDatabase`/`TaskRepository`.
 - Produces: one production composition root, current-fact reads from domain authorities, history-only context projection, and field-level legacy write disable.
 
-- [ ] **Step 1: Write failing construction and authority tests**
+- [x] **Step 1: Write failing construction and authority tests**
 
 ```python
 def test_cli_injects_all_repositories_from_one_database(cli_factory):
@@ -826,13 +830,13 @@ def test_context_deduplicates_current_and_historical_ids(app):
     assert rendered.count("h-1") == 1
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_service_integration.py -q`
 
 Expected: FAIL because production still constructs independent legacy Stores.
 
-- [ ] **Step 3: Wire one database and four bounded repositories**
+- [x] **Step 3: Wire one database and four bounded repositories**
 
 Construct `SQLiteDatabase` once in CLI/service composition. Inject repositories into existing middleware/tools/coordinators; do not modify DeepAgents graph ownership, native Todo middleware, Messages, Checkpointer, interrupt, or resume.
 
@@ -848,7 +852,7 @@ Task Definition / user-message constraints
 
 Historical projections retain source/provenance and never gain authority by appearing in a Snapshot.
 
-- [ ] **Step 4: Disable migrated legacy writes field-by-field**
+- [x] **Step 4: Disable migrated legacy writes field-by-field**
 
 Add explicit migration markers for `evidence`, `research`, `investigation`, `execution`, and `history`. `TaskRepository.save_legacy_projection()` must omit only fields whose domain marker is switched; unmigrated/Plan 4 compatibility fields continue to round-trip. Tests assert no new writes reach:
 
@@ -862,13 +866,13 @@ compaction_snapshots/compaction_failures/context_migrations
 
 Do not remove these sources or the legacy `TaskState` fields in this task.
 
-- [ ] **Step 5: Run integration regressions**
+- [x] **Step 5: Run integration regressions**
 
 Run: `.venv\Scripts\python -m pytest tests/domain_repositories/test_service_integration.py tests/test_cli.py tests/test_context.py tests/test_protected_context.py tests/test_reporting.py tests/test_service.py -q`
 
 Expected: PASS; restore/reporting data remains available after every migrated legacy writer is disabled.
 
-- [ ] **Step 6: Commit Task 7**
+- [x] **Step 6: Commit Task 7**
 
 ```powershell
 git add src/deepfix/domain_repositories/__init__.py src/deepfix/agent.py src/deepfix/cli.py src/deepfix/context.py src/deepfix/protected_context.py src/deepfix/service.py src/deepfix/reporting.py tests/domain_repositories/test_service_integration.py tests/test_cli.py tests/test_context.py tests/test_protected_context.py tests/test_reporting.py tests/test_service.py
@@ -888,7 +892,7 @@ git commit -m "refactor: wire bounded domain repositories"
 - Consumes: all Plan 3 outputs.
 - Produces: reproducible offline completion evidence and the exact Plan 4 handoff boundary.
 
-- [ ] **Step 1: Add the cross-domain migration invariant test**
+- [x] **Step 1: Add the cross-domain migration invariant test**
 
 ```python
 @pytest.mark.parametrize("domain", ["evidence", "research", "investigation", "execution", "history"])
@@ -908,11 +912,11 @@ def test_rollback_sources_are_read_only_after_switch(migrated_fixture):
     assert migrated_fixture.current_repository_counts_increased()
 ```
 
-- [ ] **Step 2: Add restore/reporting and no-duplicate-side-effect gate**
+- [x] **Step 2: Add restore/reporting and no-duplicate-side-effect gate**
 
 Create a legacy task containing deterministic/external Evidence, hypotheses, an unresolved question, two parallel Receipts, one observed Operation, approvals, and an active Snapshot. Migrate, disable legacy writers, restore, reconcile, render context, and build a report. Assert all stable IDs and Artifact hashes survive, the observed side effect count remains one, and current domain records shadow stale Snapshot items.
 
-- [ ] **Step 3: Run the Plan 3 focused gate**
+- [x] **Step 3: Run the Plan 3 focused gate**
 
 Run:
 
@@ -930,7 +934,7 @@ Run:
 
 Expected: PASS, excluding only already documented environment-specific Windows failures if they reproduce unchanged.
 
-- [ ] **Step 4: Run trusted integration regressions**
+- [x] **Step 4: Run trusted integration regressions**
 
 Run:
 
@@ -952,7 +956,7 @@ Run:
 
 Expected: PASS. DeepAgents Todo/Checkpoint behavior and Workspace/approval/verification boundaries are unchanged.
 
-- [ ] **Step 5: Run core offline and static checks**
+- [x] **Step 5: Run core offline and static checks**
 
 Run: `.venv\Scripts\python -m pytest --import-mode=importlib -q`
 
@@ -962,16 +966,122 @@ Run: `git diff --check`
 
 Expected: all offline tests pass except any explicitly documented pre-existing environment failures; Ruff and diff checks exit 0. Do not run paid online evaluation.
 
-- [ ] **Step 6: Record exact completion evidence**
+- [x] **Step 6: Record exact completion evidence**
 
 Update this document with task commit IDs, per-domain source/target counts, stable-ID/hash/reference validation results, parallel Receipt count, fault-injection execution count, focused/core test totals, and the exact read-only rollback tables/files retained for Plan 4.
 
-- [ ] **Step 7: Mark Plan 3 complete in the parent program and commit**
+- [x] **Step 7: Mark Plan 3 complete in the parent program and commit**
 
 ```powershell
 git add docs/superpowers/plans/2026-08-28-deepfix-domain-repository-consolidation.md docs/superpowers/plans/2026-08-28-deepfix-state-authority-migration-program.md tests/domain_repositories/test_migration_gate.py
 git commit -m "docs: record domain repository consolidation"
 ```
+
+## Plan 3 Completion Evidence
+
+### Task commits
+
+- Task 1: `360164b` — immutable Evidence repository.
+- Task 2: `e2f61b5` — deterministic Evidence authority switch.
+- Task 3: `c6e1be2` — external research Evidence consolidation.
+- Task 4: `6027945` — Investigation authority consolidation.
+- Task 5: `60ba669` — trusted Execution persistence consolidation.
+- Task 6: `6862064` — history-only compaction authority.
+- Task 7: `98abd8c` — production repository wiring and field-level legacy write disable.
+- Task 8 implementation/gate: `5521219` — cross-domain migration gate,
+  transactional cutover fence, rollback-field freezing, Receipt cutover guard,
+  and crash-recoverable migration leases.
+- Completion record: the `docs: record domain repository consolidation` commit
+  containing this section.
+
+### Repository ownership and tables
+
+- `EvidenceRepository`: `evidence_records`, `evidence_revisions`,
+  `research_attempts`, and `research_candidates`. It owns current deterministic,
+  accepted external, and semantic-candidate Evidence plus research-attempt audit.
+- `InvestigationRepository`: `hypotheses`, `unresolved_questions`,
+  `investigation_conflicts`, `investigation_events`, `strategy_decisions`,
+  `experiment_results`, and `experiment_events`. It owns current investigation
+  beliefs/questions, never navigation or completion.
+- `ExecutionRepository`: `operations`, `receipts`, and `approvals`. Operation,
+  Receipt, and Approval remain distinct models under one recovery/idempotency boundary.
+- `HistoryRepository`: `history_snapshots`, `history_semantic_items`,
+  `history_artifact_refs`, `history_coverage`, `compaction_history_failures`, and
+  `context_history_migrations`. It owns historical projection and lifecycle, not
+  current facts.
+- `domain_migrations` and `domain_migration_fences` are migration coordination
+  metadata, not a fifth domain authority. Fences are per task/domain, owner-scoped,
+  expire after 15 minutes, and are recoverable both before and after marker commit.
+
+### Cross-domain migration invariant
+
+The reproducible legacy fixture migrates the following exact source/target counts:
+
+| Domain | Source | Target |
+|---|---:|---:|
+| deterministic Evidence | 2 | 2 |
+| Research | 3 | 3 |
+| Investigation | 2 | 2 |
+| Execution | 4 | 4 |
+| History | 2 | 2 |
+
+For every domain, source and target canonical hashes are equal; identity mismatch,
+content-hash mismatch, and missing-reference lists are empty. Stable test,
+hypothesis, question, Receipt, Operation, research Evidence, and Snapshot identities
+survive. The Research and conversation-history `ArtifactReference` values retain
+their paths and SHA-256 hashes and are verified against the actual files.
+
+Two different legacy Receipts created concurrently migrate exactly once each.
+Four concurrent writes of the same migrated Receipt remain idempotent and keep the
+authoritative Receipt count at two. One observed Operation remains one record after
+two reconciliation passes. The four real fault-injection scenarios each execute the
+side-effect handler exactly once (`duplicate_side_effects == 0`). A writer arriving
+during execution migration waits on the task fence and then fails closed after the
+authority marker activates; it cannot modify the legacy Receipt rollback files.
+
+Current Evidence and Investigation records with the same stable IDs override stale
+Snapshot test/hypothesis projections in restore, Protected Context, reporting, and
+history projection. The migrated unresolved question and exact Artifact references
+remain available. All ten fields in `MIGRATED_LEGACY_FIELDS` are hashed and proven
+unchanged by a normal post-switch persistence cycle, while current repository counts
+continue to increase.
+
+### Read-only rollback sources retained for Plan 4
+
+- SQLite: `deterministic_evidence`, `research_queries`, `search_candidates`,
+  `external_evidence`, `investigation_state`, `working_memory`,
+  `operation_journal`, `compaction_snapshots`, `compaction_failures`,
+  `context_migrations`, the historical Plan 2 `tasks` table, and migrated fields
+  inside `legacy_task_projection`.
+- Files: `artifacts/investigation_receipts/<task>/...` legacy Receipt JSON files.
+- New production writes target the bounded repositories. Migrated legacy projection
+  fields are frozen; late legacy Receipt writes fail closed. Unmigrated Plan 4
+  compatibility fields continue to round-trip.
+
+### Verification results
+
+- Task 8 migration gate: **12 passed**.
+- Task 8 migration/service/Receipt focused subset: **25 passed**.
+- Plan 3 focused gate: **355 passed, 1 skipped, 2 deselected**; one additional
+  long-context test reproduces the pre-existing Windows sandbox `_overlapped` /
+  `WinError 10106` failure.
+- Trusted integration gate: **290 passed**; its only additional failure reuses the
+  same environment-limited long-context fixture.
+- Core offline suite (`PYTHONPATH=src;tests`, `--import-mode=importlib`):
+  **1046 passed, 2 skipped, 2 deselected**; the only two failures are the same
+  long-context fixture and the navigation test that reuses it.
+- `ruff check src tests`: PASS.
+- `git diff --check`: PASS.
+- Independent Task 8 code review: PASS, with no remaining Critical or Important
+  findings in the declared single-process Agent boundary.
+- No paid online QuixBugs or formal A/B acceptance run was executed.
+
+### Plan 4 handoff boundary
+
+Plan 4 still intentionally owns retirement of `AgentPhase`, PhaseResolver and phase
+prompts/tool gating, `WorkingMemoryStore`, giant `TaskState` compatibility fact
+fields, report compatibility projection, public `save_progress`, duplicate context
+aggregation, and legacy Store class names. None is removed by Plan 3.
 
 ## Plan 3 Review Checkpoint
 
