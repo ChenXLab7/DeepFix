@@ -24,13 +24,23 @@ from deepfix.domain_repositories.evidence import (
     restore_deterministic_evidence,
     restore_external_evidence,
 )
+from deepfix.domain_repositories.execution import (
+    ExecutionApproval,
+    ExecutionRepository,
+    create_execution_approval,
+)
 from deepfix.domain_repositories.investigation import InvestigationRepository
 from deepfix.investigation.models import (
     InvestigationHypothesis,
     InvestigationState,
     UnresolvedQuestion,
 )
+from deepfix.investigation.receipts import (
+    ToolExecutionReceipt,
+    receipt_task_segment,
+)
 from deepfix.memory import ProgressSnapshot
+from deepfix.operations import OperationJournalEntry
 from deepfix.research.models import ExternalEvidence, ResearchQuery, SearchCandidate
 
 
@@ -69,6 +79,7 @@ class DomainMigrator:
             ),
         )
         self.investigation = InvestigationRepository(self.database)
+        self.execution = ExecutionRepository(self.database)
         self._initialize_schema()
 
     def migrate_deterministic_evidence(self, task_id: str) -> DomainMigrationReport:
@@ -340,6 +351,83 @@ class DomainMigrator:
             self._save_report(report)
         return report
 
+    def migrate_execution(self, task_id: str) -> DomainMigrationReport:
+        task_id = _required(task_id, "task_id")
+        existing = self._load_report("execution", task_id)
+        if existing is not None:
+            return existing
+
+        operations = self._legacy_operations(task_id)
+        receipts = self._legacy_receipts(task_id)
+        approvals = self._legacy_approvals(task_id)
+        missing_references: list[str] = []
+        for operation in operations:
+            references: list[ArtifactReference] = []
+            for path in operation.artifact_references:
+                reference = self._operation_artifact_reference(path)
+                if reference is None:
+                    missing_references.append(path)
+                else:
+                    references.append(reference)
+            if len(references) != len(operation.artifact_references):
+                continue
+            self.execution.backfill_operation(
+                operation,
+                artifact_references=references,
+            )
+        for receipt in receipts:
+            self.execution.record_receipt(receipt)
+        for approval in approvals:
+            self.execution.record_approval(approval)
+
+        source = _execution_projection(operations, receipts, approvals)
+        target = _execution_projection(
+            self.execution.list_operations(task_id),
+            [
+                item
+                for item in (
+                    self.execution.load_receipt(task_id, receipt.tool_call_id)
+                    for receipt in receipts
+                )
+                if item is not None
+            ],
+            self.execution.list_approvals(task_id),
+        )
+        source_by_id = {
+            f"{kind}:{identity}": payload for kind, identity, payload in source
+        }
+        target_by_id = {
+            f"{kind}:{identity}": payload for kind, identity, payload in target
+        }
+        source_ids = set(source_by_id)
+        target_ids = set(target_by_id)
+        identity_mismatches = sorted(source_ids ^ target_ids)
+        hash_mismatches = sorted(
+            identity
+            for identity in source_ids & target_ids
+            if source_by_id[identity] != target_by_id[identity]
+        )
+        report = DomainMigrationReport(
+            domain="execution",
+            task_id=task_id,
+            source_count=len(source),
+            target_count=len(target),
+            source_hash=_canonical_hash(source),
+            target_hash=_canonical_hash(target),
+            identity_mismatches=identity_mismatches,
+            hash_mismatches=hash_mismatches,
+            missing_references=sorted(set(missing_references)),
+            ready_to_switch=(
+                len(source) == len(target)
+                and not identity_mismatches
+                and not hash_mismatches
+                and not missing_references
+            ),
+        )
+        if report.ready_to_switch:
+            self._save_report(report)
+        return report
+
     def _legacy_rows(self, task_id: str) -> list[tuple[str, str, str]]:
         with self.database.connection() as connection:
             table = connection.execute(
@@ -421,6 +509,96 @@ class DomainMigrator:
             None
             if row is None
             else InvestigationState.model_validate_json(str(row[0]))
+        )
+
+    def _legacy_operations(self, task_id: str) -> list[OperationJournalEntry]:
+        with self.database.connection() as connection:
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'operation_journal'
+                """
+            ).fetchone()
+            rows = (
+                []
+                if table is None
+                else connection.execute(
+                    """
+                    SELECT payload FROM operation_journal
+                    WHERE task_id = ? ORDER BY created_at, operation_id
+                    """,
+                    (task_id,),
+                ).fetchall()
+            )
+        return [OperationJournalEntry.model_validate_json(str(row[0])) for row in rows]
+
+    def _legacy_receipts(self, task_id: str) -> list[ToolExecutionReceipt]:
+        if self.artifact_root is None:
+            return []
+        directory = (
+            self.artifact_root
+            / "investigation_receipts"
+            / receipt_task_segment(task_id)
+        )
+        if not directory.is_dir():
+            return []
+        return [
+            ToolExecutionReceipt.model_validate_json(path.read_text(encoding="utf-8"))
+            for path in sorted(directory.glob("*.json"))
+        ]
+
+    def _legacy_approvals(self, task_id: str) -> list[ExecutionApproval]:
+        with self.database.connection() as connection:
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'legacy_task_projection'
+                """
+            ).fetchone()
+            row = (
+                None
+                if table is None
+                else connection.execute(
+                    "SELECT payload FROM legacy_task_projection WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+            )
+        payload = {} if row is None else json.loads(str(row[0]))
+        records = payload.get("approvals", [])
+        approvals: list[ExecutionApproval] = []
+        for ordinal, record in enumerate(records):
+            operation = str(record.get("operation", "")).strip()
+            decision = str(record.get("decision", "")).strip()
+            risk = str(record.get("risk", "")).strip()
+            approvals.append(
+                create_execution_approval(
+                    task_id=task_id,
+                    operation=operation,
+                    decision=decision,
+                    risk=risk,
+                    legacy_ordinal=ordinal,
+                    created_at=f"legacy:{ordinal:08d}",
+                )
+            )
+        return approvals
+
+    def _operation_artifact_reference(
+        self,
+        relative_path: str,
+    ) -> ArtifactReference | None:
+        if self.artifact_root is None:
+            return None
+        candidate = (self.artifact_root / relative_path).resolve()
+        try:
+            candidate.relative_to(self.artifact_root)
+        except ValueError:
+            return None
+        if not candidate.is_file():
+            return None
+        return ArtifactReference(
+            path=relative_path,
+            kind="operation_result",
+            content_hash=hashlib.sha256(candidate.read_bytes()).hexdigest(),
         )
 
     def _historical_investigation(
@@ -643,6 +821,38 @@ def _research_projection(
             _canonical_payload(item.model_dump(mode="json")),
         )
         for item in evidence
+    )
+    return sorted(records, key=lambda item: (item[0], item[1]))
+
+
+def _execution_projection(
+    operations: list[OperationJournalEntry],
+    receipts: list[ToolExecutionReceipt],
+    approvals: list[ExecutionApproval],
+) -> list[tuple[str, str, str]]:
+    records = [
+        (
+            "operation",
+            item.operation_id,
+            _canonical_payload(item.model_dump(mode="json")),
+        )
+        for item in operations
+    ]
+    records.extend(
+        (
+            "receipt",
+            item.tool_call_id,
+            _canonical_payload(item.model_dump(mode="json")),
+        )
+        for item in receipts
+    )
+    records.extend(
+        (
+            "approval",
+            item.approval_id,
+            _canonical_payload(item.model_dump(mode="json")),
+        )
+        for item in approvals
     )
     return sorted(records, key=lambda item: (item[0], item[1]))
 

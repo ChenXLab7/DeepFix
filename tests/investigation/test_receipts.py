@@ -123,3 +123,22 @@ def test_command_result_artifact_is_bounded_durable_and_idempotent(tmp_path):
     assert artifact.exit_code == 7
     assert len(artifact.output.encode("utf-8")) <= 32
     assert not list(root.parent.rglob("*.tmp"))
+
+
+def test_command_result_artifact_returns_verified_reference(tmp_path):
+    root = tmp_path / "deepfix-artifacts" / "investigation_receipts"
+    store = ToolExecutionReceiptStore(root)
+    result = ToolMessage(
+        content="passed",
+        name="execute",
+        tool_call_id="execute-1",
+        artifact={"exit_code": 0},
+    )
+
+    reference = store.save_result_artifact_reference(
+        "task-a", "execute-1", "execute", result
+    )
+
+    assert reference.kind == "operation_result"
+    assert len(reference.content_hash) == 64
+    assert store.verify_artifact_reference(reference)

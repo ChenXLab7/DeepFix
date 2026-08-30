@@ -179,6 +179,7 @@ class ArtifactReference(StrictModel):
     kind: Literal[
         "conversation_history",
         "large_tool_result",
+        "operation_result",
         "research",
         "snapshot_detail",
     ]

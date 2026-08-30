@@ -20,6 +20,7 @@ from deepfix.compaction.identity import (
     ensure_message_ids,
     stable_generated_message_id,
 )
+from deepfix.compaction.models import ArtifactReference
 from deepfix.compaction.work_units import partition_work_units
 from deepfix.investigation.classification import is_pytest_verification
 from deepfix.investigation.coordinator import InvestigationCoordinator
@@ -67,6 +68,8 @@ class InvestigationMiddleware(AgentMiddleware):
         self.receipts = receipts
         self.capabilities = dict(capabilities)
         self.operation_journal = operation_journal
+        if operation_journal is not None and receipts.repository is None:
+            receipts.repository = operation_journal.repository
 
     def wrap_model_call(
         self,
@@ -177,6 +180,8 @@ class InvestigationMiddleware(AgentMiddleware):
                 "pause_before_tool_reexecution",
                 cause=exc,
             ) from exc
+        if receipt is None and operation is not None:
+            receipt = self.operation_journal.load_receipt(task_id, call_id)
         if receipt is not None:
             expected = tool_call_hash(task_id, request.tool_call)
             if receipt.call_hash != expected:
@@ -290,13 +295,17 @@ class InvestigationMiddleware(AgentMiddleware):
                 call_id,
                 "pause_and_inspect_tool_result",
             )
-        artifact_references = list(operation.artifact_references) if operation else []
+        artifact_references: list[ArtifactReference] = (
+            self.operation_journal.artifact_references(operation.operation_id)
+            if operation is not None
+            else []
+        )
         if receipt is None:
             receipt = receipt_from_result(task_id, request.tool_call, result)
             if operation is not None and operation.operation_kind is OperationKind.COMMAND:
                 try:
                     artifact_references.append(
-                        self.receipts.save_result_artifact(
+                        self.receipts.save_result_artifact_reference(
                             task_id,
                             call_id,
                             str(request.tool_call.get("name", "")),
@@ -311,26 +320,36 @@ class InvestigationMiddleware(AgentMiddleware):
                         "do_not_retry_tool_without_operation_reconciliation",
                         cause=exc,
                     ) from exc
+            if operation is None:
+                try:
+                    self.receipts.save(receipt)
+                except Exception as exc:
+                    raise self._state_error(
+                        task_id,
+                        "tool_receipt_persistence_failed",
+                        call_id,
+                        "do_not_retry_tool_without_manual_recovery",
+                        cause=exc,
+                    ) from exc
+        if operation is not None and operation.status is OperationStatus.COMMITTED:
+            return result
+        if operation is not None:
+            post_state = self._operation_snapshot(task_id, request, result=result)
             try:
-                self.receipts.save(receipt)
+                operation = self.operation_journal.observe_with_receipt(
+                    operation.operation_id,
+                    post_state=post_state,
+                    receipt=receipt,
+                    artifact_references=artifact_references,
+                )
             except Exception as exc:
                 raise self._state_error(
                     task_id,
                     "tool_receipt_persistence_failed",
                     call_id,
-                    "do_not_retry_tool_without_manual_recovery",
+                    "do_not_retry_tool_without_operation_reconciliation",
                     cause=exc,
                 ) from exc
-        if operation is not None and operation.status is OperationStatus.COMMITTED:
-            return result
-        if operation is not None:
-            post_state = self._operation_snapshot(task_id, request, result=result)
-            operation = self.operation_journal.observe(
-                operation.operation_id,
-                post_state=post_state,
-                receipt_id=receipt.result_fingerprint,
-                artifact_references=artifact_references,
-            )
         self.coordinator.record_tool_result(task_id, request.tool_call, result)
         if operation is not None:
             self.operation_journal.commit(operation.operation_id)

@@ -16,7 +16,7 @@ from langchain_core.messages import (
 )
 from pydantic import Field, JsonValue
 
-from deepfix.compaction.models import StrictModel
+from deepfix.compaction.models import ArtifactReference, StrictModel
 from deepfix.investigation.classification import result_fingerprint
 from deepfix.investigation.identity import stable_investigation_id
 
@@ -47,12 +47,16 @@ class ToolResultArtifact(StrictModel):
 
 
 class ToolExecutionReceiptStore:
-    def __init__(self, root_dir: str | Path) -> None:
+    def __init__(self, root_dir: str | Path, *, repository=None) -> None:
         self.root_dir = Path(root_dir).expanduser().resolve()
+        self.repository = repository
         self._locks: dict[Path, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
     def save(self, receipt: ToolExecutionReceipt) -> None:
+        if self.repository is not None:
+            self.repository.record_receipt(receipt)
+            return
         path = self._path(receipt.task_id, receipt.tool_call_id)
         payload = receipt.model_dump_json(indent=2)
         with self._lock_for(path):
@@ -84,6 +88,10 @@ class ToolExecutionReceiptStore:
         task_id: str,
         tool_call_id: str,
     ) -> ToolExecutionReceipt | None:
+        if self.repository is not None:
+            current = self.repository.load_receipt(task_id, tool_call_id)
+            if current is not None:
+                return current
         path = self._path(task_id, tool_call_id)
         return self._load_path(path)
 
@@ -147,6 +155,58 @@ class ToolExecutionReceiptStore:
             if restored != artifact:
                 raise RuntimeError("tool result artifact 校验失败")
         return relative.as_posix()
+
+    def save_result_artifact_reference(
+        self,
+        task_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        result: ToolMessage,
+        *,
+        max_output_bytes: int = 100_000,
+    ) -> ArtifactReference:
+        relative = self.save_result_artifact(
+            task_id,
+            tool_call_id,
+            tool_name,
+            result,
+            max_output_bytes=max_output_bytes,
+        )
+        path = self.root_dir.parent / relative
+        reference = ArtifactReference(
+            path=relative,
+            kind="operation_result",
+            content_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        if not self.verify_artifact_reference(reference):
+            raise RuntimeError("tool result artifact 校验失败")
+        return reference
+
+    def verify_artifact_reference(self, reference: ArtifactReference) -> bool:
+        if reference.kind != "operation_result":
+            return False
+        root = self.root_dir.parent.resolve()
+        path = (root / reference.path).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return False
+        return (
+            path.is_file()
+            and hashlib.sha256(path.read_bytes()).hexdigest()
+            == reference.content_hash
+        )
+
+    def artifact_reference(self, relative_path: str) -> ArtifactReference:
+        path = self.root_dir.parent / relative_path
+        reference = ArtifactReference(
+            path=relative_path,
+            kind="operation_result",
+            content_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        if not self.verify_artifact_reference(reference):
+            raise RuntimeError("tool result artifact 校验失败")
+        return reference
 
     def load_result_artifact(
         self,

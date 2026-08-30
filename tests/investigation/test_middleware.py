@@ -1005,7 +1005,7 @@ def test_committed_tool_receipt_prevents_side_effect_reexecution(tmp_path):
     assert receipt.tool_message.tool_call_id == "edit-1"
 
 
-def test_receipt_failure_after_edit_does_not_reexecute_handler(
+def test_atomic_observation_failure_after_edit_does_not_reexecute_handler(
     tmp_path,
     monkeypatch,
 ):
@@ -1025,10 +1025,14 @@ def test_receipt_failure_after_edit_does_not_reexecute_handler(
         target.write_text("return value\n", encoding="utf-8")
         return edit_result("journal-edit-1")
 
-    def fail_save(_receipt):
-        raise OSError("simulated receipt disk failure")
+    def fail_observation(*args, **kwargs):
+        raise OSError("simulated execution commit failure")
 
-    monkeypatch.setattr(middleware.receipts, "save", fail_save)
+    monkeypatch.setattr(
+        middleware.operation_journal,
+        "observe_with_receipt",
+        fail_observation,
+    )
 
     with pytest.raises(InvestigationStateError) as first:
         middleware.wrap_tool_call(edit_request("journal-edit-1"), handler)
@@ -1076,7 +1080,41 @@ def test_successful_edit_commits_journal_after_receipt_and_evidence(tmp_path):
     assert entry.pre_state.file_hash != entry.post_state.file_hash
 
 
-def test_committed_edit_with_missing_receipt_is_never_reexecuted(tmp_path):
+def test_evidence_commit_failure_leaves_observed_operation_and_resume_does_not_edit_twice(
+    tmp_path,
+):
+    target = tmp_path / "src" / "sign.py"
+    target.parent.mkdir()
+    target.write_text("return -value\n", encoding="utf-8")
+    middleware = middleware_fixture(
+        tmp_path,
+        phase="planning",
+        with_journal=True,
+        fail_next_event_commit=True,
+    )
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        target.write_text("return value\n", encoding="utf-8")
+        return edit_result("journal-edit-observed")
+
+    request = edit_request("journal-edit-observed")
+    with pytest.raises(InvestigationStateError):
+        middleware.wrap_tool_call(request, handler)
+
+    operation_id = stable_investigation_id(
+        "operation", "task-a", "journal-edit-observed"
+    )
+    assert middleware.operation_journal.load(operation_id).status is OperationStatus.OBSERVED
+    middleware.wrap_tool_call(request, handler)
+
+    assert calls == 1
+    assert middleware.operation_journal.load(operation_id).status is OperationStatus.COMMITTED
+
+
+def test_committed_edit_uses_authoritative_receipt_without_legacy_file(tmp_path):
     target = tmp_path / "src" / "sign.py"
     target.parent.mkdir()
     target.write_text("return -value\n", encoding="utf-8")
@@ -1092,13 +1130,14 @@ def test_committed_edit_with_missing_receipt_is_never_reexecuted(tmp_path):
     request = edit_request("journal-edit-missing-receipt")
     middleware.wrap_tool_call(request, handler)
     receipt_files = list(middleware.receipts.root_dir.rglob("*.json"))
-    assert len(receipt_files) == 1
-    receipt_files[0].unlink()
+    assert receipt_files == []
+    assert middleware.operation_journal.load_receipt(
+        "task-a", "journal-edit-missing-receipt"
+    ) is not None
 
-    with pytest.raises(InvestigationStateError) as error:
-        middleware.wrap_tool_call(request, handler)
+    result = middleware.wrap_tool_call(request, handler)
 
-    assert error.value.recovery.error_code == "committed_operation_receipt_missing"
+    assert result.status == "success"
     assert calls == 1
 
 
