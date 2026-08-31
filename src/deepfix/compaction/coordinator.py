@@ -47,6 +47,7 @@ from deepfix.compaction.snapshot import (
 )
 from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.work_units import WorkUnitPartition, partition_work_units
+from deepfix.domain_repositories.history import HistoryRepository
 from deepfix.memory import WorkingMemoryStore
 from deepfix.protected_context import (
     ProtectedContext,
@@ -103,6 +104,7 @@ class CompactionCoordinator:
         snapshot_builder: CompactionSnapshotBuilder | Any,
         snapshot_store: CompactionStore | Any,
         memory_store: WorkingMemoryStore,
+        history_repository: HistoryRepository | None = None,
         budget_monitor: ContextBudgetMonitor | None = None,
         protected_builder: ProtectedContextBuilder | None = None,
         model: BaseChatModel | None = None,
@@ -116,6 +118,9 @@ class CompactionCoordinator:
         self.snapshot_builder = snapshot_builder
         self.snapshot_store = snapshot_store
         self.memory_store = memory_store
+        self.history_repository = history_repository or HistoryRepository(
+            memory_store.database_path
+        )
         self.budget_monitor = budget_monitor
         self.protected_builder = protected_builder
         self.model = model
@@ -208,10 +213,15 @@ class CompactionCoordinator:
     ) -> Command:
         failure = error.failure
         self.snapshot_store.record_failure(failure)
-        self.memory_store.record_compaction_failure(
-            request.task_id, failure.error_code
+        self.history_repository.record_compaction_failure(
+            request.task_id,
+            event_id=f"{failure.attempt_id}:failure",
+            error_code=failure.error_code,
         )
-        self.memory_store.record_manual_error(request.task_id)
+        self.history_repository.record_manual_compaction_error(
+            request.task_id,
+            event_id=f"{failure.attempt_id}:manual-error",
+        )
         if request.budget.zone == "emergency":
             if failure.prepared_snapshot_version is not None:
                 self.snapshot_store.abandon_snapshot(
@@ -521,6 +531,7 @@ class CompactionCoordinator:
             snapshot_builder=self.snapshot_builder,
             snapshot_store=self.snapshot_store,
             memory_store=self.memory_store,
+            history_repository=self.history_repository,
             partitioner=self.partitioner,
         )
         return coordinator.prepare(request)
@@ -530,25 +541,31 @@ class CompactionCoordinator:
         request: CompactionRequest,
         handler: Callable[[tuple[AnyMessage, ...]], ModelResponse],
     ) -> ModelResponse | ExtendedModelResponse:
-        self.memory_store.record_budget(
-            request.task_id,
-            request.budget.usage_ratio,
-            request.budget.zone,
-        )
         input_hash = _input_hash(request, request.messages)
         attempt_id = _attempt_id(request.task_id, input_hash)
+        self.history_repository.record_budget_observation(
+            request.task_id,
+            event_id=f"{attempt_id}:automatic-budget",
+            estimated_tokens=request.budget.request_tokens,
+            usage_ratio=request.budget.usage_ratio,
+            zone=request.budget.zone,
+        )
         if attempt_id in self._failed_attempts:
             response = handler(request.messages)
-            self.memory_store.record_passthrough(request.task_id)
+            self.history_repository.record_passthrough(
+                request.task_id,
+                event_id=f"{attempt_id}:repeat-passthrough",
+            )
             return response
         try:
             prepared = self.prepare(request)
         except CompactionPreparationError as exc:
             failure = exc.failure
             self.snapshot_store.record_failure(failure)
-            self.memory_store.record_compaction_failure(
+            self.history_repository.record_compaction_failure(
                 request.task_id,
-                failure.error_code,
+                event_id=f"{failure.attempt_id}:failure",
+                error_code=failure.error_code,
             )
             self._failed_attempts.add(failure.attempt_id)
             if request.budget.zone == "emergency" or request.entrypoint == "overflow_recovery":
@@ -561,7 +578,10 @@ class CompactionCoordinator:
                     )
                 raise _recovery_required(request, failure) from exc
             response = handler(request.messages)
-            self.memory_store.record_passthrough(request.task_id)
+            self.history_repository.record_passthrough(
+                request.task_id,
+                event_id=f"{failure.attempt_id}:failure-passthrough",
+            )
             if failure.prepared_snapshot_version is not None:
                 _abandon_if_prepared(
                     self.snapshot_store,
@@ -596,25 +616,31 @@ class CompactionCoordinator:
         request: CompactionRequest,
         handler: Callable[[tuple[AnyMessage, ...]], Any],
     ) -> ModelResponse | ExtendedModelResponse:
-        self.memory_store.record_budget(
-            request.task_id,
-            request.budget.usage_ratio,
-            request.budget.zone,
-        )
         input_hash = _input_hash(request, request.messages)
         attempt_id = _attempt_id(request.task_id, input_hash)
+        self.history_repository.record_budget_observation(
+            request.task_id,
+            event_id=f"{attempt_id}:automatic-budget",
+            estimated_tokens=request.budget.request_tokens,
+            usage_ratio=request.budget.usage_ratio,
+            zone=request.budget.zone,
+        )
         if attempt_id in self._failed_attempts:
             response = await handler(request.messages)
-            self.memory_store.record_passthrough(request.task_id)
+            self.history_repository.record_passthrough(
+                request.task_id,
+                event_id=f"{attempt_id}:repeat-passthrough",
+            )
             return response
         try:
             prepared = await self.aprepare(request)
         except CompactionPreparationError as exc:
             failure = exc.failure
             self.snapshot_store.record_failure(failure)
-            self.memory_store.record_compaction_failure(
+            self.history_repository.record_compaction_failure(
                 request.task_id,
-                failure.error_code,
+                event_id=f"{failure.attempt_id}:failure",
+                error_code=failure.error_code,
             )
             self._failed_attempts.add(failure.attempt_id)
             if request.budget.zone == "emergency" or request.entrypoint == "overflow_recovery":
@@ -627,7 +653,10 @@ class CompactionCoordinator:
                     )
                 raise _recovery_required(request, failure) from exc
             response = await handler(request.messages)
-            self.memory_store.record_passthrough(request.task_id)
+            self.history_repository.record_passthrough(
+                request.task_id,
+                event_id=f"{failure.attempt_id}:failure-passthrough",
+            )
             if failure.prepared_snapshot_version is not None:
                 _abandon_if_prepared(
                     self.snapshot_store,

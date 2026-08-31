@@ -23,6 +23,7 @@ from deepfix.compaction.models import (
 from deepfix.compaction.snapshot import CompactionSnapshotBuilder
 from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.work_units import partition_work_units
+from deepfix.domain_repositories.history import HistoryRepository
 from deepfix.memory import WorkingMemoryStore
 from deepfix.protected_context import ProtectedContext
 
@@ -143,6 +144,7 @@ def _coordinator(
     database = tmp_path / "deepfix.sqlite3"
     actual_store = CompactionStore(database)
     memory = WorkingMemoryStore(database)
+    history = HistoryRepository(database)
     calls = calls if calls is not None else []
     artifact = adapter or DeepAgentsArtifactAdapter(
         FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True)
@@ -160,11 +162,12 @@ def _coordinator(
             else snapshot_store
         ),
         memory_store=memory,
+        history_repository=history,
         model=model,
         partitioner=lambda messages, conflicts: _record_partition(
             calls, messages, conflicts
         ),
-    ), actual_store, memory
+    ), actual_store, history
 
 
 def _record_partition(calls, messages, conflicts):
@@ -453,7 +456,7 @@ def test_post_commit_activation_failure_does_not_mask_emergency_recovery(tmp_pat
 
 def test_normal_failure_passthrough_once_and_same_input_skips_reprepare(tmp_path):
     adapter = _FailingAdapter()
-    coordinator, store, memory = _coordinator(tmp_path, adapter=adapter)
+    coordinator, store, history = _coordinator(tmp_path, adapter=adapter)
     handler_calls = []
     handler = lambda messages: handler_calls.append(messages) or ModelResponse(
         result=[AIMessage(content="ok")]
@@ -468,7 +471,7 @@ def test_normal_failure_passthrough_once_and_same_input_skips_reprepare(tmp_path
     assert len(handler_calls) == 2
     assert handler_calls[0] == _messages()
     assert len(store.list_failures("task-a")) == 1
-    assert memory.metrics("task-a").normal_zone_passthrough_count == 2
+    assert history.context_telemetry("task-a").normal_zone_passthrough_count == 2
 
 
 class _VerifyFailStore:

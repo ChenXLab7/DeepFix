@@ -195,11 +195,11 @@ class TaskReportView(StrictModel):
 - Modify: `src/deepfix/compaction/middleware.py`
 - Modify: `src/deepfix/compaction/migration.py`
 
-- [ ] **Step 1: Write failing History telemetry tests.**
+- [x] **Step 1: Write failing History telemetry tests.**
 
 Cover default reads, monotonic peak token updates, overflow/retry counters, normal/emergency compaction counters, failure details, active Snapshot version, last Artifact, and idempotent event replay. Also create a legacy `context_metrics` row and prove migration preserves every field exactly once.
 
-- [ ] **Step 2: Run the red test.**
+- [x] **Step 2: Run the red test.**
 
 ```powershell
 python -m pytest tests/domain_repositories/test_context_telemetry.py -q
@@ -207,26 +207,26 @@ python -m pytest tests/domain_repositories/test_context_telemetry.py -q
 
 Expected: FAIL because `HistoryRepository.context_telemetry()` and mutation methods do not exist.
 
-- [ ] **Step 3: Add the bounded History API.**
+- [x] **Step 3: Add the bounded History API.**
 
 Implement `context_telemetry`, `record_budget_observation`, `record_overflow`, `record_overflow_retry`, `record_compaction_outcome`, and `record_compaction_failure` with explicit task/event arguments. Store telemetry in a History-owned table in the existing SQLite database. Use stable compaction event IDs to prevent retry double-counting.
 
-- [ ] **Step 4: Backfill legacy metrics before switching writers.**
+- [x] **Step 4: Backfill legacy metrics before switching writers.**
 
 Migration must compare the normalized payload/hash, write the final row, validate it, mark the metrics domain switched, and only then stop writes to `WorkingMemoryStore.context_metrics`.
 
-- [ ] **Step 5: Switch coordinator and middleware telemetry writes.**
+- [x] **Step 5: Switch coordinator and middleware telemetry writes.**
 
 Replace every `coordinator.memory_store.record_*` and `.metrics()` call with the History API. Do not change budget thresholds, one-overflow-retry behavior, or compaction failure propagation.
 
-- [ ] **Step 6: Verify focused regressions.**
+- [x] **Step 6: Verify focused regressions.**
 
 ```powershell
 python -m pytest tests/domain_repositories/test_context_telemetry.py tests/compaction/test_budget.py tests/compaction/test_coordinator.py tests/compaction/test_middleware.py tests/compaction/test_overflow.py -q
 python -m ruff check src/deepfix/domain_repositories/history.py src/deepfix/domain_repositories/migration.py src/deepfix/compaction
 ```
 
-- [ ] **Step 7: Commit.**
+- [x] **Step 7: Commit.**
 
 ```powershell
 git add src/deepfix/domain_repositories/history.py src/deepfix/domain_repositories/migration.py src/deepfix/compaction/coordinator.py src/deepfix/compaction/middleware.py src/deepfix/compaction/migration.py tests/domain_repositories/test_context_telemetry.py

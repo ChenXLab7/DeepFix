@@ -37,6 +37,7 @@ from deepfix.domain_repositories.execution import (
     create_execution_approval,
 )
 from deepfix.domain_repositories.history import (
+    ContextTelemetry,
     HistoryRepository,
     HistorySnapshotRecord,
     history_record_from_snapshot,
@@ -125,6 +126,74 @@ class DomainMigrator:
         self.execution = ExecutionRepository(self.database)
         self.history = HistoryRepository(self.database)
         self._initialize_schema()
+
+    @_fenced_migration("context_telemetry")
+    def migrate_context_telemetry(self, task_id: str) -> DomainMigrationReport:
+        task_id = _required(task_id, "task_id")
+        existing = self._load_report("context_telemetry", task_id)
+        if existing is not None:
+            return existing
+        legacy_payload = self._legacy_context_telemetry(task_id)
+        source = [] if legacy_payload is None else [(task_id, legacy_payload)]
+        if legacy_payload is not None:
+            telemetry = ContextTelemetry(
+                task_id=task_id,
+                context_peak_tokens=int(legacy_payload.get("context_peak_tokens", 0)),
+                context_overflow_count=int(
+                    legacy_payload.get("context_overflow_count", 0)
+                ),
+                active_compaction_count=int(
+                    legacy_payload.get("active_compaction_count", 0)
+                ),
+                latest_usage_ratio=float(legacy_payload.get("latest_usage_ratio", 0.0)),
+                latest_budget_zone=legacy_payload.get("latest_budget_zone"),
+                normal_compaction_count=int(
+                    legacy_payload.get("normal_compaction_count", 0)
+                ),
+                emergency_compaction_count=int(
+                    legacy_payload.get("emergency_compaction_count", 0)
+                ),
+                compaction_failure_count=int(
+                    legacy_payload.get("compaction_failure_count", 0)
+                ),
+                normal_zone_passthrough_count=int(
+                    legacy_payload.get("normal_zone_passthrough_count", 0)
+                ),
+                manual_compaction_error_count=int(
+                    legacy_payload.get("manual_compaction_error_count", 0)
+                ),
+                overflow_retry_count=int(legacy_payload.get("overflow_retry_count", 0)),
+                active_snapshot_version=legacy_payload.get(
+                    "active_compaction_snapshot_version"
+                ),
+                last_compaction_artifact=legacy_payload.get("last_compaction_artifact"),
+                last_compaction_error=legacy_payload.get("last_compaction_error"),
+                last_compaction_at=legacy_payload.get("last_compaction_at"),
+            )
+            self.history.import_context_telemetry(
+                telemetry,
+                event_id=f"legacy-context-telemetry:{task_id}",
+            )
+            normalized_source = telemetry.model_dump(mode="json")
+            target = [(task_id, self.history.context_telemetry(task_id).model_dump(mode="json"))]
+            source = [(task_id, normalized_source)]
+        else:
+            target = []
+        report = DomainMigrationReport(
+            domain="context_telemetry",
+            task_id=task_id,
+            source_count=len(source),
+            target_count=len(target),
+            source_hash=_canonical_hash(source),
+            target_hash=_canonical_hash(target),
+            identity_mismatches=[],
+            hash_mismatches=[] if source == target else [task_id],
+            missing_references=[],
+            ready_to_switch=source == target,
+        )
+        if report.ready_to_switch:
+            self._save_report(report)
+        return report
 
     @_fenced_migration("deterministic_evidence")
     def migrate_deterministic_evidence(self, task_id: str) -> DomainMigrationReport:
@@ -569,6 +638,24 @@ class DomainMigrator:
                 (task_id,),
             ).fetchall()
         return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
+
+    def _legacy_context_telemetry(self, task_id: str) -> dict[str, object] | None:
+        with self.database.connection() as connection:
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'context_metrics'
+                """
+            ).fetchone()
+            row = (
+                None
+                if table is None
+                else connection.execute(
+                    "SELECT payload FROM context_metrics WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+            )
+        return None if row is None else dict(json.loads(str(row[0])))
 
     def _legacy_history_rows(
         self,

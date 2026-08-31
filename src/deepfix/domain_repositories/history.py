@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -43,6 +44,31 @@ from deepfix.domain_repositories.investigation import (
 
 class HistoryIdentityConflict(RuntimeError):
     pass
+
+
+class ContextTelemetryIdentityConflict(RuntimeError):
+    """A stable telemetry event was replayed with different semantics."""
+
+
+class ContextTelemetry(StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str = Field(min_length=1)
+    context_peak_tokens: int = Field(default=0, ge=0)
+    context_overflow_count: int = Field(default=0, ge=0)
+    active_compaction_count: int = Field(default=0, ge=0)
+    latest_usage_ratio: float = Field(default=0.0, ge=0)
+    latest_budget_zone: str | None = None
+    normal_compaction_count: int = Field(default=0, ge=0)
+    emergency_compaction_count: int = Field(default=0, ge=0)
+    compaction_failure_count: int = Field(default=0, ge=0)
+    normal_zone_passthrough_count: int = Field(default=0, ge=0)
+    manual_compaction_error_count: int = Field(default=0, ge=0)
+    overflow_retry_count: int = Field(default=0, ge=0)
+    active_snapshot_version: int | None = Field(default=None, ge=1)
+    last_compaction_artifact: str | None = None
+    last_compaction_error: str | None = None
+    last_compaction_at: str | None = None
 
 
 class HistoricalSemanticItem(StrictModel):
@@ -108,6 +134,253 @@ class HistoryRepository:
         self.database_path = self.database.path
         self.artifact_verifier = artifact_verifier
         self._initialize_schema()
+
+    def context_telemetry(self, task_id: str) -> ContextTelemetry:
+        normalized_task_id = _required_text(task_id, "task_id")
+        with self.database.connection() as connection:
+            return self._read_context_telemetry(connection, normalized_task_id)
+
+    def record_budget_observation(
+        self,
+        task_id: str,
+        *,
+        event_id: str,
+        estimated_tokens: int,
+        usage_ratio: float,
+        zone: str,
+    ) -> ContextTelemetry:
+        if estimated_tokens < 0:
+            raise ValueError("estimated_tokens must be non-negative")
+        if usage_ratio < 0:
+            raise ValueError("usage_ratio must be non-negative")
+        normalized_zone = _required_text(zone, "zone")
+        return self._record_context_event(
+            task_id,
+            event_id=event_id,
+            kind="budget_observation",
+            event_payload={
+                "estimated_tokens": estimated_tokens,
+                "usage_ratio": usage_ratio,
+                "zone": normalized_zone,
+            },
+            update=lambda current: current.model_copy(
+                update={
+                    "context_peak_tokens": max(
+                        current.context_peak_tokens,
+                        estimated_tokens,
+                    ),
+                    "latest_usage_ratio": usage_ratio,
+                    "latest_budget_zone": normalized_zone,
+                }
+            ),
+        )
+
+    def record_overflow(self, task_id: str, *, event_id: str) -> ContextTelemetry:
+        return self._increment_context_counter(
+            task_id,
+            event_id=event_id,
+            kind="overflow",
+            field="context_overflow_count",
+        )
+
+    def record_overflow_retry(
+        self,
+        task_id: str,
+        *,
+        event_id: str,
+    ) -> ContextTelemetry:
+        return self._increment_context_counter(
+            task_id,
+            event_id=event_id,
+            kind="overflow_retry",
+            field="overflow_retry_count",
+        )
+
+    def record_passthrough(self, task_id: str, *, event_id: str) -> ContextTelemetry:
+        return self._increment_context_counter(
+            task_id,
+            event_id=event_id,
+            kind="passthrough",
+            field="normal_zone_passthrough_count",
+        )
+
+    def record_manual_compaction_error(
+        self,
+        task_id: str,
+        *,
+        event_id: str,
+    ) -> ContextTelemetry:
+        return self._increment_context_counter(
+            task_id,
+            event_id=event_id,
+            kind="manual_compaction_error",
+            field="manual_compaction_error_count",
+        )
+
+    def record_compaction_failure(
+        self,
+        task_id: str,
+        *,
+        event_id: str,
+        error_code: str,
+    ) -> ContextTelemetry:
+        normalized_error = _required_text(error_code, "error_code")[:500]
+        return self._record_context_event(
+            task_id,
+            event_id=event_id,
+            kind="compaction_failure",
+            event_payload={"error_code": normalized_error},
+            update=lambda current: current.model_copy(
+                update={
+                    "compaction_failure_count": current.compaction_failure_count + 1,
+                    "last_compaction_error": normalized_error,
+                }
+            ),
+        )
+
+    def record_compaction_outcome(
+        self,
+        task_id: str,
+        *,
+        event_id: str,
+        snapshot_version: int,
+        artifact_path: str,
+        emergency: bool,
+        recorded_at: str | None = None,
+    ) -> ContextTelemetry:
+        if snapshot_version < 1:
+            raise ValueError("snapshot_version must be positive")
+        normalized_path = _required_text(artifact_path, "artifact_path")
+        timestamp = recorded_at or datetime.now(UTC).isoformat()
+
+        def update(current: ContextTelemetry) -> ContextTelemetry:
+            values: dict[str, object] = {
+                "active_compaction_count": current.active_compaction_count + 1,
+                "active_snapshot_version": snapshot_version,
+                "last_compaction_artifact": normalized_path,
+                "last_compaction_at": timestamp,
+            }
+            counter = (
+                "emergency_compaction_count" if emergency else "normal_compaction_count"
+            )
+            values[counter] = getattr(current, counter) + 1
+            return current.model_copy(update=values)
+
+        return self._record_context_event(
+            task_id,
+            event_id=event_id,
+            kind="compaction_outcome",
+            event_payload={
+                "snapshot_version": snapshot_version,
+                "artifact_path": normalized_path,
+                "emergency": emergency,
+                "recorded_at": timestamp,
+            },
+            update=update,
+        )
+
+    def import_context_telemetry(
+        self,
+        telemetry: ContextTelemetry,
+        *,
+        event_id: str,
+    ) -> ContextTelemetry:
+        return self._record_context_event(
+            telemetry.task_id,
+            event_id=event_id,
+            kind="legacy_import",
+            event_payload=telemetry.model_dump(mode="json"),
+            update=lambda current: telemetry
+            if current == ContextTelemetry(task_id=telemetry.task_id)
+            else current,
+        )
+
+    def _increment_context_counter(
+        self,
+        task_id: str,
+        *,
+        event_id: str,
+        kind: str,
+        field: str,
+    ) -> ContextTelemetry:
+        return self._record_context_event(
+            task_id,
+            event_id=event_id,
+            kind=kind,
+            event_payload={},
+            update=lambda current: current.model_copy(
+                update={field: getattr(current, field) + 1}
+            ),
+        )
+
+    def _record_context_event(
+        self,
+        task_id: str,
+        *,
+        event_id: str,
+        kind: str,
+        event_payload: dict[str, object],
+        update: Callable[[ContextTelemetry], ContextTelemetry],
+    ) -> ContextTelemetry:
+        normalized_task_id = _required_text(task_id, "task_id")
+        normalized_event_id = _required_text(event_id, "event_id")
+        payload_json = json.dumps(
+            event_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        with self.database.unit_of_work(immediate=True) as connection:
+            existing = connection.execute(
+                """
+                SELECT kind, payload_hash FROM context_telemetry_events
+                WHERE task_id = ? AND event_id = ?
+                """,
+                (normalized_task_id, normalized_event_id),
+            ).fetchone()
+            if existing is not None:
+                if str(existing[0]) != kind or str(existing[1]) != payload_hash:
+                    raise ContextTelemetryIdentityConflict(
+                        "context telemetry event identity conflict"
+                    )
+                return self._read_context_telemetry(connection, normalized_task_id)
+            current = self._read_context_telemetry(connection, normalized_task_id)
+            updated = update(current)
+            if updated.task_id != normalized_task_id:
+                raise ValueError("context telemetry task identity changed")
+            now = datetime.now(UTC).isoformat()
+            connection.execute(
+                """
+                INSERT INTO context_telemetry(task_id, payload, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (normalized_task_id, updated.model_dump_json(), now),
+            )
+            connection.execute(
+                """
+                INSERT INTO context_telemetry_events(
+                    task_id, event_id, kind, payload_hash, recorded_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (normalized_task_id, normalized_event_id, kind, payload_hash, now),
+            )
+            return updated
+
+    @staticmethod
+    def _read_context_telemetry(connection, task_id: str) -> ContextTelemetry:
+        row = connection.execute(
+            "SELECT payload FROM context_telemetry WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return (
+            ContextTelemetry(task_id=task_id)
+            if row is None
+            else ContextTelemetry.model_validate_json(str(row[0]))
+        )
 
     def save_prepared(self, record: HistorySnapshotRecord) -> HistorySnapshotRecord:
         if record.lifecycle != "prepared":
@@ -694,8 +967,28 @@ class HistoryRepository:
                     event_payload TEXT NOT NULL,
                     migrated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS context_telemetry (
+                    task_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS context_telemetry_events (
+                    task_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    PRIMARY KEY(task_id, event_id)
+                );
                 """
             )
+
+
+def _required_text(value: str, field: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field} is required")
+    return normalized
 
 
 def _rebase_record(

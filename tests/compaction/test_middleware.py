@@ -22,6 +22,7 @@ from deepfix.compaction.models import (
 )
 from deepfix.compaction.snapshot import CompactionSnapshotBuilder
 from deepfix.compaction.store import CompactionStore
+from deepfix.domain_repositories.history import HistoryRepository
 from deepfix.memory import WorkingMemoryStore
 from deepfix.protected_context import ProtectedContext
 
@@ -105,6 +106,7 @@ def _report(zone, ratio, target=None):
 class _Coordinator:
     def __init__(self, memory):
         self.memory_store = memory
+        self.history_repository = HistoryRepository(memory.database_path)
         self.snapshot_store = SimpleNamespace()
         self.requests = []
 
@@ -249,4 +251,6 @@ def test_committed_event_reconstructs_effective_view_without_deleting_checkpoint
     assert {"m3", "m4"} <= set(effective_ids)
     assert request.state["messages"] == messages
     assert store.get_snapshot("task-a", 1).lifecycle == "active"
-    assert memory.metrics("task-a").active_compaction_snapshot_version == 1
+    assert coordinator.history_repository.context_telemetry(
+        "task-a"
+    ).active_snapshot_version == 1

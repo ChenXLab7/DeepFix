@@ -15,6 +15,7 @@ from deepfix.compaction.middleware import DeepFixCompactionMiddleware
 from deepfix.compaction.models import CompactionDelta, DeterministicEvidenceBlock, TaskAnchor
 from deepfix.compaction.snapshot import CompactionSnapshotBuilder
 from deepfix.compaction.store import CompactionStore
+from deepfix.domain_repositories.history import HistoryRepository
 from deepfix.memory import WorkingMemoryStore
 from deepfix.protected_context import ProtectedContext
 
@@ -101,6 +102,7 @@ def _empty_delta():
 def _middleware(tmp_path, adapter=None):
     database = tmp_path / "deepfix.sqlite3"
     memory = WorkingMemoryStore(database)
+    history = HistoryRepository(database)
     coordinator = CompactionCoordinator(
         adapter=adapter
         or DeepAgentsArtifactAdapter(
@@ -110,12 +112,13 @@ def _middleware(tmp_path, adapter=None):
         snapshot_builder=CompactionSnapshotBuilder(),
         snapshot_store=CompactionStore(database),
         memory_store=memory,
+        history_repository=history,
     )
-    return DeepFixCompactionMiddleware(_ProtectedBuilder(), _Budget(), coordinator), memory
+    return DeepFixCompactionMiddleware(_ProtectedBuilder(), _Budget(), coordinator), history
 
 
 def test_overflow_retries_handler_exactly_once_with_minimal_safe_context(tmp_path):
-    middleware, memory = _middleware(tmp_path)
+    middleware, history = _middleware(tmp_path)
     calls = []
 
     def handler(request):
@@ -133,7 +136,7 @@ def test_overflow_retries_handler_exactly_once_with_minimal_safe_context(tmp_pat
     assert "m1" not in retry_ids
     assert isinstance(calls[1].messages[0], SystemMessage)
     assert "<deepfix_task_anchor>" in calls[1].system_message.text
-    assert memory.metrics("task-a").overflow_retry_count == 1
+    assert history.context_telemetry("task-a").overflow_retry_count == 1
 
 
 def test_second_overflow_raises_recovery_without_third_call(tmp_path):

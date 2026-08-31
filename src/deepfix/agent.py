@@ -177,6 +177,7 @@ def build_agent(
         snapshot_builder=CompactionSnapshotBuilder(),
         snapshot_store=compaction,
         memory_store=working_memory_store,
+        history_repository=(repositories.history if repositories is not None else None),
         budget_monitor=budget_monitor,
         protected_builder=protected_builder,
         model=compaction_model,
@@ -278,7 +279,12 @@ def build_agent(
             ),
             TodoNavigationMiddleware(navigation_feedback, reminder_rounds=3),
             LegacyContextMigrationMiddleware(
-                LegacyContextStores(tasks, working_memory_store, compaction),
+                LegacyContextStores(
+                    tasks,
+                    working_memory_store,
+                    compaction,
+                    repositories.history if repositories is not None else None,
+                ),
                 DeepAgentsArtifactAdapter(resolved_backend),
             ),
             InvestigationMigrationMiddleware(

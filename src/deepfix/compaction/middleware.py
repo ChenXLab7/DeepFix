@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Annotated, Any, NotRequired
@@ -148,10 +150,18 @@ class DeepFixCompactionMiddleware(AgentMiddleware):
             system_message=SystemMessage(content=system_content),
         )
         report = self.budget_monitor.measure(updated, [])
-        self.coordinator.memory_store.record_budget(
+        self.coordinator.history_repository.record_budget_observation(
             task_id,
-            report.usage_ratio,
-            report.zone,
+            event_id=_telemetry_event_id(
+                task_id,
+                "model-budget",
+                report.request_tokens,
+                report.zone,
+                *(str(message.id) for message in effective_messages),
+            ),
+            estimated_tokens=report.request_tokens,
+            usage_ratio=report.usage_ratio,
+            zone=report.zone,
         )
         return _PreparedModelRequest(
             task_id=task_id,
@@ -195,8 +205,15 @@ class DeepFixCompactionMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest], ModelResponse],
         first_overflow: ContextOverflowError,
     ) -> ModelResponse | ExtendedModelResponse:
-        self.coordinator.memory_store.record_overflow(prepared.task_id)
-        self.coordinator.memory_store.record_overflow_retry(prepared.task_id)
+        overflow_event_id = _prepared_telemetry_event_id(prepared, "overflow")
+        self.coordinator.history_repository.record_overflow(
+            prepared.task_id,
+            event_id=overflow_event_id,
+        )
+        self.coordinator.history_repository.record_overflow_retry(
+            prepared.task_id,
+            event_id=f"{overflow_event_id}:retry",
+        )
         recovery_request = _overflow_request(prepared)
         try:
             return self.coordinator.invoke_automatic(
@@ -217,8 +234,15 @@ class DeepFixCompactionMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
         first_overflow: ContextOverflowError,
     ) -> ModelResponse | ExtendedModelResponse:
-        self.coordinator.memory_store.record_overflow(prepared.task_id)
-        self.coordinator.memory_store.record_overflow_retry(prepared.task_id)
+        overflow_event_id = _prepared_telemetry_event_id(prepared, "overflow")
+        self.coordinator.history_repository.record_overflow(
+            prepared.task_id,
+            event_id=overflow_event_id,
+        )
+        self.coordinator.history_repository.record_overflow_retry(
+            prepared.task_id,
+            event_id=f"{overflow_event_id}:retry",
+        )
         recovery_request = _overflow_request(prepared)
         try:
             return await self.coordinator.ainvoke_automatic(
@@ -341,10 +365,11 @@ class DeepFixCompactionMiddleware(AgentMiddleware):
                 task_id,
                 event,
             )
-        metrics = self.coordinator.memory_store.metrics(task_id)
-        if metrics.active_compaction_snapshot_version != event.active_snapshot_version:
-            self.coordinator.memory_store.record_compaction_event(
+        metrics = self.coordinator.history_repository.context_telemetry(task_id)
+        if metrics.active_snapshot_version != event.active_snapshot_version:
+            self.coordinator.history_repository.record_compaction_outcome(
                 task_id,
+                event_id=event.event_id,
                 snapshot_version=event.active_snapshot_version,
                 artifact_path=event.conversation_artifact.path,
                 emergency=metrics.latest_budget_zone == "emergency",
@@ -416,6 +441,27 @@ def _overflow_request(prepared: _PreparedModelRequest) -> CompactionRequest:
 def _event_from_state(state: dict[str, Any]) -> DeepFixCompactionEvent | None:
     value = state.get("_deepfix_compaction_event")
     return DeepFixCompactionEvent.model_validate(value) if value else None
+
+
+def _prepared_telemetry_event_id(
+    prepared: _PreparedModelRequest,
+    kind: str,
+) -> str:
+    return _telemetry_event_id(
+        prepared.task_id,
+        kind,
+        prepared.report.request_tokens,
+        *(str(message.id) for message in prepared.request.messages),
+    )
+
+
+def _telemetry_event_id(task_id: str, kind: str, *parts: object) -> str:
+    material = json.dumps(
+        [task_id, kind, *parts],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return f"context_{hashlib.sha256(material.encode('utf-8')).hexdigest()[:32]}"
 
 
 def _model_request_task_id(request: ModelRequest) -> str:

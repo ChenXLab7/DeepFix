@@ -29,6 +29,7 @@ from deepfix.compaction.models import (
 )
 from deepfix.compaction.snapshot import snapshot_content_hash
 from deepfix.compaction.store import CompactionStore
+from deepfix.domain_repositories.history import HistoryRepository
 from deepfix.memory import WorkingMemoryStore
 from deepfix.persistence import TaskRepository
 
@@ -40,6 +41,7 @@ class LegacyContextStores:
     tasks: TaskRepository
     memory: WorkingMemoryStore
     compaction: CompactionStore
+    history: HistoryRepository | None = None
 
 
 class LegacyContextMigrationState(DeepFixCompactionState):
@@ -250,8 +252,10 @@ def migrate_legacy_context_state(
     )
     stores.compaction.activate_from_event(task_id, event)
     stores.compaction.record_migration(task_id, _MIGRATION_VERSION, event)
-    stores.memory.record_compaction_event(
+    history = stores.history or HistoryRepository(stores.memory.database_path)
+    history.record_compaction_outcome(
         task_id,
+        event_id=event.event_id,
         snapshot_version=prepared.version,
         artifact_path=artifact.path,
         emergency=False,
