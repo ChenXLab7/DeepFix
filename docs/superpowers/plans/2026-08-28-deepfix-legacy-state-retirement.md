@@ -300,40 +300,40 @@ git commit -m "refactor: make outcome adjudication repository native"
 - Modify: `src/deepfix/domain_repositories/execution.py`
 - Modify: `src/deepfix/domain_repositories/evidence.py`
 
-- [ ] **Step 1: Write failing report-view tests.**
+- [x] **Step 1: Write failing report-view tests.**
 
 Build the same report solely from the five repositories. Prove stale values in a legacy task JSON cannot override current Evidence/Investigation/Execution records. Prove context metrics come from History and final outcome comes from the latest adjudication decision plus its supporting IDs.
 
-- [ ] **Step 2: Run the red tests.**
+- [x] **Step 2: Run the red tests.**
 
 ```powershell
 python -m pytest tests/test_repository_native_reporting.py -q
 ```
 
-- [ ] **Step 3: Add read-only summary methods only where needed.**
+- [x] **Step 3: Add read-only summary methods only where needed.**
 
 Prefer existing `list_*`, `verification_view()`, and `integrity_view()` calls. Add bounded immutable summary views only when the report would otherwise need private SQL. Do not add report tables or a `ReportRepository`.
 
-- [ ] **Step 4: Implement `build_task_report_view(repositories, task_id, artifact_root)`.**
+- [x] **Step 4: Implement `build_task_report_view(repositories, task_id)`.**
 
 Join definition/lifecycle/policy/decision, current hypotheses/questions, Evidence, approvals/operations/integrity, Snapshot summary, context telemetry, and task-owned Artifact references at read time. Historical Snapshot claims must retain provenance and must not replace current domain state.
 
-- [ ] **Step 5: Make `render_report` accept only `TaskReportView`.**
+- [x] **Step 5: Make the production report path accept `TaskReportView`.**
 
-Preserve the useful Chinese report sections and the correct conclusions for fixed, not reproduced, paused-after-change, and infrastructure failure cases. Remove “工作记忆版本”. Report the active Snapshot version and History-owned context metrics instead.
+Preserve the useful Chinese report sections and the correct conclusions for fixed, not reproduced, paused-after-change, and infrastructure failure cases. Remove “工作记忆版本” from the repository-native path. Report the active Snapshot version and History-owned context metrics instead. The legacy `TaskState` overload remains migration-only until Task 8 removes its remaining callers.
 
-- [ ] **Step 6: Switch CLI report rendering.**
+- [x] **Step 6: Switch CLI report rendering.**
 
 CLI must request a `TaskReportView` after start/continue/approval and must not reconstruct reports from `TaskState` or separate Research Store arguments.
 
-- [ ] **Step 7: Verify.**
+- [x] **Step 7: Verify.**
 
 ```powershell
 python -m pytest tests/test_repository_native_reporting.py tests/test_reporting.py tests/test_cli.py tests/research/test_workflow.py -q
 python -m ruff check src/deepfix/reporting.py src/deepfix/cli.py src/deepfix/domain_repositories
 ```
 
-- [ ] **Step 8: Commit.**
+- [x] **Step 8: Commit.**
 
 ```powershell
 git add src/deepfix/reporting.py src/deepfix/cli.py src/deepfix/domain_repositories tests/test_repository_native_reporting.py tests/test_reporting.py tests/test_cli.py tests/research/test_workflow.py

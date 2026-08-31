@@ -24,7 +24,7 @@ from deepfix.memory import WorkingMemoryStore
 from deepfix.models import TaskState, TaskStatus
 from deepfix.operations import OperationJournalStore, OperationReconciler
 from deepfix.persistence import TaskRepository
-from deepfix.reporting import render_report
+from deepfix.reporting import build_task_report_view, render_report
 from deepfix.research.dependency import DependencyInspector
 from deepfix.research.fetcher import SafeEvidenceFetcher
 from deepfix.research.providers import (
@@ -116,12 +116,16 @@ def run_interaction(
     if task.status is TaskStatus.CLARIFYING:
         output_fn(f"需要补充信息: {task.pending_question or '请提供更多信息'}")
     else:
-        external_evidence = (
-            research_evidence_store.list_evidence(task.task_id)
-            if research_evidence_store is not None
-            else []
-        )
-        output_fn(render_report(task, external_evidence))
+        repositories = getattr(service, "repositories", None)
+        if isinstance(repositories, DomainRepositories):
+            output_fn(render_report(build_task_report_view(repositories, task.task_id)))
+        else:
+            external_evidence = (
+                research_evidence_store.list_evidence(task.task_id)
+                if research_evidence_store is not None
+                else []
+            )
+            output_fn(render_report(task, external_evidence))
     return task
 
 
