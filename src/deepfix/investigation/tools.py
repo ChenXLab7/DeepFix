@@ -11,7 +11,6 @@ from deepfix.compaction.identity import stable_generated_message_id
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.models import (
     CheckedLocation,
-    ContinueInvestigationInput,
     ProposedChange,
     RecordHypothesisInput,
 )
@@ -19,10 +18,6 @@ from deepfix.investigation.models import (
 _RECORD_DESCRIPTION = (
     "记录或迁移当前调查假设。supported 假设必须引用系统证据、已检查位置、"
     "拟修改目标和预期效果；任务 ID 由运行时自动提供。"
-)
-_CONTINUE_DESCRIPTION = (
-    "停滞门禁触发后，为一个与现有假设绑定的明确调查动作申请一次性许可。"
-    "工具、目标和任务 ID 都会被系统校验。"
 )
 
 
@@ -82,7 +77,7 @@ def build_record_hypothesis_tool(
                 "record_hypothesis",
             )
         next_action = (
-            "；需要收集新证据时，调用 continue_investigation 并引用该 hypothesis_id"
+            "；需要收集新证据时，更新 Todo 并引用该 hypothesis_id"
             if record.state == "candidate"
             else ""
         )
@@ -105,77 +100,6 @@ def build_record_hypothesis_tool(
         func=record_hypothesis,
         name="record_hypothesis",
         description=_RECORD_DESCRIPTION,
-    )
-
-
-def build_continue_investigation_tool(
-    coordinator: InvestigationCoordinator,
-) -> BaseTool:
-    def continue_investigation(
-        hypothesis_ids: list[str],
-        unresolved_question: str,
-        expected_evidence: str,
-        tool_name: str,
-        target: str,
-        reason: str,
-        runtime: ToolRuntime,
-    ) -> ToolMessage:
-        task_id = _task_id(runtime)
-        call_id = str(runtime.tool_call_id or "").strip()
-        if not task_id:
-            return _error_message(
-                "unknown",
-                call_id or "continue-investigation",
-                "continue_validation_error",
-                "申请调查许可失败：运行配置缺少 thread_id",
-                "continue_investigation",
-            )
-        if not call_id:
-            return _error_message(
-                task_id,
-                "missing-call-id",
-                "continue_validation_error",
-                "申请调查许可失败：缺少 tool_call_id",
-                "continue_investigation",
-            )
-        try:
-            permit = coordinator.grant_investigation_permit(
-                task_id,
-                ContinueInvestigationInput(
-                    hypothesis_ids=hypothesis_ids,
-                    unresolved_question=unresolved_question,
-                    expected_evidence=expected_evidence,
-                    tool_name=tool_name,
-                    target=target,
-                    reason=reason,
-                ),
-            )
-        except (ValidationError, ValueError) as exc:
-            return _error_message(
-                task_id,
-                call_id,
-                "continue_validation_error",
-                f"申请调查许可失败：{_safe_validation_error(exc)}",
-                "continue_investigation",
-            )
-        return _success_message(
-            task_id,
-            call_id,
-            "continue_permit_granted",
-            "一次性调查许可已发放",
-            "continue_investigation",
-            {
-                "permit_id": permit.permit_id,
-                "tool_name": permit.tool_name,
-                "target_hash": permit.target_hash,
-                "granted_in_generation": permit.granted_in_generation,
-            },
-        )
-
-    return StructuredTool.from_function(
-        func=continue_investigation,
-        name="continue_investigation",
-        description=_CONTINUE_DESCRIPTION,
     )
 
 

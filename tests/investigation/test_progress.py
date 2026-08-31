@@ -11,11 +11,10 @@ def observation(event_type: str, **updates) -> ToolObservation:
     return base.model_copy(update=updates)
 
 
-def test_new_file_and_phase_change_are_not_strong_progress():
+def test_new_file_is_not_strong_progress():
     evaluator = ProgressEvaluator()
 
     assert evaluator.evaluate(observation("file_checked", path="src/new.py")) is None
-    assert evaluator.evaluate(observation("phase_changed")) is None
 
 
 def test_content_fingerprint_change_is_not_strong_progress():

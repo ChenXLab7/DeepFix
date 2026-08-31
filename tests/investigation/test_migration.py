@@ -12,7 +12,6 @@ from deepfix.investigation.migration import (
     InvestigationMigrationMiddleware,
     InvestigationMigrator,
 )
-from deepfix.investigation.models import AgentPhase
 from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
 from deepfix.models import TaskState, TaskStatus
@@ -107,34 +106,35 @@ def _edit_pair() -> list[AnyMessage]:
 
 
 @pytest.mark.parametrize(
-    ("messages", "task_status", "expected"),
+    ("messages", "task_status", "expected_observation_count"),
     [
-        ([], TaskStatus.INVESTIGATING, AgentPhase.INVESTIGATING),
-        (_pytest_pair(1), TaskStatus.TESTING, AgentPhase.DIAGNOSING),
+        ([], TaskStatus.INVESTIGATING, 0),
+        (_pytest_pair(1), TaskStatus.TESTING, 1),
         (
             [*_pytest_pair(1), *_edit_pair()],
             TaskStatus.EDITING,
-            AgentPhase.EDITING,
+            2,
         ),
         (
             [*_edit_pair(), *_pytest_pair(0)],
             TaskStatus.TESTING,
-            AgentPhase.REVIEWING,
+            2,
         ),
-        ([], TaskStatus.CLARIFYING, AgentPhase.CLARIFYING),
+        ([], TaskStatus.CLARIFYING, 0),
     ],
 )
-def test_legacy_phase_is_reconstructed_from_durable_evidence(
+def test_legacy_messages_migrate_durable_evidence_without_phase(
     tmp_path: Path,
     messages: list[AnyMessage],
     task_status: TaskStatus,
-    expected: AgentPhase,
+    expected_observation_count: int,
 ) -> None:
     migrator = _migrator_fixture(tmp_path, task_status)
 
     state = migrator.migrate("task-a", messages)
 
-    assert state.agent_phase is expected
+    assert len(migrator.store.list_events("task-a")) == 1 + expected_observation_count
+    assert "agent_phase" not in type(state).model_fields
 
 
 def test_working_memory_phase_and_unproven_hypothesis_do_not_unlock_editing(
@@ -149,7 +149,6 @@ def test_working_memory_phase_and_unproven_hypothesis_do_not_unlock_editing(
 
     state = migrator.migrate("task-a", [])
 
-    assert state.agent_phase is AgentPhase.INVESTIGATING
     assert state.supported_hypothesis_ids == []
     assert [(item.statement, item.state) for item in state.hypotheses] == [
         ("maybe cache", "candidate")
@@ -178,7 +177,7 @@ def test_unpaired_execution_and_approval_do_not_count_as_execution(
 
     state = migrator.migrate("task-a", messages)
 
-    assert state.agent_phase is AgentPhase.EDITING
+    assert state.test_evidence_ids == []
 
 
 def test_migration_replay_is_idempotent(tmp_path: Path) -> None:
@@ -209,4 +208,4 @@ def test_middleware_migrates_using_runtime_task_id(tmp_path: Path) -> None:
     update = middleware.before_agent({"messages": _pytest_pair(1)}, runtime)
 
     assert update is None
-    assert migrator.store.load("task-a").agent_phase is AgentPhase.DIAGNOSING
+    assert len(migrator.store.list_events("task-a")) == 2

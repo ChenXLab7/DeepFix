@@ -136,10 +136,9 @@ class CaseBlackboardBuilder:
             [*current_evidence, *historical_evidence],
             "evidence_id",
         )
-        memory = context.working_memory
         confirmed_claims = _unique_by_id(
             [
-                *(memory.snapshot.facts if memory else []),
+                *context.confirmed_facts,
                 *(snapshot.confirmed_facts if snapshot else []),
             ],
             "claim_id",
@@ -180,7 +179,7 @@ class CaseBlackboardBuilder:
             "evidence_id",
         )
         unresolved_questions = [
-            *(memory.snapshot.unresolved_questions if memory else []),
+            *context.unresolved_questions,
             *(snapshot.unresolved_questions if snapshot else []),
         ]
         evidence_gaps = _unique_text(unresolved_questions)
@@ -191,7 +190,7 @@ class CaseBlackboardBuilder:
             "task_id": task_id,
             "task_anchor": anchor,
             "reproduction_state": _reproduction_state(deterministic_evidence),
-            "working_memory_version": memory.version if memory else None,
+            "working_memory_version": None,
             "confirmed_claims": confirmed_claims,
             "hypotheses": hypotheses,
             "evidence_gaps": evidence_gaps,
@@ -211,21 +210,11 @@ class CaseBlackboardBuilder:
                 if self._budget_loader
                 else LoopBudgetView()
             ),
-            "stagnation_level": (
-                context.investigation_state.stagnation_level
-                if context.investigation_state is not None
-                else 0
-            ),
-            "reevaluation_required": (
-                context.investigation_state.reevaluation_required
-                if context.investigation_state is not None
-                else False
-            ),
-            "investigation_state_version": (
-                context.investigation_state.version
-                if context.investigation_state is not None
-                else 0
-            ),
+            # Legacy fields remain in the serialized view until the migration
+            # boundary is removed. They no longer control navigation.
+            "stagnation_level": 0,
+            "reevaluation_required": False,
+            "investigation_state_version": 0,
         }
         fingerprint = stable_investigation_id(
             "blackboard",
@@ -242,26 +231,7 @@ class CaseBlackboardBuilder:
 
 def _project_hypotheses(context: ProtectedContext) -> list[BlackboardHypothesis]:
     projected: list[BlackboardHypothesis] = []
-    investigation = context.investigation_state
-    if investigation is not None:
-        projected.extend(
-            BlackboardHypothesis(
-                hypothesis_id=item.hypothesis_id,
-                text=item.statement,
-                state={
-                    "candidate": "active",
-                    "rejected": "rejected",
-                    "supported": "confirmed",
-                }[item.state],
-                reason=item.reason,
-                provenance_root_ids=list(item.evidence_ids),
-            )
-            for item in investigation.hypotheses
-        )
-    memory = context.working_memory
-    records: list[HypothesisRecord] = []
-    if memory is not None:
-        records.extend(memory.snapshot.all_hypotheses())
+    records: list[HypothesisRecord] = list(context.hypotheses)
     snapshot = context.active_snapshot
     if snapshot is not None:
         records.extend(

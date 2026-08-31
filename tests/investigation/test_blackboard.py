@@ -8,8 +8,8 @@ from deepfix.compaction.models import (
     SystemTestEvidence,
     TaskAnchor,
 )
+from deepfix.domain_repositories.execution import ExecutionIntegrity
 from deepfix.investigation.blackboard import CaseBlackboardBuilder
-from deepfix.memory import ProgressSnapshot, WorkingMemoryVersion
 from deepfix.protected_context import ProtectedContext
 
 
@@ -54,7 +54,7 @@ def _snapshot(duplicate_test: SystemTestEvidence) -> CompactionSnapshot:
     )
 
 
-def _context(*, memory: WorkingMemoryVersion | None = None) -> ProtectedContext:
+def _context(*, facts: tuple[ProvenancedClaim, ...] = ()) -> ProtectedContext:
     current_test = _test_evidence(exit_code=1)
     return ProtectedContext(
         task_anchor=TaskAnchor(
@@ -65,8 +65,15 @@ def _context(*, memory: WorkingMemoryVersion | None = None) -> ProtectedContext:
             project_python="C:/Python/python.exe",
             task_status="running",
         ),
-        working_memory=memory,
         deterministic_evidence=DeterministicEvidenceBlock(tests=[current_test]),
+        confirmed_facts=facts,
+        hypotheses=(),
+        unresolved_questions=(),
+        execution_integrity=ExecutionIntegrity(
+            receipt_count=0,
+            approval_count=0,
+        ),
+        external_evidence=(),
         active_snapshot=_snapshot(_test_evidence(exit_code=0)),
     )
 
@@ -81,26 +88,15 @@ def test_blackboard_projects_same_evidence_once() -> None:
     ]
 
 
-def test_working_memory_cannot_replace_test_exit_code() -> None:
-    memory = WorkingMemoryVersion(
-        task_id="task-1",
-        version=2,
-        snapshot=ProgressSnapshot(
-            phase="investigating",
-            summary="Continue investigation",
-            facts=[
-                ProvenancedClaim(
-                    claim_id="claim-passed",
-                    text="pytest passed",
-                    sources=[
-                        ProvenanceRef(kind="working_memory", ref_id="memory-2")
-                    ],
-                )
-            ],
-        ),
-        created_at="2026-08-27T00:00:00+00:00",
+def test_semantic_claim_cannot_replace_test_exit_code() -> None:
+    fact = ProvenancedClaim(
+        claim_id="claim-passed",
+        text="pytest passed",
+        sources=[
+            ProvenanceRef(kind="system_evidence", ref_id="semantic-evidence-2")
+        ],
     )
-    builder = CaseBlackboardBuilder(lambda _task_id: _context(memory=memory))
+    builder = CaseBlackboardBuilder(lambda _task_id: _context(facts=(fact,)))
 
     view = builder.build("task-1")
 
@@ -114,8 +110,12 @@ def test_blackboard_rejects_context_from_another_task() -> None:
     builder = CaseBlackboardBuilder(
         lambda _task_id: ProtectedContext(
             task_anchor=wrong_anchor,
-            working_memory=context.working_memory,
             deterministic_evidence=context.deterministic_evidence,
+            confirmed_facts=context.confirmed_facts,
+            hypotheses=context.hypotheses,
+            unresolved_questions=context.unresolved_questions,
+            execution_integrity=context.execution_integrity,
+            external_evidence=context.external_evidence,
             active_snapshot=context.active_snapshot,
         )
     )

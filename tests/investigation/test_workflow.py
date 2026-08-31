@@ -16,8 +16,6 @@ from deepfix.investigation.errors import (
 )
 from deepfix.investigation.middleware import InvestigationMiddleware
 from deepfix.investigation.models import (
-    AgentPhase,
-    ContinueInvestigationInput,
     InvestigationCapability,
     InvestigationRecoveryMetadata,
     RecordHypothesisInput,
@@ -25,7 +23,6 @@ from deepfix.investigation.models import (
 from deepfix.investigation.receipts import ToolExecutionReceiptStore
 from investigation.helpers import (
     coordinator_fixture,
-    force_phase,
     seed_checked_location,
     seed_evidence,
     supported_input,
@@ -39,7 +36,6 @@ class ScriptStep:
     args: dict[str, object]
     result: ToolMessage | None = None
     hypothesis: RecordHypothesisInput | None = None
-    continue_input: ContinueInvestigationInput | None = None
 
 
 class OfflineRepairHarness:
@@ -78,11 +74,6 @@ class OfflineRepairHarness:
                     "task-a",
                     step.hypothesis,
                     source_id=step.call_id,
-                )
-                continue
-            if step.continue_input is not None:
-                self.investigation.grant_investigation_permit(
-                    "task-a", step.continue_input
                 )
                 continue
             request = _tool_request(step.name, step.call_id, step.args)
@@ -214,31 +205,18 @@ def _repeated_pytest_steps(hypothesis_id: str) -> list[ScriptStep]:
             _result(call_id, "same gcd failure", {"exit_code": 1}),
         )
 
-    permit = ContinueInvestigationInput(
-        hypothesis_ids=[hypothesis_id],
-        unresolved_question="does one bounded rerun reproduce the failure?",
-        expected_evidence="same deterministic pytest failure",
-        tool_name="execute",
-        target="python -m pytest -q",
-        reason="one bounded reproduction",
-    )
+    del hypothesis_id
     return [
         failed("repeat-1"),
         failed("repeat-2"),
         failed("repeat-3"),
         failed("repeat-4"),
-        ScriptStep(
-            "continue_investigation",
-            "permit-1",
-            {},
-            continue_input=permit,
-        ),
         failed("repeat-5"),
         failed("repeat-6"),
     ]
 
 
-def test_normal_bugfix_flow_reaches_reviewing_without_false_stagnation(
+def test_normal_bugfix_flow_records_domain_progress_without_phase_navigation(
     tmp_path: Path,
 ) -> None:
     harness = OfflineRepairHarness(tmp_path)
@@ -254,8 +232,13 @@ def test_normal_bugfix_flow_reaches_reviewing_without_false_stagnation(
 
     state = harness.run(_normal_flow(evidence_id))
 
-    assert state.agent_phase is AgentPhase.REVIEWING
+    assert state.supported_hypothesis_ids
+    assert len(state.test_evidence_ids) == 2
     assert state.stagnation_level == 0
+    assert not any(
+        event.event_type == "phase_changed"
+        for event in harness.investigation.store.list_events("task-a")
+    )
     assert harness.tool_names == [
         "execute",
         "read_file",
@@ -266,14 +249,13 @@ def test_normal_bugfix_flow_reaches_reviewing_without_false_stagnation(
     ]
 
 
-def test_bfs_repository_scan_is_stopped_before_context_growth(tmp_path: Path) -> None:
+def test_bfs_repository_scan_is_advisory_not_a_hard_tool_gate(tmp_path: Path) -> None:
     harness = OfflineRepairHarness(tmp_path)
 
-    with pytest.raises(InvestigationStagnationError):
-        harness.run(_exploratory_reads(20))
+    state = harness.run(_exploratory_reads(20))
 
-    assert harness.completed_read_calls <= 6
-    assert harness.investigation.state("task-a").stagnation_level == 1
+    assert harness.completed_read_calls == 20
+    assert state.stagnation_level == 1
 
 
 def test_gcd_exact_repeat_is_corrected_then_pauses_before_permit(tmp_path: Path) -> None:
@@ -305,12 +287,7 @@ def test_store_failure_after_tool_execution_does_not_rerun_tool(
     tmp_path: Path,
 ) -> None:
     coordinator = coordinator_fixture(tmp_path)
-    state = force_phase(
-        coordinator.store,
-        coordinator.store.ensure_started("task-a"),
-        AgentPhase.PLANNING,
-    )
-    assert state.agent_phase is AgentPhase.PLANNING
+    coordinator.store.ensure_started("task-a")
     original_record = coordinator.record_tool_result
     failed = False
 
@@ -323,7 +300,6 @@ def test_store_failure_after_tool_execution_does_not_rerun_tool(
                 InvestigationRecoveryMetadata(
                     task_id=task_id,
                     error_code="investigation_event_commit_failed",
-                    agent_phase=current.agent_phase,
                     state_version=current.version,
                     last_event_sequence=coordinator.store.last_sequence(task_id),
                     tool_call_id=str(tool_call["id"]),

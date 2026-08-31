@@ -1,10 +1,8 @@
 import pytest
 
-from deepfix.investigation.errors import InvestigationStagnationError
 from deepfix.investigation.experiments import StrategyDecision
 from deepfix.investigation.models import (
     InvestigationState,
-    NewInvestigationEvent,
     ToolObservation,
 )
 from deepfix.investigation.stagnation import (
@@ -14,7 +12,6 @@ from deepfix.investigation.stagnation import (
     progress_fingerprint,
     strategy_signature,
 )
-from investigation.helpers import continue_input, stagnated_coordinator
 
 
 def event(event_type: str, progress: str | None = None) -> ToolObservation:
@@ -101,9 +98,7 @@ def test_experiment_stagnation_requires_repeated_strategy_without_progress():
     )
     before = progress_fingerprint(state)
 
-    stalled = ExperimentStagnationDetector().after_experiment(
-        state, decision, before
-    )
+    stalled = ExperimentStagnationDetector().after_experiment(state, decision, before)
     progressed = ExperimentStagnationDetector().after_experiment(
         state.model_copy(update={"closed_evidence_gap_ids": ["gap-1"]}),
         decision,
@@ -175,11 +170,11 @@ def test_four_exploratory_results_trigger_reevaluation():
     assert state.stagnation_level == 1
 
 
-def test_phase_change_and_new_file_do_not_reset_stagnation():
+def test_non_progress_event_and_new_file_do_not_reset_stagnation():
     detector = StagnationDetector()
     state = state_with_no_progress_count(5)
 
-    state = detector.after_event(state, event("phase_changed"))
+    state = detector.after_event(state, event("tool_completed"))
     state = detector.after_tool(
         state,
         no_progress("read-new-file", scope="exploratory"),
@@ -219,76 +214,3 @@ def test_strong_progress_resets_generation_and_counters():
     assert updated.progress_generation == state.progress_generation + 1
     assert updated.no_progress_count == 0
     assert updated.stagnation_level == 0
-
-
-def test_permit_allows_only_bound_tool_once_and_then_pauses(tmp_path):
-    coordinator = stagnated_coordinator(tmp_path)
-
-    permit = coordinator.grant_investigation_permit("task-a", continue_input())
-
-    authorization = coordinator.authorize_tool(
-        "task-a",
-        "grep",
-        {"pattern": "flip", "path": "src/sign.py"},
-    )
-    assert authorization.allowed
-    assert authorization.permit_id == permit.permit_id
-    coordinator.record_observation("task-a", no_progress("permitted-grep"))
-    with pytest.raises(InvestigationStagnationError):
-        coordinator.authorize_tool(
-            "task-a",
-            "read_file",
-            {"file_path": "src/other.py"},
-        )
-
-
-def test_permit_does_not_authorize_a_different_target(tmp_path):
-    coordinator = stagnated_coordinator(tmp_path)
-    coordinator.grant_investigation_permit("task-a", continue_input())
-
-    with pytest.raises(InvestigationStagnationError):
-        coordinator.authorize_tool(
-            "task-a",
-            "grep",
-            {"pattern": "other", "path": "src/sign.py"},
-        )
-
-    assert coordinator.state("task-a").permit is not None
-    assert not coordinator.state("task-a").permit.consumed
-
-
-def test_candidate_can_request_one_targeted_tool_from_decision_checkpoint(tmp_path):
-    coordinator = stagnated_coordinator(tmp_path)
-    state = coordinator.state("task-a")
-    state = state.model_copy(
-        update={
-            "stagnation_level": 0,
-            "reevaluation_required": False,
-            "diagnostic_decision_required": True,
-            "permit": None,
-        }
-    )
-    coordinator.store.commit(
-        coordinator.state("task-a").version,
-        [
-            NewInvestigationEvent(
-                event_id="event-decision-checkpoint",
-                task_id="task-a",
-                event_type="reevaluation_required",
-                phase_before=state.agent_phase,
-                phase_after=state.agent_phase,
-            )
-        ],
-        state,
-    )
-
-    permit = coordinator.grant_investigation_permit("task-a", continue_input())
-
-    assert permit.consumed is False
-    authorization = coordinator.authorize_tool(
-        "task-a",
-        "grep",
-        {"pattern": "flip", "path": "src/sign.py"},
-    )
-    assert authorization.allowed is True
-    assert authorization.permit_id == permit.permit_id

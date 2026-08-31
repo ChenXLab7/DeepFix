@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from deepfix.compaction.models import SystemTestEvidence
@@ -10,12 +12,9 @@ from deepfix.investigation.experiments import (
     ExperimentResult,
     StrategyDecision,
 )
-from deepfix.investigation.models import (
-    AgentPhase,
-    InvestigationHypothesis,
-    NewInvestigationEvent,
-)
+from deepfix.investigation.models import InvestigationHypothesis, NewInvestigationEvent
 from deepfix.investigation.store import InvestigationStateConflict, InvestigationStore
+from deepfix.persistence import open_sqlite_connection
 
 
 def test_strategy_decision_save_is_idempotent(tmp_path) -> None:
@@ -42,21 +41,18 @@ def new_event(
     task_id: str,
     event_id: str,
     event_type: str,
-    phase: AgentPhase,
 ) -> NewInvestigationEvent:
     return NewInvestigationEvent(
         event_id=event_id,
         task_id=task_id,
         event_type=event_type,
-        phase_before=phase,
-        phase_after=phase,
     )
 
 
 def test_store_commits_event_and_state_atomically(tmp_path):
     store = InvestigationStore(tmp_path / "deepfix.sqlite3")
     state = store.ensure_started("task-a")
-    event = new_event("task-a", "event-1", "tool_completed", state.agent_phase)
+    event = new_event("task-a", "event-1", "tool_completed")
     updated = state.model_copy(update={"no_progress_count": 1})
 
     committed = store.commit(state.version, [event], updated)
@@ -70,7 +66,7 @@ def test_store_replay_is_idempotent_and_task_isolated(tmp_path):
     store = InvestigationStore(tmp_path / "deepfix.sqlite3")
     a = store.ensure_started("task-a")
     b = store.ensure_started("task-b")
-    event = new_event("task-a", "event-a", "file_checked", a.agent_phase)
+    event = new_event("task-a", "event-a", "file_checked")
 
     committed = store.commit(a.version, [event], a)
     replayed = store.commit(a.version, [event], a)
@@ -86,14 +82,14 @@ def test_store_rejects_stale_non_replay_commit(tmp_path):
     state = store.ensure_started("task-a")
     store.commit(
         state.version,
-        [new_event("task-a", "event-1", "file_checked", state.agent_phase)],
+        [new_event("task-a", "event-1", "file_checked")],
         state,
     )
 
     with pytest.raises(InvestigationStateConflict):
         store.commit(
             state.version,
-            [new_event("task-a", "event-2", "file_checked", state.agent_phase)],
+            [new_event("task-a", "event-2", "file_checked")],
             state,
         )
 
@@ -101,9 +97,9 @@ def test_store_rejects_stale_non_replay_commit(tmp_path):
 def test_store_rejects_same_event_id_with_different_payload(tmp_path):
     store = InvestigationStore(tmp_path / "deepfix.sqlite3")
     state = store.ensure_started("task-a")
-    original = new_event("task-a", "event-1", "file_checked", state.agent_phase)
+    original = new_event("task-a", "event-1", "file_checked")
     store.commit(state.version, [original], state)
-    conflicting = new_event("task-a", "event-1", "file_changed", state.agent_phase)
+    conflicting = new_event("task-a", "event-1", "file_changed")
 
     with pytest.raises(InvestigationStateConflict, match="事件内容冲突"):
         store.commit(state.version, [conflicting], state)
@@ -112,7 +108,7 @@ def test_store_rejects_same_event_id_with_different_payload(tmp_path):
 def test_store_rejects_events_from_another_task(tmp_path):
     store = InvestigationStore(tmp_path / "deepfix.sqlite3")
     state = store.ensure_started("task-a")
-    foreign = new_event("task-b", "event-1", "file_checked", state.agent_phase)
+    foreign = new_event("task-b", "event-1", "file_checked")
 
     with pytest.raises(InvestigationStateConflict, match="任务不一致"):
         store.commit(state.version, [foreign], state)
@@ -123,6 +119,54 @@ def test_last_sequence_is_zero_for_unknown_task(tmp_path):
 
     assert store.load("missing") is None
     assert store.last_sequence("missing") == 0
+
+
+def test_store_strips_retired_phase_and_permit_fields_from_legacy_rows(tmp_path):
+    database = tmp_path / "deepfix.sqlite3"
+    store = InvestigationStore(database)
+    state = store.ensure_started("task-a")
+    payload = state.model_dump(mode="json")
+    payload.update(
+        {
+            "agent_phase": "editing",
+            "paused_agent_phase": "investigating",
+            "permit": {
+                "permit_id": "permit-1",
+                "tool_name": "grep",
+                "target_hash": "target-1",
+                "granted_in_generation": 0,
+                "consumed": False,
+            },
+            "post_permit_review_pending": True,
+        }
+    )
+    with open_sqlite_connection(database) as connection:
+        connection.execute(
+            "UPDATE investigation_state SET payload = ? WHERE task_id = ?",
+            (json.dumps(payload), "task-a"),
+        )
+        connection.execute(
+            "UPDATE investigation_events SET payload = ? WHERE task_id = ?",
+            (
+                json.dumps(
+                    {
+                        **NewInvestigationEvent.task_started("task-a").model_dump(
+                            mode="json"
+                        ),
+                        "phase_before": "investigating",
+                        "phase_after": "investigating",
+                    }
+                ),
+                "task-a",
+            ),
+        )
+        connection.commit()
+
+    restored = store.load("task-a")
+
+    assert restored is not None
+    assert "agent_phase" not in type(restored).model_fields
+    assert len(store.list_events("task-a")) == 1
 
 
 def test_store_projects_hypotheses_to_domain_repository_atomically(tmp_path):
@@ -140,7 +184,6 @@ def test_store_projects_hypotheses_to_domain_repository_atomically(tmp_path):
         "task-a",
         "event-h-1",
         "hypothesis_recorded",
-        state.agent_phase,
     )
 
     committed = store.commit(
@@ -171,7 +214,6 @@ def test_store_load_overlays_repository_hypothesis_over_stale_legacy_payload(
         "task-a",
         "event-h-1",
         "hypothesis_recorded",
-        state.agent_phase,
     )
     state = store.commit(
         state.version,
@@ -222,7 +264,7 @@ def test_experiment_replay_returns_repository_overlay(tmp_path) -> None:
     )
     state = store.commit(
         state.version,
-        [new_event("task-a", "event-h-1", "hypothesis_recorded", state.agent_phase)],
+        [new_event("task-a", "event-h-1", "hypothesis_recorded")],
         state.model_copy(update={"hypotheses": [candidate]}),
     )
     result = ExperimentResult(

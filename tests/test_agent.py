@@ -86,7 +86,6 @@ def test_agent_exposes_repair_tools_without_subagent_task_tool(agent):
         "save_progress",
         "compact_conversation",
         "record_hypothesis",
-        "continue_investigation",
         "search_diagnostic_artifacts",
         "read_diagnostic_artifact",
         "write_todos",
@@ -222,7 +221,9 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert todo_list.system_prompt == EXPECTED_TODO_SYSTEM_PROMPT
     assert isinstance(todo_navigation, TodoNavigationMiddleware)
     assert todo_navigation.reminder_rounds == 3
-    assert todo_navigation.feedback_source._verification_store is verification_policy_store
+    assert type(todo_navigation.feedback_source).__name__ == (
+        "RepositoryNavigationFeedbackSource"
+    )
     assert type(migration).__name__ == "LegacyContextMigrationMiddleware"
     assert isinstance(prompt, PromptPolicyMiddleware)
     assert isinstance(compaction, DeepFixCompactionMiddleware)

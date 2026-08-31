@@ -7,7 +7,6 @@ from langchain_core.messages import ToolMessage
 
 from deepfix.investigation.errors import InvestigationStateError
 from deepfix.investigation.models import (
-    AgentPhase,
     InvestigationCapability,
     RecordHypothesisInput,
     ToolObservation,
@@ -34,7 +33,7 @@ def test_supported_hypothesis_rejects_cross_task_evidence(tmp_path):
         )
 
 
-def test_supported_hypothesis_unlocks_planning_with_stable_id(tmp_path):
+def test_supported_hypothesis_records_stable_id_without_phase_navigation(tmp_path):
     coordinator = coordinator_fixture(tmp_path)
     seed_evidence(coordinator.compaction_store, "task-a", "evidence-a")
     seed_checked_location(coordinator.store, "task-a", "src/sign.py", 1, 20)
@@ -60,7 +59,11 @@ def test_supported_hypothesis_unlocks_planning_with_stable_id(tmp_path):
     )
 
     assert first.hypothesis_id == replay.hypothesis_id
-    assert coordinator.state("task-a").agent_phase is AgentPhase.PLANNING
+    assert first.hypothesis_id in coordinator.state("task-a").supported_hypothesis_ids
+    assert all(
+        event.event_type != "phase_changed"
+        for event in coordinator.store.list_events("task-a")
+    )
     assert coordinator.state("task-a").diagnostic_decision_required is False
 
 
@@ -133,7 +136,7 @@ def test_candidate_hypothesis_does_not_unlock_planning(tmp_path):
 
     coordinator.record_hypothesis("task-a", command, source_id="tool-hyp-1")
 
-    assert coordinator.state("task-a").agent_phase is AgentPhase.INVESTIGATING
+    assert coordinator.state("task-a").task_id == "task-a"
     assert coordinator.state("task-a").diagnostic_decision_required is True
 
 
@@ -539,9 +542,8 @@ def test_originating_progress_increments_generation_but_phase_event_does_not(tmp
 
     assert after.progress_generation == before.progress_generation + 1
     events = coordinator.store.list_events("task-a")
-    assert events[-2].progress_kind == "test_evidence"
-    assert events[-1].event_type == "phase_changed"
-    assert events[-1].progress_kind is None
+    assert events[-1].progress_kind == "test_evidence"
+    assert all(event.event_type != "phase_changed" for event in events)
 
 
 def artifact_search_result(

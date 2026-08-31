@@ -9,16 +9,6 @@ from pydantic import Field, JsonValue, model_validator
 from deepfix.compaction.models import ProvenanceRef, StrictModel
 
 
-class AgentPhase(StrEnum):
-    CLARIFYING = "clarifying"
-    INVESTIGATING = "investigating"
-    DIAGNOSING = "diagnosing"
-    PLANNING = "planning"
-    EDITING = "editing"
-    TESTING = "testing"
-    REVIEWING = "reviewing"
-
-
 class ProgressKind(StrEnum):
     TEST_EVIDENCE = "test_evidence"
     DECISION_EVIDENCE = "decision_evidence"
@@ -65,9 +55,7 @@ class InvestigationEventType(StrEnum):
     VERIFICATION_EXECUTION_OBSERVED = "verification_execution_observed"
     POST_EDIT_TEST_OBSERVED = "post_edit_test_observed"
     INVESTIGATION_INTENT_RECORDED = "investigation_intent_recorded"
-    PHASE_CHANGED = "phase_changed"
     REEVALUATION_REQUIRED = "reevaluation_required"
-    INVESTIGATION_PERMIT_GRANTED = "investigation_permit_granted"
     INVESTIGATION_STAGNATED = "investigation_stagnated"
 
 
@@ -162,14 +150,6 @@ class ExperimentClaimRecord(StrictModel):
     provenance_root_ids: list[str] = Field(default_factory=list)
 
 
-class InvestigationPermit(StrictModel):
-    permit_id: str = Field(min_length=1)
-    tool_name: str = Field(min_length=1)
-    target_hash: str = Field(min_length=1)
-    granted_in_generation: int = Field(ge=0)
-    consumed: bool = False
-
-
 class RecordHypothesisInput(StrictModel):
     hypothesis_id: str | None = None
     statement: str = Field(min_length=1)
@@ -194,15 +174,6 @@ class RecordHypothesisInput(StrictModel):
         return self
 
 
-class ContinueInvestigationInput(StrictModel):
-    hypothesis_ids: list[str]
-    unresolved_question: str = Field(min_length=1)
-    expected_evidence: str = Field(min_length=1)
-    tool_name: str = Field(min_length=1)
-    target: str = Field(min_length=1)
-    reason: str = Field(min_length=1)
-
-
 class ToolObservation(StrictModel):
     event_type: InvestigationEventType
     tool_call_id: str | None = None
@@ -224,8 +195,6 @@ class NewInvestigationEvent(StrictModel):
     event_type: InvestigationEventType
     source_message_id: str | None = None
     tool_call_id: str | None = None
-    phase_before: AgentPhase
-    phase_after: AgentPhase
     progress_kind: ProgressKind | None = None
     payload: dict[str, JsonValue] = Field(default_factory=dict)
 
@@ -237,8 +206,6 @@ class NewInvestigationEvent(StrictModel):
             event_id=stable_investigation_id("event", task_id, "task_started"),
             task_id=task_id,
             event_type=InvestigationEventType.TASK_STARTED,
-            phase_before=AgentPhase.INVESTIGATING,
-            phase_after=AgentPhase.INVESTIGATING,
         )
 
 
@@ -251,8 +218,6 @@ class InvestigationState(StrictModel):
     task_id: str = Field(min_length=1)
     version: int = 0
     migration_version: int = 0
-    agent_phase: AgentPhase = AgentPhase.INVESTIGATING
-    paused_agent_phase: AgentPhase | None = None
     checked_files: list[CheckedFile] = Field(default_factory=list, max_length=64)
     relation_edges: list[RelationEdge] = Field(default_factory=list, max_length=128)
     recent_tool_signatures: list[str] = Field(default_factory=list, max_length=32)
@@ -286,8 +251,6 @@ class InvestigationState(StrictModel):
     diagnostic_test_count_since_decision: int = 0
     repair_reevaluation_required: bool = False
     decision_correction_used: bool = False
-    permit: InvestigationPermit | None = None
-    post_permit_review_pending: bool = False
     memory_save_failure_count: int = 0
     memory_save_blocked_generation: int | None = None
     memory_saved_generation: int | None = None
@@ -307,11 +270,9 @@ class InvestigationState(StrictModel):
 class InvestigationRecoveryMetadata(StrictModel):
     task_id: str = Field(min_length=1)
     error_code: str = Field(min_length=1)
-    agent_phase: AgentPhase
     state_version: int
     last_event_sequence: int
     tool_call_id: str | None = None
-    permit_id: str | None = None
     checkpoint_available: bool
     recovery_action: str = Field(min_length=1)
     error_type: str | None = Field(default=None, max_length=120)

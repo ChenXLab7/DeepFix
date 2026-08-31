@@ -9,11 +9,10 @@ from typing import Protocol
 from pydantic import BaseModel, ConfigDict
 
 from deepfix.compaction.models import FileChangeEvidence, SystemTestEvidence
-from deepfix.compaction.store import CompactionStore
-from deepfix.investigation.store import InvestigationStore
+from deepfix.domain_repositories import DomainRepositories
+from deepfix.domain_repositories.evidence import restore_deterministic_evidence
 from deepfix.verification import (
     VerificationPolicy,
-    VerificationPolicyStore,
     evaluate_required_oracles,
 )
 
@@ -35,34 +34,41 @@ class NavigationFeedbackSource(Protocol):
         raise NotImplementedError
 
 
-class LegacyNavigationFeedbackSource:
-    """Project milestones from legacy stores without changing their state."""
+class RepositoryNavigationFeedbackSource:
+    """Project advisory milestones from bounded domain authorities."""
 
-    def __init__(
-        self,
-        investigation_store: InvestigationStore,
-        evidence_store: CompactionStore,
-        verification_store: VerificationPolicyStore,
-    ) -> None:
-        self._investigation_store = investigation_store
-        self._evidence_store = evidence_store
-        self._verification_store = verification_store
+    def __init__(self, repositories: DomainRepositories) -> None:
+        self.repositories = repositories
 
     def build(self, task_id: str) -> NavigationFeedback:
         """Read current stores once and return stable, non-persisted advice."""
 
-        state = self._investigation_store.load(task_id)
-        evidence = self._evidence_store.list_evidence(task_id)
-        policy = self._verification_store.load(task_id)
+        hypotheses = self.repositories.investigation.list_hypotheses(task_id)
+        evidence = [
+            restore_deterministic_evidence(item)
+            for item in self.repositories.evidence.list_for_task(task_id)
+            if item.payload_type
+            in {
+                "SystemTestEvidence",
+                "FileChangeEvidence",
+                "ApprovalEvidence",
+                "ResearchStatusEvidence",
+            }
+        ]
+        policy = self.repositories.tasks.load_verification_policy(task_id)
+        integrity = self.repositories.execution.integrity_view(task_id)
 
         milestones: dict[str, str] = {}
-        if state is not None:
-            for hypothesis_id in sorted(set(state.supported_hypothesis_ids)):
-                milestone_id = f"supported-hypothesis:{hypothesis_id}"
-                milestones[milestone_id] = f"Supported hypothesis: {hypothesis_id}."
-            for gap_id in sorted(set(state.closed_evidence_gap_ids)):
-                milestone_id = f"closed-evidence-gap:{gap_id}"
-                milestones[milestone_id] = f"Closed evidence gap: {gap_id}."
+        for hypothesis in hypotheses:
+            if hypothesis.state == "supported":
+                milestone_id = f"supported-hypothesis:{hypothesis.hypothesis_id}"
+                milestones[milestone_id] = (
+                    f"Supported hypothesis: {hypothesis.hypothesis_id}."
+                )
+        if integrity.incomplete_operation_ids or integrity.unknown_operation_ids:
+            milestones["execution-recovery-pending"] = (
+                "Execution recovery is pending before further side effects."
+            )
 
         successful_paths = sorted(
             {

@@ -7,8 +7,6 @@ from deepfix.investigation.errors import (
 )
 from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.models import (
-    AgentPhase,
-    ContinueInvestigationInput,
     InvestigationCapability,
     InvestigationEvent,
     InvestigationEventType,
@@ -37,10 +35,6 @@ _LAZY_EXPORTS = {
         "deepfix.investigation.store",
         "InvestigationStore",
     ),
-    "build_continue_investigation_tool": (
-        "deepfix.investigation.tools",
-        "build_continue_investigation_tool",
-    ),
     "build_record_hypothesis_tool": (
         "deepfix.investigation.tools",
         "build_record_hypothesis_tool",
@@ -58,8 +52,6 @@ def __getattr__(name: str):
     return value
 
 __all__ = [
-    "AgentPhase",
-    "ContinueInvestigationInput",
     "InvestigationCapability",
     "InvestigationCoordinationError",
     "InvestigationEvent",
@@ -76,7 +68,6 @@ __all__ = [
     "ProgressKind",
     "RecordHypothesisInput",
     "ScopeKind",
-    "build_continue_investigation_tool",
     "build_record_hypothesis_tool",
     "stable_investigation_id",
 ]

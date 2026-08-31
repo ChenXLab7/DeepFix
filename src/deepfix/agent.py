@@ -54,12 +54,11 @@ from deepfix.investigation.models import InvestigationCapability
 from deepfix.investigation.receipts import ToolExecutionReceiptStore
 from deepfix.investigation.store import InvestigationStore
 from deepfix.investigation.tools import (
-    build_continue_investigation_tool,
     build_record_hypothesis_tool,
 )
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import RepairOutcome
-from deepfix.navigation.feedback import LegacyNavigationFeedbackSource
+from deepfix.navigation.feedback import RepositoryNavigationFeedbackSource
 from deepfix.navigation.middleware import TodoNavigationMiddleware
 from deepfix.navigation.prompts import (
     DEEPFIX_TODO_SYSTEM_PROMPT,
@@ -156,12 +155,7 @@ def build_agent(
         compaction_store=compaction,
         evidence_collector=evidence_collector,
     )
-    policy_store = verification_policy_store or VerificationPolicyStore(tasks=tasks)
-    navigation_feedback = LegacyNavigationFeedbackSource(
-        investigation_store,
-        compaction,
-        policy_store,
-    )
+    navigation_feedback = RepositoryNavigationFeedbackSource(repositories)
     protected_builder = ProtectedContextBuilder(repositories)
     budget_monitor = ContextBudgetMonitor()
     coordinator = CompactionCoordinator(
@@ -182,7 +176,6 @@ def build_agent(
     )
     compact_conversation = build_compact_conversation_tool(coordinator)
     record_hypothesis = build_record_hypothesis_tool(investigation)
-    continue_investigation = build_continue_investigation_tool(investigation)
     artifact_collector = ArtifactReferenceCollector(compaction, resolved_backend)
     artifact_service = DiagnosticArtifactService(
         tasks,
@@ -209,7 +202,6 @@ def build_agent(
         "save_progress",
         "compact_conversation",
         "record_hypothesis",
-        "continue_investigation",
         "search_diagnostic_artifacts",
         "read_diagnostic_artifact",
         "write_todos",
@@ -231,7 +223,6 @@ def build_agent(
         "save_progress": InvestigationCapability.MEMORY,
         "compact_conversation": InvestigationCapability.COMPACTION,
         "record_hypothesis": InvestigationCapability.META,
-        "continue_investigation": InvestigationCapability.META,
         "search_diagnostic_artifacts": InvestigationCapability.READ,
         "read_diagnostic_artifact": InvestigationCapability.READ,
         "write_todos": InvestigationCapability.META,
@@ -247,9 +238,7 @@ def build_agent(
         "delete": True,
         "execute": True,
     }
-    prompt_policy_middleware = (
-        [] if _experiment_mode else [PromptPolicyMiddleware(investigation_store)]
-    )
+    prompt_policy_middleware = [] if _experiment_mode else [PromptPolicyMiddleware()]
     return create_deep_agent(
         model=main_model,
         system_prompt=(
@@ -259,7 +248,6 @@ def build_agent(
             save_progress,
             compact_conversation,
             record_hypothesis,
-            continue_investigation,
             search_diagnostic_artifacts,
             read_diagnostic_artifact,
             *(item.tool for item in resolved.tools),

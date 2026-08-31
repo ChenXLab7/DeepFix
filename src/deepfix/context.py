@@ -235,7 +235,7 @@ def build_context_middleware(
                 "再在上下文足够长时调用 compact_conversation。"
             ),
         ),
-        PromptPolicyMiddleware(investigation_store),
+        PromptPolicyMiddleware(),
         ContextMemoryMiddleware(store),
         ResearchEvidenceMiddleware(evidence_store),
     ]

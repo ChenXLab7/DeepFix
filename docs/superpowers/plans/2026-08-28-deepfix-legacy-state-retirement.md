@@ -397,7 +397,7 @@ python -m pytest tests/test_repository_native_context.py tests/test_protected_co
 python -m ruff check src/deepfix/protected_context.py src/deepfix/compaction src/deepfix/agent.py src/deepfix/context.py
 ```
 
-- [ ] **Step 8: Commit.**
+- [x] **Step 8: Commit.**
 
 ```powershell
 git add src/deepfix/protected_context.py src/deepfix/compaction src/deepfix/agent.py src/deepfix/context.py tests/test_repository_native_context.py tests/test_protected_context.py tests/compaction
@@ -423,27 +423,27 @@ git commit -m "refactor: project protected context from domain authorities"
 - Modify: `tests/test_prompting.py`
 - Modify: `tests/test_agent.py`
 
-- [ ] **Step 1: Write failing repository-native navigation tests.**
+- [x] **Step 1: Write failing repository-native navigation tests.**
 
 The existing Todo Graph State schema and three-Tool-Round reminder cadence must remain unchanged. Milestones must be derived from current Investigation/Evidence/Execution/Verification repository views, not legacy facades or Phase.
 
-- [ ] **Step 2: Write failing phase-retirement tests.**
+- [x] **Step 2: Write failing phase-retirement tests.**
 
 Assert all ordinary diagnostic/edit/test tools remain visible independent of Phase; blocked writes are rejected only by approval/workspace/execution policy; Todo status does not authorize tools; and no prompt contains a Phase matrix or `continue_investigation` instruction.
 
-- [ ] **Step 3: Replace `LegacyNavigationFeedbackSource`.**
+- [x] **Step 3: Replace `LegacyNavigationFeedbackSource`.**
 
 Rename it to `RepositoryNavigationFeedbackSource` and inject `DomainRepositories`. Keep milestone feedback advisory and request-local. A milestone may prompt “check whether the current Todo is complete” but never updates Todo itself.
 
-- [ ] **Step 4: Collapse prompts to stable policy.**
+- [x] **Step 4: Collapse prompts to stable policy.**
 
 `PromptPolicyMiddleware` must not read Investigation state. Retain stable repair/tool/research/reliability rules plus DeepAgents native Todo instructions. Remove `PHASE_PROMPTS` and any dynamic phase prompt selection.
 
-- [ ] **Step 5: Remove Phase navigation and permits.**
+- [x] **Step 5: Remove Phase navigation and permits.**
 
 Delete `AgentPhase`, `PhaseResolver`, phase-before/after event fields, paused phase, phase correction, phase-based capability maps, and `continue_investigation`. Preserve hypothesis/question/evidence-gap/experiment records only where they are facts or evaluation records—not tool gates.
 
-- [ ] **Step 6: Verify.**
+- [x] **Step 6: Verify.**
 
 ```powershell
 python -m pytest tests/navigation tests/investigation/test_middleware.py tests/investigation/test_store.py tests/investigation/test_coordinator.py tests/test_prompting.py tests/test_agent.py -q
@@ -453,7 +453,7 @@ rg -n "AgentPhase|PhaseResolver|PHASE_PROMPTS|continue_investigation|phase_based
 
 Expected final `rg`: no production matches except an explicitly named migration-only legacy payload parser, if required for historical input.
 
-- [ ] **Step 7: Commit.**
+- [x] **Step 7: Commit.**
 
 ```powershell
 git add src/deepfix/navigation src/deepfix/investigation src/deepfix/prompting.py src/deepfix/prompts.py src/deepfix/agent.py tests/navigation tests/investigation tests/test_prompting.py tests/test_agent.py

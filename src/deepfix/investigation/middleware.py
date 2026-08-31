@@ -129,12 +129,6 @@ class InvestigationMiddleware(AgentMiddleware):
         if not task_id:
             return request
         state = self.coordinator.state(task_id)
-        allowed = self.coordinator.allowed_tool_names(state, self.capabilities)
-        tools = [
-            tool
-            for tool in request.tools or []
-            if str(getattr(tool, "name", "")) in allowed
-        ]
         block = render_investigation_state(
             state,
             _available_work_unit_refs(task_id, request.messages),
@@ -142,7 +136,6 @@ class InvestigationMiddleware(AgentMiddleware):
         original = request.system_message.text if request.system_message else ""
         content = f"{original}\n\n{block}" if original else block
         return request.override(
-            tools=tools,
             system_message=SystemMessage(content=content),
         )
 
@@ -257,15 +250,6 @@ class InvestigationMiddleware(AgentMiddleware):
                     authorization.correction_ref_id or "unknown",
                 ), None
             return task_id, None, _decision_correction_message(task_id, call_id), None
-        state = self.coordinator.state(task_id)
-        allowed = self.coordinator.allowed_tool_names(state, self.capabilities)
-        if name not in allowed and authorization.permit_id is None:
-            raise self._state_error(
-                task_id,
-                "tool_not_allowed_in_agent_phase",
-                call_id,
-                "return_to_a_phase_that_allows_the_tool",
-            )
         if operation is None:
             operation = self._prepare_operation(task_id, request)
         return task_id, None, None, operation
@@ -515,12 +499,7 @@ def render_investigation_state(
 ) -> str:
     lines = [
         "<deepfix_investigation_state>",
-        f"<phase>{state.agent_phase.value}</phase>",
         f"<progress_generation>{state.progress_generation}</progress_generation>",
-        f"<stagnation_level>{state.stagnation_level}</stagnation_level>",
-        f"<reevaluation_required>{str(state.reevaluation_required).lower()}</reevaluation_required>",
-        f"<no_progress_count>{state.no_progress_count}</no_progress_count>",
-        f"<exploratory_without_progress>{state.exploratory_without_progress}</exploratory_without_progress>",
         "<checked_paths>",
     ]
     lines.extend(
@@ -533,26 +512,6 @@ def render_investigation_state(
         for item in state.recent_tool_signatures[-8:]
     )
     lines.append("</recent_tool_signatures>")
-    if state.repair_reevaluation_required:
-        lines.extend(
-            (
-                "<repair_reevaluation_checkpoint>",
-                "修改后验证失败，原 supported 假设和修复计划已被测试反证。",
-                "先用 record_hypothesis 排除或修正旧假设；证据不足时记录 candidate，",
-                "再用 continue_investigation 申请一次定向调查。不要直接重复测试或继续修改。",
-                "</repair_reevaluation_checkpoint>",
-            )
-        )
-    elif state.diagnostic_decision_required:
-        lines.extend(
-            (
-                "<diagnostic_decision_checkpoint>",
-                "当前必须进行诊断决策。",
-                "证据充分时立即调用 record_hypothesis，不要继续读取相邻 traceback 片段。",
-                "证据不足时先记录 candidate 假设，再调用 continue_investigation 说明未解决问题和预期证据。",
-                "</diagnostic_decision_checkpoint>",
-            )
-        )
     if state.memory_save_blocked_generation == state.progress_generation:
         lines.extend(
             (
@@ -700,7 +659,7 @@ def _decision_correction_message(task_id: str, call_id: str) -> ToolMessage:
         content=(
             "当前处于诊断决策检查点，不能继续读取或执行。"
             "请根据现有证据调用 record_hypothesis；"
-            "若证据不足，先记录 candidate，再调用 continue_investigation 申请一次定向调查。"
+            "若证据不足，先记录 candidate，并更新 Todo 选择一次定向调查。"
         ),
         tool_call_id=call_id,
         status="error",
@@ -745,8 +704,7 @@ def _duplicate_hypothesis_message(
         ),
         content=(
             f"相同 candidate 已存在：hypothesis_id={hypothesis_id}。"
-            "不要再次创建该假设；若需要验证它，请调用 continue_investigation "
-            "并引用这个 hypothesis_id。"
+            "不要再次创建该假设；若需要验证它，请更新 Todo 并引用这个 hypothesis_id。"
         ),
         tool_call_id=call_id,
         name="record_hypothesis",

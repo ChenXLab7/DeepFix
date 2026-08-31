@@ -2,22 +2,18 @@ import pytest
 from pydantic import ValidationError
 
 from deepfix.investigation.models import (
-    AgentPhase,
     CheckedLocation,
-    ContinueInvestigationInput,
     InvestigationState,
     ProposedChange,
     RecordHypothesisInput,
 )
 
 
-def test_new_state_has_no_false_progress_or_permit():
+def test_new_state_has_no_false_progress():
     state = InvestigationState.new("task-a")
 
-    assert state.agent_phase is AgentPhase.INVESTIGATING
     assert state.progress_generation == 0
     assert state.stagnation_level == 0
-    assert state.permit is None
 
 
 def test_supported_hypothesis_requires_operational_fields():
@@ -56,18 +52,6 @@ def test_rejected_hypothesis_requires_existing_identity():
             checked_locations=[],
             target_state="rejected",
             reason="the parser preserves the input",
-        )
-
-
-def test_continue_intent_requires_a_tool_and_target():
-    with pytest.raises(ValidationError):
-        ContinueInvestigationInput(
-            hypothesis_ids=["hyp-1"],
-            unresolved_question="which branch flips sign?",
-            expected_evidence="branch condition",
-            tool_name="",
-            target="src/sign.py",
-            reason="inspect the branch",
         )
 
 

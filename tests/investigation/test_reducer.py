@@ -137,8 +137,6 @@ def test_reducer_attaches_assessment_evidence_before_supporting_hypothesis(
                 event_id="event-h-1",
                 task_id="task-1",
                 event_type="hypothesis_recorded",
-                phase_before=state.agent_phase,
-                phase_after=state.agent_phase,
             )
         ],
         state.model_copy(update={"hypotheses": [candidate]}),

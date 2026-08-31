@@ -23,8 +23,6 @@ from deepfix.investigation.errors import (
 from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.middleware import InvestigationMiddleware
 from deepfix.investigation.models import (
-    AgentPhase,
-    ContinueInvestigationInput,
     InvestigationCapability,
     InvestigationHypothesis,
     InvestigationRecoveryMetadata,
@@ -34,7 +32,7 @@ from deepfix.investigation.models import (
 )
 from deepfix.investigation.receipts import ToolExecutionReceiptStore
 from deepfix.operations import OperationJournalStore, OperationStatus
-from investigation.helpers import coordinator_fixture, force_phase
+from investigation.helpers import coordinator_fixture
 
 
 def named_tools(*names: str) -> list[BaseTool]:
@@ -247,6 +245,7 @@ def middleware_fixture(
     fail_next_event_commit: bool = False,
     with_journal: bool = False,
 ) -> InvestigationMiddleware:
+    del phase  # compatibility input proving phase labels no longer affect tools
     coordinator = coordinator_fixture(tmp_path)
     if with_journal:
         task = coordinator.tasks.get("task-a")
@@ -255,7 +254,6 @@ def middleware_fixture(
         task.workspace_baseline_id = "baseline-task-a"
         coordinator.tasks.save(task)
     state = coordinator.store.ensure_started("task-a")
-    state = force_phase(coordinator.store, state, AgentPhase(phase))
     candidate = InvestigationHypothesis(
         hypothesis_id="hyp-1",
         statement="sign flips in helper",
@@ -273,8 +271,6 @@ def middleware_fixture(
                 ),
                 task_id="task-a",
                 event_type="hypothesis_recorded",
-                phase_before=state.agent_phase,
-                phase_after=state.agent_phase,
             )
         ],
         state.model_copy(
@@ -298,7 +294,6 @@ def middleware_fixture(
                     InvestigationRecoveryMetadata(
                         task_id=task_id,
                         error_code="investigation_event_commit_failed",
-                        agent_phase=current.agent_phase,
                         state_version=current.version,
                         last_event_sequence=coordinator.store.last_sequence(task_id),
                         tool_call_id=str(tool_call["id"]),
@@ -359,7 +354,7 @@ def test_experiment_capability_boundary_blocks_tool_before_execution(tmp_path):
     assert "not allowed by this experiment" in result.content
 
 
-def test_diagnosing_request_hides_modify_tools_and_renders_bounded_state(tmp_path):
+def test_phase_does_not_hide_tools_and_renders_bounded_state(tmp_path):
     middleware = middleware_fixture(tmp_path, phase="diagnosing")
     request = model_request(
         tools=named_tools("read_file", "edit_file", "record_hypothesis")
@@ -369,15 +364,17 @@ def test_diagnosing_request_hides_modify_tools_and_renders_bounded_state(tmp_pat
 
     assert [tool.name for tool in captured.tools] == [
         "read_file",
+        "edit_file",
         "record_hypothesis",
     ]
+    assert "<phase>" not in captured.system_message.text
     assert "<deepfix_investigation_state>" in captured.system_message.text
     assert '<hypothesis id="hyp-1" state="candidate">' in (
         captured.system_message.text
     )
 
 
-def test_level_one_exposes_only_three_meta_tools(tmp_path):
+def test_stagnation_level_does_not_hide_tools(tmp_path):
     middleware = middleware_fixture(tmp_path, stagnation_level=1)
 
     captured = capture_model_request(
@@ -386,9 +383,7 @@ def test_level_one_exposes_only_three_meta_tools(tmp_path):
     )
 
     assert {tool.name for tool in captured.tools} == {
-        "record_hypothesis",
-        "continue_investigation",
-        "save_progress",
+        tool.name for tool in all_test_tools()
     }
 
 
@@ -412,7 +407,7 @@ def test_repeated_save_progress_failures_hide_memory_tool_for_generation(tmp_pat
         model_request(tools=all_test_tools()),
     )
 
-    assert "save_progress" not in {tool.name for tool in captured.tools}
+    assert "save_progress" in {tool.name for tool in captured.tools}
     assert "本进展代次内不再调用 save_progress" in captured.system_message.text
 
 
@@ -433,7 +428,7 @@ def test_successful_save_progress_is_not_repeated_in_same_generation(tmp_path):
         model_request(tools=all_test_tools()),
     )
 
-    assert "save_progress" not in {tool.name for tool in captured.tools}
+    assert "save_progress" in {tool.name for tool in captured.tools}
     assert "Working Memory 已保存" in captured.system_message.text
     assert "直接返回 RepairOutcome" in captured.system_message.text
 
@@ -452,7 +447,7 @@ def test_normal_investigation_exposes_diagnostic_artifact_tools(tmp_path):
     } <= {tool.name for tool in captured.tools}
 
 
-def test_diagnostic_read_requires_hypothesis_decision_and_renders_instruction(
+def test_diagnostic_checkpoint_is_advisory_and_does_not_hide_tools(
     tmp_path,
 ):
     middleware = middleware_fixture(tmp_path, phase="diagnosing")
@@ -476,16 +471,12 @@ def test_diagnostic_read_requires_hypothesis_decision_and_renders_instruction(
     )
 
     assert {tool.name for tool in captured.tools} == {
-        "record_hypothesis",
-        "continue_investigation",
-        "save_progress",
+        tool.name for tool in all_test_tools()
     }
-    assert "<diagnostic_decision_checkpoint>" in captured.system_message.text
-    assert "record_hypothesis" in captured.system_message.text
-    assert "不要继续读取相邻" in captured.system_message.text
+    assert "<diagnostic_decision_checkpoint>" not in captured.system_message.text
 
 
-def test_decision_checkpoint_returns_one_correction_then_pauses(tmp_path):
+def test_decision_checkpoint_does_not_block_tool_execution(tmp_path):
     middleware = middleware_fixture(tmp_path, phase="diagnosing")
     middleware.coordinator.record_observation(
         "task-a",
@@ -505,20 +496,9 @@ def test_decision_checkpoint_returns_one_correction_then_pauses(tmp_path):
 
     correction = middleware.wrap_tool_call(read_request(), handler)
 
-    assert called is False
+    assert called is True
     assert isinstance(correction, ToolMessage)
-    assert correction.status == "error"
-    assert correction.artifact["result_type"] == "diagnostic_decision_correction"
-    assert "record_hypothesis" in correction.content
-    assert middleware.coordinator.state("task-a").decision_correction_used is True
-
-    with pytest.raises(InvestigationStagnationError) as caught:
-        middleware.wrap_tool_call(
-            tool_request("read_file", "read-2", {"file_path": "/src/other.py"}),
-            handler,
-        )
-
-    assert caught.value.recovery.error_code == "diagnostic_decision_ignored"
+    assert correction.status == "success"
 
 
 def test_direct_read_of_offloaded_result_routes_to_diagnostic_tools(tmp_path):
@@ -572,29 +552,15 @@ def test_async_direct_read_of_offloaded_result_skips_handler(tmp_path):
     assert result.status == "error"
 
 
-def test_level_one_exposes_only_the_unconsumed_permitted_artifact_tool(tmp_path):
+def test_stagnation_does_not_change_visible_tools(tmp_path):
     middleware = middleware_fixture(tmp_path, stagnation_level=1)
-    middleware.coordinator.grant_investigation_permit(
-        "task-a",
-        ContinueInvestigationInput(
-            hypothesis_ids=["hyp-1"],
-            unresolved_question="which archived failure proves the branch?",
-            expected_evidence="the original AssertionError and traceback",
-            tool_name="search_diagnostic_artifacts",
-            target="AssertionError",
-            reason="the live ToolMessage contains only an offload preview",
-        ),
-    )
 
     before = capture_model_request(
         middleware,
         model_request(tools=all_test_tools()),
     )
     assert {tool.name for tool in before.tools} == {
-        "record_hypothesis",
-        "continue_investigation",
-        "save_progress",
-        "search_diagnostic_artifacts",
+        tool.name for tool in all_test_tools()
     }
 
     request = tool_request(
@@ -616,9 +582,7 @@ def test_level_one_exposes_only_the_unconsumed_permitted_artifact_tool(tmp_path)
         model_request(tools=all_test_tools()),
     )
     assert {tool.name for tool in after.tools} == {
-        "record_hypothesis",
-        "continue_investigation",
-        "save_progress",
+        tool.name for tool in all_test_tools()
     }
 
 
@@ -631,10 +595,10 @@ def test_interrupt_command_does_not_mark_pytest_as_executed(tmp_path):
     )
 
     assert isinstance(result, Command)
-    assert middleware.coordinator.state("task-a").agent_phase is AgentPhase.EDITING
+    assert middleware.coordinator.state("task-a").task_id == "task-a"
 
 
-def test_real_pytest_tool_message_records_testing_then_failure(tmp_path):
+def test_real_pytest_tool_message_records_failure_without_phase_events(tmp_path):
     middleware = middleware_fixture(tmp_path, phase="editing")
 
     result = middleware.wrap_tool_call(
@@ -643,23 +607,16 @@ def test_real_pytest_tool_message_records_testing_then_failure(tmp_path):
     )
 
     events = middleware.coordinator.store.list_events("task-a")
-    assert [item.event_type for item in events[-4:]] == [
-        "verification_execution_observed",
-        "phase_changed",
-        "post_edit_test_observed",
-        "phase_changed",
-    ]
+    assert events[-1].event_type == "test_observed"
     assert result.artifact["exit_code"] == 1
-    assert middleware.coordinator.state("task-a").agent_phase is AgentPhase.DIAGNOSING
 
 
-def test_post_edit_pytest_failure_requires_hypothesis_reevaluation(tmp_path):
+def test_post_edit_failure_records_fact_but_does_not_gate_tools(tmp_path):
     middleware = middleware_fixture(tmp_path, phase="planning")
     middleware.wrap_tool_call(
         edit_request(call_id="edit-artifactless"),
         lambda request: artifactless_edit_result("edit-artifactless"),
     )
-    assert middleware.coordinator.state("task-a").agent_phase is AgentPhase.EDITING
 
     middleware.wrap_tool_call(
         pytest_tool_request(),
@@ -667,21 +624,18 @@ def test_post_edit_pytest_failure_requires_hypothesis_reevaluation(tmp_path):
     )
 
     state = middleware.coordinator.state("task-a")
-    assert state.agent_phase is AgentPhase.DIAGNOSING
     assert state.repair_reevaluation_required is True
     captured = capture_model_request(
         middleware,
         model_request(tools=all_test_tools()),
     )
     assert {tool.name for tool in captured.tools} == {
-        "record_hypothesis",
-        "continue_investigation",
-        "save_progress",
+        tool.name for tool in all_test_tools()
     }
-    assert "修改后验证失败" in captured.system_message.text
+    assert "修改后验证失败" not in captured.system_message.text
 
 
-def test_two_diagnostic_pytest_runs_require_hypothesis_decision(tmp_path):
+def test_two_diagnostic_pytest_runs_record_checkpoint_without_gating(tmp_path):
     middleware = middleware_fixture(tmp_path, phase="investigating")
     for call_id, command in (
         ("pytest-diagnostic-1", "python -m pytest -q"),
@@ -706,9 +660,7 @@ def test_two_diagnostic_pytest_runs_require_hypothesis_decision(tmp_path):
         model_request(tools=all_test_tools()),
     )
     assert {tool.name for tool in captured.tools} == {
-        "record_hypothesis",
-        "continue_investigation",
-        "save_progress",
+        tool.name for tool in all_test_tools()
     }
 
 
@@ -772,29 +724,15 @@ def test_windows_unix_pipeline_is_blocked_before_execution(tmp_path, monkeypatch
     assert "--tb=short" in result.content
 
 
-def test_redirected_pytest_is_corrected_then_bound_permit_executes(tmp_path, monkeypatch):
+def test_redirected_pytest_is_corrected_then_clean_command_executes(tmp_path, monkeypatch):
     middleware = middleware_fixture(tmp_path, stagnation_level=1)
     monkeypatch.setattr("deepfix.investigation.middleware._PLATFORM_NAME", "nt")
     command = "python -m pytest python_testcases/test_knapsack.py -v"
-    middleware.coordinator.grant_investigation_permit(
-        "task-a",
-        ContinueInvestigationInput(
-            hypothesis_ids=["hyp-1"],
-            unresolved_question="does the test reproduce?",
-            expected_evidence="pytest exit code",
-            tool_name="execute",
-            target=command,
-            reason="run the requested test",
-        ),
-    )
     executions = 0
-    permit_consumed_before_execution = False
 
     def handler(request):
-        nonlocal executions, permit_consumed_before_execution
+        nonlocal executions
         executions += 1
-        permit = middleware.coordinator.state("task-a").permit
-        permit_consumed_before_execution = permit is not None and permit.consumed
         return ToolMessage(
             id="pytest-result",
             content="1 passed",
@@ -816,7 +754,6 @@ def test_redirected_pytest_is_corrected_then_bound_permit_executes(tmp_path, mon
     assert isinstance(correction, ToolMessage)
     assert correction.artifact["result_type"] == "pytest_shell_correction"
     assert correction.artifact["suggested_command"] == command
-    assert middleware.coordinator.state("task-a").permit.consumed is False
 
     result = middleware.wrap_tool_call(
         tool_request("execute", "pytest-clean", {"command": command}),
@@ -825,7 +762,6 @@ def test_redirected_pytest_is_corrected_then_bound_permit_executes(tmp_path, mon
 
     assert result.artifact["exit_code"] == 0
     assert executions == 1
-    assert permit_consumed_before_execution is True
 
 
 def test_model_prompt_exposes_current_work_unit_ids_for_save_progress(tmp_path):
@@ -940,7 +876,7 @@ def test_alternating_duplicate_candidates_are_each_corrected_once_then_pause(tmp
     assert correction.status == "error"
     assert correction.artifact["result_type"] == "duplicate_hypothesis_correction"
     assert correction.artifact["hypothesis_id"] == existing.hypothesis_id
-    assert "continue_investigation" in correction.text
+    assert "Todo" in correction.text
 
     other_correction = middleware.wrap_tool_call(
         tool_request(
@@ -967,7 +903,7 @@ def test_alternating_duplicate_candidates_are_each_corrected_once_then_pause(tmp
     assert handler_called is False
 
 
-def test_level_two_blocks_before_handler_execution(tmp_path):
+def test_level_two_does_not_block_before_handler_execution(tmp_path):
     middleware = middleware_fixture(tmp_path, stagnation_level=2)
     called = False
 
@@ -976,10 +912,8 @@ def test_level_two_blocks_before_handler_execution(tmp_path):
         called = True
         return read_result()
 
-    with pytest.raises(InvestigationStagnationError):
-        middleware.wrap_tool_call(read_request(), handler)
-
-    assert called is False
+    middleware.wrap_tool_call(read_request(), handler)
+    assert called is True
 
 
 def test_committed_tool_receipt_prevents_side_effect_reexecution(tmp_path):

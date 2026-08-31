@@ -15,7 +15,6 @@ from deepfix.compaction.store import CompactionStore
 from deepfix.investigation.classification import is_pytest_verification
 from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.models import (
-    AgentPhase,
     InvestigationEventType,
     InvestigationHypothesis,
     InvestigationState,
@@ -24,7 +23,6 @@ from deepfix.investigation.models import (
 )
 from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import WorkingMemoryStore
-from deepfix.models import TaskStatus
 from deepfix.persistence import TaskRepository
 
 _FILE_OPERATIONS = {
@@ -80,7 +78,6 @@ class InvestigationMigrator:
             task.project_python,
             self.compaction_store,
         )
-        reconstructed_phase = _reconstruct_phase(observations)
         hypotheses = _working_memory_candidates(
             normalized_task_id,
             self.memory,
@@ -88,23 +85,13 @@ class InvestigationMigrator:
         )
         state = (existing or InvestigationState.new(normalized_task_id)).model_copy(
             update={
-                "agent_phase": (
-                    AgentPhase.CLARIFYING
-                    if task.status is TaskStatus.CLARIFYING
-                    else reconstructed_phase
-                ),
-                "paused_agent_phase": (
-                    reconstructed_phase
-                    if task.status is TaskStatus.CLARIFYING
-                    else None
-                ),
                 "hypotheses": hypotheses,
                 "supported_hypothesis_ids": [],
                 "test_evidence_ids": _test_evidence_ids(observations),
                 "migration_version": self.VERSION,
             }
         )
-        events = _migration_events(normalized_task_id, observations, state.agent_phase)
+        events = _migration_events(normalized_task_id, observations)
         if existing is None:
             events.insert(0, NewInvestigationEvent.task_started(normalized_task_id))
         return self.store.commit(existing.version if existing else 0, events, state)
@@ -235,25 +222,6 @@ def _observation_from_pair(
     )
 
 
-def _reconstruct_phase(observations: Sequence[_LegacyObservation]) -> AgentPhase:
-    phase = AgentPhase.INVESTIGATING
-    edit_seen = False
-    for observation in observations:
-        if observation.kind == "edit":
-            edit_seen = True
-            phase = AgentPhase.EDITING
-        elif observation.kind == "pytest":
-            if edit_seen:
-                phase = (
-                    AgentPhase.REVIEWING
-                    if observation.exit_code == 0
-                    else AgentPhase.DIAGNOSING
-                )
-            elif observation.exit_code != 0:
-                phase = AgentPhase.DIAGNOSING
-    return phase
-
-
 def _working_memory_candidates(
     task_id: str,
     memory: WorkingMemoryStore,
@@ -296,33 +264,19 @@ def _test_evidence_ids(
 def _migration_events(
     task_id: str,
     observations: Sequence[_LegacyObservation],
-    final_phase: AgentPhase,
 ) -> list[NewInvestigationEvent]:
-    phase = AgentPhase.INVESTIGATING
     edit_seen = False
     events: list[NewInvestigationEvent] = []
     for observation in observations:
-        before = phase
         if observation.kind == "edit":
             edit_seen = True
-            phase = AgentPhase.EDITING
             event_type = InvestigationEventType.FILE_CHANGED
             progress_kind = ProgressKind.FILE_CHANGE
         else:
             if edit_seen:
-                phase = (
-                    AgentPhase.REVIEWING
-                    if observation.exit_code == 0
-                    else AgentPhase.DIAGNOSING
-                )
                 event_type = InvestigationEventType.POST_EDIT_TEST_OBSERVED
                 progress_kind = ProgressKind.POST_EDIT_TEST
             else:
-                phase = (
-                    AgentPhase.DIAGNOSING
-                    if observation.exit_code != 0
-                    else phase
-                )
                 event_type = InvestigationEventType.TEST_OBSERVED
                 progress_kind = ProgressKind.TEST_EVIDENCE
         events.append(
@@ -339,8 +293,6 @@ def _migration_events(
                 event_type=event_type,
                 source_message_id=observation.source_message_id,
                 tool_call_id=observation.tool_call_id,
-                phase_before=before,
-                phase_after=phase,
                 progress_kind=progress_kind,
                 payload={
                     "evidence_id": observation.evidence_id,
@@ -350,8 +302,4 @@ def _migration_events(
                 },
             )
         )
-    if not events:
-        return []
-    if final_phase is AgentPhase.CLARIFYING:
-        events[-1] = events[-1].model_copy(update={"phase_after": final_phase})
     return events

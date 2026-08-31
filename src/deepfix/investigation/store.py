@@ -142,16 +142,17 @@ class InvestigationStore:
                 """,
                 (task_id,),
             ).fetchall()
-        return [
-            InvestigationEvent.model_validate(
-                {
-                    **cast(dict[str, Any], json.loads(row[0])),
-                    "sequence": row[1],
-                    "created_at": row[2],
-                }
+        events = []
+        for row in rows:
+            payload = _legacy_event_payload(cast(dict[str, Any], json.loads(row[0])))
+            if payload is None:
+                continue
+            events.append(
+                InvestigationEvent.model_validate(
+                    {**payload, "sequence": row[1], "created_at": row[2]}
+                )
             )
-            for row in rows
-        ]
+        return events
 
     def commit_experiment(
         self,
@@ -336,7 +337,9 @@ class InvestigationStore:
         ).fetchone()
         if row is None:
             return None
-        return InvestigationState.model_validate_json(row[0])
+        return InvestigationState.model_validate(
+            _legacy_state_payload(cast(dict[str, Any], json.loads(row[0])))
+        )
 
     @staticmethod
     def _existing_events(
@@ -364,7 +367,15 @@ class InvestigationStore:
         existing: dict[str, str],
     ) -> None:
         for event in events:
-            if existing[event.event_id] != _canonical_event(event):
+            stored = _legacy_event_payload(
+                cast(dict[str, Any], json.loads(existing[event.event_id]))
+            )
+            normalized = (
+                json.dumps(stored, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                if stored is not None
+                else ""
+            )
+            if normalized != _canonical_event(event):
                 raise InvestigationStateConflict("相同 event_id 的事件内容冲突")
 
     @staticmethod
@@ -439,3 +450,29 @@ def _canonical_event(event: NewInvestigationEvent) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _legacy_state_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Migration-only parser for retired phase/permit state fields."""
+    normalized = dict(payload)
+    for field in (
+        "agent_phase",
+        "paused_agent_phase",
+        "permit",
+        "post_permit_review_pending",
+    ):
+        normalized.pop(field, None)
+    return normalized
+
+
+def _legacy_event_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Strip retired event projections and omit phase-only historical events."""
+    if payload.get("event_type") in {
+        "phase_changed",
+        "investigation_permit_granted",
+    }:
+        return None
+    normalized = dict(payload)
+    normalized.pop("phase_before", None)
+    normalized.pop("phase_after", None)
+    return normalized

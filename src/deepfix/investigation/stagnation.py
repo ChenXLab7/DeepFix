@@ -6,7 +6,6 @@ from collections.abc import Sequence
 
 from deepfix.investigation.experiments import StrategyDecision
 from deepfix.investigation.models import (
-    InvestigationEventType,
     InvestigationState,
     ScopeKind,
     ToolObservation,
@@ -104,8 +103,6 @@ class StagnationDetector:
         state: InvestigationState,
         observation: ToolObservation,
     ) -> InvestigationState:
-        if observation.event_type is InvestigationEventType.PHASE_CHANGED:
-            return state
         if observation.progress_kind is None:
             return state
         return state.model_copy(
@@ -117,8 +114,6 @@ class StagnationDetector:
                 "seen_progress_fingerprints": state.seen_progress_fingerprints[-1:],
                 "reevaluation_required": False,
                 "stagnation_level": 0,
-                "permit": None,
-                "post_permit_review_pending": False,
                 "duplicate_hypothesis_correction_ids": [],
             }
         )
@@ -141,12 +136,7 @@ class StagnationDetector:
         repeated = bool(activity_signature) and signatures.count(activity_signature) >= 3
         cycled = matching_cycle_size(signatures) is not None
         stalled = repeated or cycled or no_progress >= 6 or exploratory >= 4
-        level = state.stagnation_level
-        if state.post_permit_review_pending:
-            level = 2
-            stalled = True
-        elif stalled:
-            level = max(level, 1)
+        level = max(state.stagnation_level, int(stalled))
         return state.model_copy(
             update={
                 "recent_tool_signatures": signatures,

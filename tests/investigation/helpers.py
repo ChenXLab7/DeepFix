@@ -9,12 +9,9 @@ from deepfix.compaction.store import CompactionStore
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.models import (
-    AgentPhase,
     CheckedFile,
     CheckedLocation,
-    ContinueInvestigationInput,
     InvestigationHypothesis,
-    InvestigationState,
     NewInvestigationEvent,
     ProposedChange,
     RecordHypothesisInput,
@@ -96,34 +93,9 @@ def seed_checked_location(
                 event_id=event_id,
                 task_id=task_id,
                 event_type="file_checked",
-                phase_before=state.agent_phase,
-                phase_after=state.agent_phase,
             )
         ],
         state.model_copy(update={"checked_files": [checked]}),
-    )
-
-
-def force_phase(
-    store: InvestigationStore,
-    state: InvestigationState,
-    phase: AgentPhase,
-) -> InvestigationState:
-    event_id = stable_investigation_id(
-        "event", state.task_id, "force-phase", phase.value
-    )
-    return store.commit(
-        state.version,
-        [
-            NewInvestigationEvent(
-                event_id=event_id,
-                task_id=state.task_id,
-                event_type="phase_changed",
-                phase_before=state.agent_phase,
-                phase_after=phase,
-            )
-        ],
-        state.model_copy(update={"agent_phase": phase}),
     )
 
 
@@ -163,8 +135,6 @@ def stagnated_coordinator(tmp_path: Path) -> InvestigationCoordinator:
                 event_id=event_id,
                 task_id="task-a",
                 event_type="reevaluation_required",
-                phase_before=state.agent_phase,
-                phase_after=state.agent_phase,
             )
         ],
         state.model_copy(
@@ -176,14 +146,3 @@ def stagnated_coordinator(tmp_path: Path) -> InvestigationCoordinator:
         ),
     )
     return coordinator
-
-
-def continue_input() -> ContinueInvestigationInput:
-    return ContinueInvestigationInput(
-        hypothesis_ids=["hyp-1"],
-        unresolved_question="which call flips sign?",
-        expected_evidence="a verified call edge",
-        tool_name="grep",
-        target="src/sign.py|flip",
-        reason="test evidence points to hyp-1",
-    )
