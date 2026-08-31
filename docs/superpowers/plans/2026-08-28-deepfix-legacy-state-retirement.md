@@ -150,8 +150,8 @@ class OutcomeAdjudicationInput(StrictModel):
 
 
 class OutcomeAdjudicator:
-    def decide(self, value: OutcomeAdjudicationInput) -> AdjudicationDecision:
-        """Return an ID-only decision without reading or writing persistence."""
+    def decide(self, value: OutcomeAdjudicationInput) -> OutcomeAssessment:
+        """Return a pure assessment; only terminal outcomes carry an ID-only decision."""
 
 
 class TaskRuntime(StrictModel):
@@ -244,7 +244,7 @@ git commit -m "refactor: move context telemetry to history authority"
 - Modify: `src/deepfix/task_domain/__init__.py`
 - Modify: `src/deepfix/task_domain/repository.py`
 
-- [ ] **Step 1: Write the decision table as failing tests.**
+- [x] **Step 1: Write the decision table as failing tests.**
 
 At minimum cover:
 
@@ -257,32 +257,32 @@ At minimum cover:
 - self-generated supplemental tests alone → not `fixed`;
 - decision contains only IDs, never copied Evidence payloads.
 
-- [ ] **Step 2: Run the red test.**
+- [x] **Step 2: Run the red test.**
 
 ```powershell
 python -m pytest tests/task_domain/test_pure_adjudication.py -q
 ```
 
-- [ ] **Step 3: Strengthen `VerificationEvidenceView`.**
+- [x] **Step 3: Strengthen `VerificationEvidenceView`.**
 
 Expose immutable typed test/change Evidence or stable query helpers sufficient for deterministic oracle evaluation. This is a read view over EvidenceRepository, not a new stored table and not a copied task aggregate.
 
-- [ ] **Step 4: Implement the pure adjudicator.**
+- [x] **Step 4: Implement the pure adjudicator.**
 
 The adjudicator must not call a model, parse model prose, inspect raw Journal transitions, mutate a Repository, or infer truth from Snapshot/Todo. It returns a new `AdjudicationDecision`; the service separately persists it through TaskRepository.
 
-- [ ] **Step 5: Remove the old final-outcome authority.**
+- [x] **Step 5: Remove the old final-outcome authority.**
 
 Retain experiment assessment helpers in `investigation/evaluation.py`, but route final `fixed`/`not_reproduced` decisions through `OutcomeAdjudicator` only. `executor_recommendation` remains non-authoritative input to planning and is absent from adjudication input.
 
-- [ ] **Step 6: Verify.**
+- [x] **Step 6: Verify.**
 
 ```powershell
 python -m pytest tests/task_domain/test_pure_adjudication.py tests/test_verification.py tests/investigation/test_evaluation.py tests/task_domain/test_repository.py -q
 python -m ruff check src/deepfix/task_domain src/deepfix/domain_repositories/evidence.py src/deepfix/investigation/evaluation.py
 ```
 
-- [ ] **Step 7: Commit.**
+- [x] **Step 7: Commit.**
 
 ```powershell
 git add src/deepfix/task_domain src/deepfix/domain_repositories/evidence.py src/deepfix/investigation/evaluation.py tests/task_domain/test_pure_adjudication.py

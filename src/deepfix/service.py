@@ -25,7 +25,6 @@ from deepfix.domain_repositories.migration import DomainMigrator, domain_is_swit
 from deepfix.investigation.classification import is_pytest_verification
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import InvestigationCoordinationError
-from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.models import InvestigationRecoveryMetadata
 from deepfix.investigation.receipts import receipt_task_segment
 from deepfix.memory import WorkingMemoryStore
@@ -33,8 +32,9 @@ from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus,
 from deepfix.operations import OperationReconciler
 from deepfix.persistence import TaskRepository
 from deepfix.research.store import ResearchEvidenceStore
+from deepfix.task_domain.adjudication import OutcomeAdjudicationInput, OutcomeAdjudicator
 from deepfix.task_domain.migration import task_definition_from_legacy
-from deepfix.task_domain.models import AdjudicationDecision, TaskLifecycleStatus
+from deepfix.task_domain.models import TaskLifecycleStatus
 from deepfix.verification import (
     VerificationPolicyBuilder,
     VerificationPolicyStore,
@@ -667,24 +667,36 @@ class BugfixService:
     def _record_adjudication(self, task: TaskState) -> None:
         if task.resolution not in {"fixed", "not_reproduced"}:
             return
+        definition = self.repository.get_definition(task.task_id)
         lifecycle = self.repository.get_lifecycle(task.task_id)
-        evidence_ids = sorted(
-            {item.evidence_id for item in self.compaction_store.list_evidence(task.task_id)}
+        verification = self.repositories.evidence.verification_view(task.task_id)
+        assessment = OutcomeAdjudicator().decide(
+            OutcomeAdjudicationInput(
+                definition=definition,
+                lifecycle=lifecycle,
+                verification_policy=self.repository.load_verification_policy(
+                    task.task_id,
+                    task.verification_policy_version,
+                ),
+                verification=verification,
+                execution_integrity=self.repositories.execution.integrity_view(
+                    task.task_id
+                ),
+                successful_change_evidence_ids=[
+                    item.evidence_id
+                    for item in verification.file_change_evidence
+                    if item.status == "succeeded"
+                ],
+                scope_violation_evidence_ids=[],
+                reproduction_state=(
+                    "not_reproduced"
+                    if task.resolution == "not_reproduced"
+                    else "reproduced"
+                ),
+            )
         )
-        decision = AdjudicationDecision(
-            decision_id=stable_investigation_id(
-                "adjudication",
-                task.task_id,
-                str(lifecycle.version),
-                task.resolution,
-            ),
-            task_id=task.task_id,
-            outcome=task.resolution,
-            evidence_ids=evidence_ids,
-            operation_ids=[],
-            decided_at=lifecycle.updated_at,
-        )
-        self.repository.record_adjudication(decision)
+        if assessment.decision is not None and assessment.outcome == task.resolution:
+            self.repository.record_adjudication(assessment.decision)
 
     def _sanitize_investigation_recovery(
         self,

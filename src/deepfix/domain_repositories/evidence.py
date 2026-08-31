@@ -77,6 +77,8 @@ class VerificationEvidenceView(StrictModel):
     verified_evidence_ids: list[str] = Field(default_factory=list)
     contradicted_evidence_ids: list[str] = Field(default_factory=list)
     unverified_evidence_ids: list[str] = Field(default_factory=list)
+    test_evidence: list[SystemTestEvidence] = Field(default_factory=list)
+    file_change_evidence: list[FileChangeEvidence] = Field(default_factory=list)
 
 
 class ResearchAttempt(StrictModel):
@@ -500,6 +502,17 @@ class EvidenceRepository:
 
     def verification_view(self, task_id: str) -> VerificationEvidenceView:
         items = self.list_for_task(task_id)
+        deterministic = [
+            restore_deterministic_evidence(item)
+            for item in items
+            if item.kind
+            in {
+                EvidenceKind.TEST,
+                EvidenceKind.FILE_CHANGE,
+                EvidenceKind.APPROVAL,
+                EvidenceKind.RESEARCH_STATUS,
+            }
+        ]
         return VerificationEvidenceView(
             evidence_ids=[item.evidence_id for item in items],
             verified_evidence_ids=[
@@ -516,6 +529,12 @@ class EvidenceRepository:
                 item.evidence_id
                 for item in items
                 if item.verification_state is EvidenceVerification.UNVERIFIED
+            ],
+            test_evidence=[
+                item for item in deterministic if isinstance(item, SystemTestEvidence)
+            ],
+            file_change_evidence=[
+                item for item in deterministic if isinstance(item, FileChangeEvidence)
             ],
         )
 

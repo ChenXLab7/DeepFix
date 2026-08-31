@@ -140,6 +140,7 @@ def evaluate_required_oracles(
             item
             for item in evidence
             if _normalize_command(item.command) == _normalize_command(oracle.command)
+            and item.origin == oracle.origin
             and _timing_satisfies(item.timing, oracle.required_timing)
         ]
         if not matches:

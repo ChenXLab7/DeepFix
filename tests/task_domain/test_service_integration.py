@@ -177,8 +177,8 @@ def test_legacy_phase_change_does_not_increment_business_lifecycle(config) -> No
 
 
 def test_completed_outcome_records_adjudication_with_evidence_ids(config) -> None:
-    service = service_for(config, FakeAgent(no_response()))
-    task = service.start("验证当前实现")
+    service = service_for(config, FakeAgent(no_response()), workspace=True)
+    task = service.start("验证当前实现，运行 python -m pytest -q")
     task.test_results = [
         RepairTestResult("python -m pytest -q", 0, "1 passed")
     ]
@@ -191,9 +191,9 @@ def test_completed_outcome_records_adjudication_with_evidence_ids(config) -> Non
             summary="1 passed",
             tool_call_id="test-call",
             source_message_id="test-result",
-            origin="repository_existing",
-            scope="full_suite",
-            timing="post_change",
+            origin="user_specified",
+            scope="targeted",
+            timing="baseline",
             workspace_baseline_id="baseline-1",
             code_state_hash="code-state-1",
         ),

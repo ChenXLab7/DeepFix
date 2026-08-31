@@ -75,6 +75,7 @@ class ExecutionIntegrity(StrictModel):
     status_counts: dict[str, int] = Field(default_factory=dict)
     receipt_count: int = Field(ge=0)
     approval_count: int = Field(ge=0)
+    incomplete_operation_ids: list[str] = Field(default_factory=list)
     unknown_operation_ids: list[str] = Field(default_factory=list)
 
     @property
@@ -330,10 +331,18 @@ class ExecutionRepository:
                 """,
                 (task_id, OperationStatus.UNKNOWN.value),
             ).fetchall()
+            incomplete = connection.execute(
+                """
+                SELECT operation_id FROM operations
+                WHERE task_id = ? AND status != ? ORDER BY operation_id
+                """,
+                (task_id, OperationStatus.COMMITTED.value),
+            ).fetchall()
         return ExecutionIntegrity(
             status_counts={str(row[0]): int(row[1]) for row in status_rows},
             receipt_count=int(receipt_count),
             approval_count=int(approval_count),
+            incomplete_operation_ids=[str(row[0]) for row in incomplete],
             unknown_operation_ids=[str(row[0]) for row in unknown],
         )
 
