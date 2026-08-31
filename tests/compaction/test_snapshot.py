@@ -69,7 +69,9 @@ def _build_input(**updates):
         "task_id": "task-a",
         "previous_snapshot": None,
         "compressed_units": (unit,),
-        "latest_memory": None,
+        "current_facts": (),
+        "current_hypotheses": (),
+        "current_unresolved_questions": (),
         "task_anchor": TaskAnchor(
             task_id="task-a",
             task_goal="修复符号错误",

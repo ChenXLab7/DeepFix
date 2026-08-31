@@ -860,14 +860,7 @@ def test_restore_context_reporting_and_execution_reconciliation_use_current_auth
     restored = service._load_current_task(TASK_ID)
     event = repositories.history.migrated_event(TASK_ID)
     assert event is not None
-    context = ProtectedContextBuilder(
-        repositories.tasks,
-        memory,
-        compaction,
-        research,
-        EvidenceCollector(compaction, research),
-        investigation_store,
-    ).build(
+    context = ProtectedContextBuilder(repositories).build(
         TASK_ID,
         [HumanMessage(id="message-user-1", content="fix parser failure")],
         event,

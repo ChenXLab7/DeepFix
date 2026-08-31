@@ -22,6 +22,7 @@ from deepfix.compaction.models import (
 )
 from deepfix.compaction.snapshot import CompactionSnapshotBuilder
 from deepfix.compaction.store import CompactionStore
+from deepfix.domain_repositories.execution import ExecutionIntegrity
 from deepfix.domain_repositories.history import HistoryRepository
 from deepfix.memory import WorkingMemoryStore
 from deepfix.protected_context import ProtectedContext
@@ -62,8 +63,12 @@ def _protected(latest="m-latest"):
             project_python="C:/python.exe",
             task_status="investigating",
         ),
-        working_memory=None,
         deterministic_evidence=DeterministicEvidenceBlock(),
+        confirmed_facts=(),
+        hypotheses=(),
+        unresolved_questions=(),
+        execution_integrity=ExecutionIntegrity(receipt_count=0, approval_count=0),
+        external_evidence=(),
         active_snapshot=None,
     )
 
@@ -156,8 +161,12 @@ def test_normal_observe_and_compaction_threshold_paths(tmp_path):
         )
 
     assert "working memory" not in received[0].system_message.text.lower()
-    assert "save_progress" in received[1].system_message.text
+    assert "save_progress" not in received[1].system_message.text
     assert "save_progress" not in received[2].system_message.text
+    assert all(
+        request.system_message.text.count("<deepfix_protected_context>") == 1
+        for request in received
+    )
     assert [item.budget.target_ratio for item in coordinator.requests] == [0.75, 0.65]
     assert all(request.messages == tuple(messages) for request in coordinator.requests)
 

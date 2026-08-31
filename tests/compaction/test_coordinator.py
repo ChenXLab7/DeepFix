@@ -23,6 +23,7 @@ from deepfix.compaction.models import (
 from deepfix.compaction.snapshot import CompactionSnapshotBuilder
 from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.work_units import partition_work_units
+from deepfix.domain_repositories.execution import ExecutionIntegrity
 from deepfix.domain_repositories.history import HistoryRepository
 from deepfix.memory import WorkingMemoryStore
 from deepfix.protected_context import ProtectedContext
@@ -60,8 +61,12 @@ def _request(zone="normal_compaction", ratio=0.90):
             project_python="C:/python.exe",
             task_status="investigating",
         ),
-        working_memory=None,
         deterministic_evidence=DeterministicEvidenceBlock(),
+        confirmed_facts=(),
+        hypotheses=(),
+        unresolved_questions=(),
+        execution_integrity=ExecutionIntegrity(receipt_count=0, approval_count=0),
+        external_evidence=(),
         active_snapshot=None,
     )
     return CompactionRequest(

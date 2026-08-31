@@ -37,7 +37,6 @@ from deepfix.compaction.models import (
     UserConstraintCandidate,
     WorkUnit,
 )
-from deepfix.memory import WorkingMemoryVersion
 
 DELTA_EXTRACTION_PROMPT = """You extract evidence-backed candidates from complete work units.
 Return only the CompactionDelta schema. Every semantic item must cite a supplied work_unit
@@ -52,9 +51,11 @@ class BuildSnapshotInput:
     task_id: str
     previous_snapshot: CompactionSnapshot | None
     compressed_units: tuple[WorkUnit, ...]
-    latest_memory: WorkingMemoryVersion | None
     task_anchor: TaskAnchor
     deterministic_evidence: DeterministicEvidenceBlock
+    current_facts: tuple[ProvenancedClaim, ...]
+    current_hypotheses: tuple[HypothesisRecord, ...]
+    current_unresolved_questions: tuple[ProvenancedText, ...]
     delta: CompactionDelta
     artifact_reference: ArtifactReference
     input_hash: str
@@ -239,9 +240,8 @@ class CompactionSnapshotBuilder:
             )
         for candidate in value.delta.confirmed_fact_candidates:
             _upsert_claim(value.task_id, claims, candidate)
-        if value.latest_memory:
-            for memory_claim in value.latest_memory.snapshot.facts:
-                _upsert_claim(value.task_id, claims, memory_claim)
+        for current_claim in value.current_facts:
+            _upsert_claim(value.task_id, claims, current_claim)
         return list(claims.values())
 
     def _merge_hypotheses(
@@ -268,9 +268,8 @@ class CompactionSnapshotBuilder:
                 transition,
                 version,
             )
-        if value.latest_memory:
-            for item in value.latest_memory.snapshot.all_hypotheses():
-                hypotheses[item.hypothesis_id] = item
+        for item in value.current_hypotheses:
+            hypotheses[item.hypothesis_id] = item
         return hypotheses
 
     def _merge_experiments(
@@ -294,20 +293,6 @@ class CompactionSnapshotBuilder:
             experiments[canonical_id] = item.model_copy(
                 update={"experiment_id": canonical_id}
             )
-        if value.latest_memory:
-            source = ProvenanceRef(
-                kind="working_memory",
-                ref_id=f"working-memory-{value.latest_memory.version}",
-            )
-            for text in value.latest_memory.snapshot.experiments:
-                canonical_id = _stable_id("experiment", value.task_id, text)
-                experiments[canonical_id] = ExperimentRecord(
-                    experiment_id=canonical_id,
-                    purpose=text,
-                    action=text,
-                    result=text,
-                    sources=[source],
-                )
         return list(experiments.values())
 
     def _merge_conflicts(self, value: BuildSnapshotInput) -> list[ConflictRecord]:
@@ -364,15 +349,8 @@ class CompactionSnapshotBuilder:
             else []
         )
         incoming = list(getattr(value.delta, field_name))
-        if value.latest_memory:
-            source = ProvenanceRef(
-                kind="working_memory",
-                ref_id=f"working-memory-{value.latest_memory.version}",
-            )
-            incoming.extend(
-                ProvenancedText(text=text, sources=[source])
-                for text in getattr(value.latest_memory.snapshot, field_name)
-            )
+        if field_name == "unresolved_questions":
+            incoming.extend(value.current_unresolved_questions)
         merged: dict[str, ProvenancedText] = {item.text: item for item in prior}
         for item in incoming:
             existing = merged.get(item.text)

@@ -30,7 +30,6 @@ from deepfix.memory import WorkingMemoryStore
 from deepfix.models import RepairOutcome
 from deepfix.navigation.middleware import TodoNavigationMiddleware
 from deepfix.prompting import PromptPolicyMiddleware
-from deepfix.protected_context import ProtectedContextMiddleware
 from deepfix.verification import VerificationPolicyStore
 
 EXPECTED_TODO_SYSTEM_PROMPT = """## Bug-repair task navigation
@@ -199,7 +198,7 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert tool_names.count("search_technical_sources") == 1
     assert tool_names.count("fetch_external_evidence") == 1
     assert tool_names.count("link_external_evidence") == 1
-    assert middleware_names[:9] == [
+    assert middleware_names[:8] == [
         "MessageIdentityMiddleware",
         "TodoListMiddleware",
         "TodoNavigationMiddleware",
@@ -207,7 +206,6 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
         "InvestigationMigrationMiddleware",
         "InvestigationMiddleware",
         "PromptPolicyMiddleware",
-        "ProtectedContextMiddleware",
         "DeepFixCompactionMiddleware",
     ]
     assert not {
@@ -216,8 +214,8 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
         "ContextMemoryMiddleware",
         "ResearchEvidenceMiddleware",
     } & set(middleware_names)
-    identity, todo_list, todo_navigation, migration, _, _, prompt, protected, compaction = (
-        middleware[:9]
+    identity, todo_list, todo_navigation, migration, _, _, prompt, compaction = (
+        middleware[:8]
     )
     assert isinstance(identity, MessageIdentityMiddleware)
     assert isinstance(todo_list, TodoListMiddleware)
@@ -227,8 +225,9 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert todo_navigation.feedback_source._verification_store is verification_policy_store
     assert type(migration).__name__ == "LegacyContextMigrationMiddleware"
     assert isinstance(prompt, PromptPolicyMiddleware)
-    assert isinstance(protected, ProtectedContextMiddleware)
     assert isinstance(compaction, DeepFixCompactionMiddleware)
+    assert middleware_names.count("DeepFixCompactionMiddleware") == 1
+    assert "ProtectedContextMiddleware" not in middleware_names
     assert captured["model"] is main_model
     assert compaction.coordinator.model is compaction_model
     assert compaction.coordinator.model is not captured["model"]

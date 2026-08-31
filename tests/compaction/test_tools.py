@@ -23,6 +23,7 @@ from deepfix.compaction.models import (
 from deepfix.compaction.snapshot import CompactionSnapshotBuilder
 from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.tools import build_compact_conversation_tool
+from deepfix.domain_repositories.execution import ExecutionIntegrity
 from deepfix.memory import WorkingMemoryStore
 from deepfix.protected_context import ProtectedContext
 
@@ -47,8 +48,12 @@ def _protected():
             project_python="C:/python.exe",
             task_status="investigating",
         ),
-        working_memory=None,
         deterministic_evidence=DeterministicEvidenceBlock(),
+        confirmed_facts=(),
+        hypotheses=(),
+        unresolved_questions=(),
+        execution_integrity=ExecutionIntegrity(receipt_count=0, approval_count=0),
+        external_evidence=(),
         active_snapshot=None,
     )
 
@@ -73,7 +78,7 @@ class _Budget:
         )
 
     def measure(self, request, blocks):
-        assert len(blocks) == 3
+        assert len(blocks) == 4
         return self.report
 
 

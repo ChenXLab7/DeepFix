@@ -178,8 +178,9 @@ class CompactionCoordinator:
             ),
             [
                 projected.task_anchor_xml,
-                projected.working_memory_xml,
+                projected.current_state_xml,
                 projected.deterministic_evidence_xml,
+                projected.execution_integrity_xml,
             ],
         )
         tool_call_id = str(getattr(runtime, "tool_call_id", "") or "")
@@ -331,9 +332,11 @@ class CompactionCoordinator:
             task_id=request.task_id,
             previous_snapshot=request.protected_context.active_snapshot,
             compressed_units=retention.compressed_units,
-            latest_memory=request.protected_context.working_memory,
             task_anchor=request.protected_context.task_anchor,
             deterministic_evidence=request.protected_context.deterministic_evidence,
+            current_facts=request.protected_context.confirmed_facts,
+            current_hypotheses=request.protected_context.hypotheses,
+            current_unresolved_questions=request.protected_context.unresolved_questions,
             delta=delta,
             artifact_reference=artifact,
             input_hash=input_hash,
@@ -722,11 +725,9 @@ def _input_hash(
             else None
         ),
         "message_ids": [str(message.id) for message in normalized_messages],
-        "working_memory_version": (
-            request.protected_context.working_memory.version
-            if request.protected_context.working_memory
-            else None
-        ),
+        "current_hypothesis_ids": [
+            item.hypothesis_id for item in request.protected_context.hypotheses
+        ],
         "deterministic_evidence": evidence,
     }
     return hashlib.sha256(
@@ -876,11 +877,6 @@ def _recovery_required(
             stage=stage,
             error_code=failure.error_code,
             usage_ratio=request.budget.usage_ratio,
-            working_memory_version=(
-                request.protected_context.working_memory.version
-                if request.protected_context.working_memory
-                else None
-            ),
             active_snapshot_version=active_version,
             prepared_snapshot_version=failure.prepared_snapshot_version,
             prepared_snapshot_lifecycle=(

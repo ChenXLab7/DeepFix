@@ -270,11 +270,6 @@ class DeepFixCompactionMiddleware(AgentMiddleware):
                 stage="overflow_retry",
                 error_code="context_overflow_after_single_retry",
                 usage_ratio=request.budget.usage_ratio,
-                working_memory_version=(
-                    request.protected_context.working_memory.version
-                    if request.protected_context.working_memory
-                    else None
-                ),
                 active_snapshot_version=(
                     request.active_event.active_snapshot_version
                     if request.active_event
@@ -299,11 +294,6 @@ class DeepFixCompactionMiddleware(AgentMiddleware):
                 stage="overflow_retry",
                 error_code="context_overflow_after_single_retry",
                 usage_ratio=request.budget.usage_ratio,
-                working_memory_version=(
-                    request.protected_context.working_memory.version
-                    if request.protected_context.working_memory
-                    else None
-                ),
                 active_snapshot_version=(
                     request.active_event.active_snapshot_version
                     if request.active_event
@@ -320,30 +310,7 @@ class DeepFixCompactionMiddleware(AgentMiddleware):
         self,
         prepared: _PreparedModelRequest,
     ) -> ModelRequest:
-        if prepared.report.zone != "observe":
-            return prepared.request
-        partition = partition_work_units(prepared.request.messages, set())
-        latest_unit_id = partition.units[-1].unit_id if partition.units else "none"
-        memory = prepared.context.working_memory
-        stale = (
-            memory is None
-            or memory.snapshot.coverage.last_user_message_id
-            != prepared.context.task_anchor.latest_user_message_id
-            or latest_unit_id not in memory.snapshot.coverage.covered_work_unit_ids
-        )
-        if not stale or not self.budget_monitor.should_emit_memory_hint(
-            memory.version if memory else 0,
-            latest_unit_id,
-        ):
-            return prepared.request
-        original = prepared.request.system_message.text
-        hint = (
-            "<deepfix_memory_hint>当前 Working Memory 已落后；完成本工作单元后"
-            "请调用 save_progress。</deepfix_memory_hint>"
-        )
-        return prepared.request.override(
-            system_message=SystemMessage(content=f"{original}\n\n{hint}")
-        )
+        return prepared.request
 
     def _reconcile_event(
         self,

@@ -71,7 +71,6 @@ from deepfix.prompting import PromptPolicyMiddleware
 from deepfix.prompts import CORE_REPAIR_PROMPT
 from deepfix.protected_context import (
     ProtectedContextBuilder,
-    ProtectedContextMiddleware,
 )
 from deepfix.research.store import ResearchEvidenceStore
 from deepfix.verification import VerificationPolicyStore
@@ -129,6 +128,7 @@ def build_agent(
     compaction_model = build_compaction_model(config)
     if compaction_model_callbacks:
         compaction_model = compaction_model.with_config(callbacks=list(compaction_model_callbacks))
+    repositories = repositories or DomainRepositories.create(config.database_path)
     resolved_backend = backend or build_backend(config)
     tasks = task_repository or (
         repositories.tasks if repositories is not None else TaskRepository(config.database_path)
@@ -162,14 +162,7 @@ def build_agent(
         compaction,
         policy_store,
     )
-    protected_builder = ProtectedContextBuilder(
-        tasks,
-        working_memory_store,
-        compaction,
-        research,
-        evidence_collector,
-        investigation_store,
-    )
+    protected_builder = ProtectedContextBuilder(repositories)
     budget_monitor = ContextBudgetMonitor()
     coordinator = CompactionCoordinator(
         adapter=DeepAgentsArtifactAdapter(resolved_backend),
@@ -308,7 +301,6 @@ def build_agent(
                 ),
             ),
             *prompt_policy_middleware,
-            ProtectedContextMiddleware(protected_builder),
             DeepFixCompactionMiddleware(
                 protected_builder,
                 budget_monitor,

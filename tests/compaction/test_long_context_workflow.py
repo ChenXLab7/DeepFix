@@ -49,7 +49,11 @@ from deepfix.compaction.snapshot import CompactionSnapshotBuilder
 from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.work_units import partition_work_units
 from deepfix.config import AppConfig, ApprovalMode, ModelRoleConfig
+from deepfix.domain_repositories import DomainRepositories
+from deepfix.domain_repositories.execution import ExecutionIntegrity
+from deepfix.domain_repositories.migration import DomainMigrator
 from deepfix.investigation.coordinator import InvestigationCoordinator
+from deepfix.investigation.models import InvestigationHypothesis
 from deepfix.investigation.store import InvestigationStore
 from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, TaskState, TaskStatus
@@ -198,10 +202,10 @@ class _LongBugWorkflow:
     def run(self) -> _WorkflowResult:
         database = self.state / "deepfix.sqlite3"
         constraint = "只修复符号归一化，不得修改公开 API"
-        tasks = TaskRepository(database)
+        repositories = DomainRepositories.create(database)
+        tasks = repositories.tasks
         memory = WorkingMemoryStore(database)
-        snapshots = CompactionStore(database)
-        research = ResearchEvidenceStore(database)
+        snapshots = CompactionStore(database, repositories=repositories)
         artifact_adapter = DeepAgentsArtifactAdapter(
             FilesystemBackend(root_dir=self.state / "artifacts", virtual_mode=True)
         )
@@ -277,7 +281,7 @@ class _LongBugWorkflow:
         )
         hypothesis_id = first_memory.snapshot.active_hypotheses[0].hypothesis_id
         rejected_reason = "全新进程仍失败，缓存假设被排除"
-        memory.save_progress(
+        second_memory = memory.save_progress(
             task.task_id,
             phase="planning",
             summary="缓存已排除，准备最小修改",
@@ -307,12 +311,25 @@ class _LongBugWorkflow:
                 artifact_path="/.deepfix-artifacts/research/sign.md",
             ),
         )
-        collector = EvidenceCollector(snapshots, research)
+        assert DomainMigrator(database).migrate_investigation(task.task_id).ready_to_switch
+        rejected = second_memory.snapshot.rejected_hypotheses[0]
+        repositories.investigation.backfill_current_hypothesis(
+            task.task_id,
+            InvestigationHypothesis(
+                hypothesis_id=rejected.hypothesis_id,
+                statement=rejected.text,
+                state="rejected",
+                evidence_ids=[],
+                checked_locations=[],
+                reason=rejected.reason or rejected_reason,
+            ),
+        )
         events = []
         active_snapshot = None
+        protected_builder = ProtectedContextBuilder(repositories)
         compaction_middleware = _RecordingCompactionMiddleware(
             _ConstraintProtectedBuilder(
-                ProtectedContextBuilder(tasks, memory, snapshots, research, collector),
+                protected_builder,
                 constraint,
             ),
             _ForcedCompactionBudget(),
@@ -439,21 +456,7 @@ class _LongBugWorkflow:
         task.transition_to(TaskStatus.REVIEWING)
         task.transition_to(TaskStatus.COMPLETED)
         tasks.save(task)
-        final_evidence = collector.collect(task.task_id, messages, task)
-        final_context = ProtectedContext(
-            TaskAnchor(
-                task_id=task.task_id,
-                task_goal=constraint,
-                user_constraints=active_snapshot.user_constraints,
-                latest_user_message_id="m-user",
-                project_root=str(self.project),
-                project_python=sys.executable,
-                task_status=task.status.value,
-            ),
-            memory.latest(task.task_id),
-            final_evidence,
-            active_snapshot,
-        )
+        final_context = protected_builder.build(task.task_id, messages, events[-1])
         history = artifact_adapter.read_verified(events[-1].conversation_artifact.path)
         scoped_partition = partition_work_units(_scoped(task.task_id, messages), set())
         units = {unit.unit_id: unit for unit in scoped_partition.units}
@@ -545,7 +548,7 @@ def _failure_request(task_id, ratio, zone):
         messages=messages,
         active_event=None,
         protected_context=ProtectedContext(
-            TaskAnchor(
+            task_anchor=TaskAnchor(
                 task_id=task_id,
                 task_goal="fix",
                 user_constraints=[],
@@ -554,9 +557,13 @@ def _failure_request(task_id, ratio, zone):
                 project_python=sys.executable,
                 task_status="investigating",
             ),
-            None,
-            DeterministicEvidenceBlock(),
-            None,
+            deterministic_evidence=DeterministicEvidenceBlock(),
+            confirmed_facts=(),
+            hypotheses=(),
+            unresolved_questions=(),
+            execution_integrity=ExecutionIntegrity(receipt_count=0, approval_count=0),
+            external_evidence=(),
+            active_snapshot=None,
         ),
         budget=_budget(zone, ratio),
         model=object(),

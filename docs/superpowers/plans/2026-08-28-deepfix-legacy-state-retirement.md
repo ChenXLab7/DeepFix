@@ -364,33 +364,33 @@ Do not continue until approved.
 - Modify: `src/deepfix/agent.py`
 - Modify: `src/deepfix/context.py`
 
-- [ ] **Step 1: Write failing projection tests.**
+- [x] **Step 1: Write failing projection tests.**
 
 Cover task isolation, immutable original problem, current hypotheses/questions, deterministic Evidence, approval/operation integrity, active Snapshot history, and exact-once display of each `constraint_id`, `evidence_id`, and `hypothesis_id`. Add a stale Snapshot hypothesis that the current InvestigationRepository marks rejected and assert the stale claim is not displayed as current truth.
 
-- [ ] **Step 2: Prove only one middleware injection.**
+- [x] **Step 2: Prove only one middleware injection.**
 
 Add an Agent construction/request test that counts `<deepfix_protected_context>` blocks and requires exactly one. Snapshot text may expose historical references but not duplicate current records.
 
-- [ ] **Step 3: Run the red tests.**
+- [x] **Step 3: Run the red tests.**
 
 ```powershell
 python -m pytest tests/test_repository_native_context.py tests/test_protected_context.py -q
 ```
 
-- [ ] **Step 4: Replace `ProtectedContextBuilder` dependencies.**
+- [x] **Step 4: Replace `ProtectedContextBuilder` dependencies.**
 
 It must receive `DomainRepositories` plus request-local Graph Messages/config. It reads TaskDefinition/Lifecycle, Investigation, Evidence, Execution, and History directly. It must not accept legacy `TaskRepository`, `WorkingMemoryStore`, `CompactionStore`, `ResearchEvidenceStore`, or `InvestigationStore` facades.
 
-- [ ] **Step 5: Replace Working Memory input to Snapshot merge.**
+- [x] **Step 5: Replace Working Memory input to Snapshot merge.**
 
 `CompactionSnapshotBuilder` receives old active Snapshot, new complete work units, current Investigation/Evidence views, immutable task definition/constraints, and Execution facts. Remove repeated natural-language Working Memory merging. Preserve Artifact-first → validate Snapshot → activate event → replace messages ordering.
 
-- [ ] **Step 6: Make compaction middleware the single injection owner.**
+- [x] **Step 6: Make compaction middleware the single injection owner.**
 
 Remove the separate `ProtectedContextMiddleware` from production Agent construction (or delete it if unused everywhere). Keep one request-local protected block; never write it into Graph Messages.
 
-- [ ] **Step 7: Verify compaction safety.**
+- [x] **Step 7: Verify compaction safety.**
 
 ```powershell
 python -m pytest tests/test_repository_native_context.py tests/test_protected_context.py tests/compaction/test_snapshot.py tests/compaction/test_coordinator.py tests/compaction/test_middleware.py tests/compaction/test_failure_atomicity.py tests/compaction/test_long_context_workflow.py -q
