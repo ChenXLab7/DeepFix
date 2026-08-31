@@ -48,7 +48,6 @@ from deepfix.compaction.snapshot import (
 from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.work_units import WorkUnitPartition, partition_work_units
 from deepfix.domain_repositories.history import HistoryRepository
-from deepfix.memory import WorkingMemoryStore
 from deepfix.protected_context import (
     ProtectedContext,
     ProtectedContextBuilder,
@@ -103,7 +102,6 @@ class CompactionCoordinator:
         delta_generator: CompactionDeltaGenerator | Any,
         snapshot_builder: CompactionSnapshotBuilder | Any,
         snapshot_store: CompactionStore | Any,
-        memory_store: WorkingMemoryStore,
         history_repository: HistoryRepository | None = None,
         budget_monitor: ContextBudgetMonitor | None = None,
         protected_builder: ProtectedContextBuilder | None = None,
@@ -117,9 +115,8 @@ class CompactionCoordinator:
         self.delta_generator = delta_generator
         self.snapshot_builder = snapshot_builder
         self.snapshot_store = snapshot_store
-        self.memory_store = memory_store
         self.history_repository = history_repository or HistoryRepository(
-            memory_store.database_path
+            snapshot_store.database_path
         )
         self.budget_monitor = budget_monitor
         self.protected_builder = protected_builder
@@ -153,19 +150,13 @@ class CompactionCoordinator:
         self,
         runtime: Any,
     ) -> tuple[CompactionRequest | None, Command | None]:
-        if (
-            self.budget_monitor is None
-            or self.protected_builder is None
-            or self.model is None
-        ):
+        if self.budget_monitor is None or self.protected_builder is None or self.model is None:
             raise RuntimeError("manual compaction dependencies are not configured")
         task_id = _runtime_task_id(runtime)
         messages = tuple(runtime.state.get("messages", ()))
         event_value = runtime.state.get("_deepfix_compaction_event")
         event = (
-            DeepFixCompactionEvent.model_validate(event_value)
-            if event_value is not None
-            else None
+            DeepFixCompactionEvent.model_validate(event_value) if event_value is not None else None
         )
         protected = self.protected_builder.build(task_id, messages, event)
         projected = ProtectedContextProjector().project(protected)
@@ -271,8 +262,7 @@ class CompactionCoordinator:
     def prepare(self, request: CompactionRequest) -> PreparedCompaction:
         identities = ensure_message_ids(request.task_id, request.messages)
         messages = tuple(
-            _with_task_scope(message, request.task_id)
-            for message in identities.messages
+            _with_task_scope(message, request.task_id) for message in identities.messages
         )
         partition = self.partitioner(messages, identities.conflicted_message_ids)
         input_hash = _input_hash(request, messages)
@@ -435,10 +425,7 @@ class CompactionCoordinator:
                 request.task_id,
                 event,
             )
-            if (
-                active.lifecycle != "active"
-                or active.content_hash != verified.content_hash
-            ):
+            if active.lifecycle != "active" or active.content_hash != verified.content_hash:
                 raise ValueError("Snapshot activation verification failed")
         except CompactionPreparationError as exc:
             raise _rebind_error(
@@ -474,8 +461,7 @@ class CompactionCoordinator:
     async def aprepare(self, request: CompactionRequest) -> PreparedCompaction:
         identities = ensure_message_ids(request.task_id, request.messages)
         messages = tuple(
-            _with_task_scope(message, request.task_id)
-            for message in identities.messages
+            _with_task_scope(message, request.task_id) for message in identities.messages
         )
         partition = self.partitioner(messages, identities.conflicted_message_ids)
         input_hash = _input_hash(request, messages)
@@ -533,7 +519,6 @@ class CompactionCoordinator:
             delta_generator=_StaticDeltaGenerator(delta),
             snapshot_builder=self.snapshot_builder,
             snapshot_store=self.snapshot_store,
-            memory_store=self.memory_store,
             history_repository=self.history_repository,
             partitioner=self.partitioner,
         )
@@ -606,11 +591,7 @@ class CompactionCoordinator:
         return ExtendedModelResponse(
             model_response=response,
             command=Command(
-                update={
-                    "_deepfix_compaction_event": prepared.event.model_dump(
-                        mode="json"
-                    )
-                }
+                update={"_deepfix_compaction_event": prepared.event.model_dump(mode="json")}
             ),
         )
 
@@ -681,11 +662,7 @@ class CompactionCoordinator:
         return ExtendedModelResponse(
             model_response=response,
             command=Command(
-                update={
-                    "_deepfix_compaction_event": prepared.event.model_dump(
-                        mode="json"
-                    )
-                }
+                update={"_deepfix_compaction_event": prepared.event.model_dump(mode="json")}
             ),
         )
 
@@ -720,9 +697,7 @@ def _input_hash(
     payload = {
         "task_id": request.task_id,
         "active_snapshot_version": (
-            request.active_event.active_snapshot_version
-            if request.active_event
-            else None
+            request.active_event.active_snapshot_version if request.active_event else None
         ),
         "message_ids": [str(message.id) for message in normalized_messages],
         "current_hypothesis_ids": [
@@ -752,10 +727,7 @@ def _snapshot_message(
     content = snapshot.model_dump_json()
     if len(content) > 16_000:
         content = (
-            content[:15_000]
-            + "\n[Snapshot details truncated; full history: "
-            + artifact.path
-            + "]"
+            content[:15_000] + "\n[Snapshot details truncated; full history: " + artifact.path + "]"
         )
     return SystemMessage(
         id=stable_generated_message_id(
@@ -774,15 +746,9 @@ def _validate_history_coverage(
     latest_user_message_id: str,
 ) -> None:
     expected_message_ids = list(
-        dict.fromkeys(
-            message_id
-            for unit in compressed_units
-            for message_id in unit.message_ids
-        )
+        dict.fromkeys(message_id for unit in compressed_units for message_id in unit.message_ids)
     )
-    expected_work_unit_ids = list(
-        dict.fromkeys(unit.unit_id for unit in compressed_units)
-    )
+    expected_work_unit_ids = list(dict.fromkeys(unit.unit_id for unit in compressed_units))
     if snapshot.coverage.last_user_message_id != latest_user_message_id:
         raise ValueError("History coverage latest User Message does not match")
     if snapshot.coverage.covered_message_ids != expected_message_ids:
@@ -808,9 +774,7 @@ def _rebind_error(
             "budget_zone": request.budget.zone,
             "input_hash": input_hash,
             "original_messages_preserved": True,
-            "artifact_reference": (
-                artifact.path if artifact else error.failure.artifact_reference
-            ),
+            "artifact_reference": (artifact.path if artifact else error.failure.artifact_reference),
             "prepared_snapshot_version": (
                 prepared_version
                 if prepared_version is not None
@@ -866,11 +830,7 @@ def _recovery_required(
         "overflow_retry",
     }
     stage = failure.stage if failure.stage in allowed_stages else "snapshot_validate"
-    active_version = (
-        request.active_event.active_snapshot_version
-        if request.active_event
-        else None
-    )
+    active_version = request.active_event.active_snapshot_version if request.active_event else None
     return ContextRecoveryRequired(
         ContextRecoveryMetadata(
             task_id=request.task_id,
@@ -879,9 +839,7 @@ def _recovery_required(
             usage_ratio=request.budget.usage_ratio,
             active_snapshot_version=active_version,
             prepared_snapshot_version=failure.prepared_snapshot_version,
-            prepared_snapshot_lifecycle=(
-                "prepared" if failure.prepared_snapshot_version else None
-            ),
+            prepared_snapshot_lifecycle=("prepared" if failure.prepared_snapshot_version else None),
             conversation_artifact=failure.artifact_reference,
             original_messages_preserved=True,
         )
@@ -898,9 +856,7 @@ def _runtime_task_id(runtime: Any) -> str:
     if execution_info is not None and execution_info.thread_id:
         return str(execution_info.thread_id).strip()
     task_id = str(
-        getattr(runtime, "config", {})
-        .get("configurable", {})
-        .get("thread_id", "")
+        getattr(runtime, "config", {}).get("configurable", {}).get("thread_id", "")
     ).strip()
     if not task_id:
         raise ValueError("manual compaction runtime 缺少 thread_id")

@@ -26,7 +26,6 @@ from deepfix.extensions import (
     build_research_extensions,
 )
 from deepfix.investigation.models import InvestigationCapability
-from deepfix.memory import WorkingMemoryStore
 from deepfix.models import RepairOutcome
 from deepfix.navigation.middleware import TodoNavigationMiddleware
 from deepfix.prompting import PromptPolicyMiddleware
@@ -66,7 +65,6 @@ def agent(config):
     return build_agent(
         config,
         checkpointer=InMemorySaver(),
-        working_memory_store=WorkingMemoryStore(config.database_path),
     )
 
 
@@ -83,7 +81,6 @@ def test_agent_exposes_repair_tools_without_subagent_task_tool(agent):
         "glob",
         "grep",
         "execute",
-        "save_progress",
         "compact_conversation",
         "record_hypothesis",
         "search_diagnostic_artifacts",
@@ -183,7 +180,6 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     result = build_agent(
         config,
         checkpointer=InMemorySaver(),
-        working_memory_store=WorkingMemoryStore(config.database_path),
         extensions=extensions,
         verification_policy_store=verification_policy_store,
     )
@@ -192,7 +188,7 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     middleware = captured["middleware"]
     middleware_names = [type(item).__name__ for item in middleware]
     assert result == "compiled-agent"
-    assert tool_names.count("save_progress") == 1
+    assert "save_progress" not in tool_names
     assert tool_names.count("inspect_dependency") == 1
     assert tool_names.count("search_technical_sources") == 1
     assert tool_names.count("fetch_external_evidence") == 1
@@ -213,17 +209,13 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
         "ContextMemoryMiddleware",
         "ResearchEvidenceMiddleware",
     } & set(middleware_names)
-    identity, todo_list, todo_navigation, migration, _, _, prompt, compaction = (
-        middleware[:8]
-    )
+    identity, todo_list, todo_navigation, migration, _, _, prompt, compaction = middleware[:8]
     assert isinstance(identity, MessageIdentityMiddleware)
     assert isinstance(todo_list, TodoListMiddleware)
     assert todo_list.system_prompt == EXPECTED_TODO_SYSTEM_PROMPT
     assert isinstance(todo_navigation, TodoNavigationMiddleware)
     assert todo_navigation.reminder_rounds == 3
-    assert type(todo_navigation.feedback_source).__name__ == (
-        "RepositoryNavigationFeedbackSource"
-    )
+    assert type(todo_navigation.feedback_source).__name__ == ("RepositoryNavigationFeedbackSource")
     assert type(migration).__name__ == "LegacyContextMigrationMiddleware"
     assert isinstance(prompt, PromptPolicyMiddleware)
     assert isinstance(compaction, DeepFixCompactionMiddleware)
@@ -232,10 +224,6 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert captured["model"] is main_model
     assert compaction.coordinator.model is compaction_model
     assert compaction.coordinator.model is not captured["model"]
-    save_progress = next(tool for tool in captured["tools"] if tool.name == "save_progress")
-    assert not any(
-        hasattr(save_progress, name) for name in ("model", "main_model", "compaction_model")
-    )
     assert tool_names.count("compact_conversation") == 1
     assert tool_names.count("search_diagnostic_artifacts") == 1
     assert tool_names.count("read_diagnostic_artifact") == 1
@@ -280,7 +268,6 @@ def test_agent_investigation_middleware_uses_shared_execution_repository(
     build_agent(
         config,
         checkpointer=InMemorySaver(),
-        working_memory_store=WorkingMemoryStore(config.database_path),
         repositories=repositories,
     )
 
@@ -308,7 +295,6 @@ def test_agent_configures_write_todos_with_deepfix_navigation_contract(
     build_agent(
         config,
         checkpointer=InMemorySaver(),
-        working_memory_store=WorkingMemoryStore(config.database_path),
     )
 
     todo_list = next(
@@ -335,7 +321,6 @@ def test_experiment_builder_is_opt_in_and_legacy_builder_defaults_are_unchanged(
     kwargs = {
         "config": config,
         "checkpointer": InMemorySaver(),
-        "working_memory_store": WorkingMemoryStore(config.database_path),
     }
 
     assert build_agent(**kwargs) == "deepfix_repair_agent"
@@ -371,7 +356,6 @@ def test_agent_rejects_extension_that_shadows_diagnostic_artifact_tool(
         build_agent(
             config,
             checkpointer=InMemorySaver(),
-            working_memory_store=WorkingMemoryStore(config.database_path),
             extensions=extensions,
         )
 

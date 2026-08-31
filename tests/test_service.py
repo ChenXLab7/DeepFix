@@ -31,7 +31,6 @@ from deepfix.investigation.errors import (
     InvestigationStateError,
 )
 from deepfix.investigation.models import (
-    AgentPhase,
     InvestigationHypothesis,
     InvestigationRecoveryMetadata,
 )
@@ -40,10 +39,8 @@ from deepfix.investigation.receipts import (
     receipt_from_result,
 )
 from deepfix.investigation.store import InvestigationStore
-from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
 from deepfix.models import (
     ApprovalRecord,
-    Evidence,
     RepairOutcome,
     TaskState,
     TaskStatus,
@@ -218,15 +215,9 @@ def app_config(tmp_path, monkeypatch):
     return load_config(tmp_path, ApprovalMode.MANUAL)
 
 
-@pytest.fixture
-def memory_store(app_config):
-    return WorkingMemoryStore(app_config.database_path)
-
-
 def make_service(
     config,
     fake_agent,
-    memory_store=None,
     research_store=None,
     investigation=None,
     operation_reconciler=None,
@@ -235,7 +226,6 @@ def make_service(
     execution_backend=None,
 ):
     repository = TaskRepository(config.database_path)
-    memory_store = memory_store or WorkingMemoryStore(config.database_path)
     research_store = research_store or ResearchEvidenceStore(config.database_path)
     return (
         BugfixService(
@@ -243,7 +233,6 @@ def make_service(
             repository,
             ApprovalPolicy(config.approval_mode),
             config,
-            memory_store,
             research_store,
             investigation=investigation,
             operation_reconciler=operation_reconciler,
@@ -1030,45 +1019,8 @@ def test_repeated_graph_message_history_does_not_duplicate_test_result(app_confi
     assert len(continued.test_results) == 1
 
 
-def test_service_syncs_latest_memory_without_overriding_current_investigation(
-    app_config,
-    memory_store,
-):
-    fake_agent = FakeAgent(outcome(), outcome(question="请继续提供信息"))
-    service, _ = make_service(app_config, fake_agent, memory_store)
-    task = service.start("测试失败")
-    memory_store.save(
-        task.task_id,
-        ProgressSnapshot(
-            phase="investigating",
-            summary="最新调查",
-            facts=["失败可稳定复现"],
-            evidence=[
-                {
-                    "source": "tests/test_calc.py:18",
-                    "observation": "期望 2，实际 -2",
-                }
-            ],
-            active_hypotheses=["符号处理重复取反"],
-            rejected_hypotheses=[],
-            checked_files=["src/calc.py"],
-            experiments=["目标单测退出码为 1"],
-            next_steps=["验证 normalize_sign"],
-            unresolved_questions=[],
-        ),
-    )
-
-    continued = service.continue_task(task.task_id, "继续")
-
-    assert continued.working_memory_version == 1
-    assert Evidence("tests/test_calc.py:18", "期望 2，实际 -2") in continued.evidence
-    assert continued.hypotheses == []
-    assert continued.diagnosis is None
-
-
 def test_tool_message_wording_cannot_increment_compaction_metric(
     app_config,
-    memory_store,
 ):
     messages = [
         AIMessage(
@@ -1094,19 +1046,17 @@ def test_tool_message_wording_cannot_increment_compaction_metric(
     service, _ = make_service(
         app_config,
         FakeAgent(first, second),
-        memory_store,
     )
     task = service.start("超长测试失败")
 
     continued = service.continue_task(task.task_id, "继续")
 
     assert continued.context_metrics.active_compaction_count == 0
-    assert memory_store.metrics(task.task_id).active_compaction_count == 0
+    assert service.repositories.history.context_telemetry(task.task_id).active_compaction_count == 0
 
 
 def test_nothing_to_compact_does_not_increment_success_metric(
     app_config,
-    memory_store,
 ):
     result = outcome()
     result["messages"] = [
@@ -1129,20 +1079,18 @@ def test_nothing_to_compact_does_not_increment_success_metric(
     service, _ = make_service(
         app_config,
         FakeAgent(result),
-        memory_store,
     )
 
     task = service.start("短任务")
 
     assert task.context_metrics.active_compaction_count == 0
-    assert memory_store.metrics(task.task_id).active_compaction_count == 0
+    assert service.repositories.history.context_telemetry(task.task_id).active_compaction_count == 0
 
 
-def test_uncoordinated_context_overflow_is_an_ordinary_agent_failure(app_config, memory_store):
+def test_uncoordinated_context_overflow_is_an_ordinary_agent_failure(app_config):
     service, repository = make_service(
         app_config,
         FakeAgent(ContextOverflowError("context exceeded")),
-        memory_store,
     )
 
     task = service.start("超长任务")
@@ -1171,7 +1119,6 @@ def investigation_recovery(task_id):
     return InvestigationRecoveryMetadata(
         task_id=task_id,
         error_code="investigation_stagnated",
-        agent_phase=AgentPhase.DIAGNOSING,
         state_version=3,
         last_event_sequence=7,
         checkpoint_available=True,
@@ -1297,22 +1244,6 @@ def test_foreign_diagnostic_artifact_recovery_fails_closed(app_config):
     assert repository.get(task.task_id).status is TaskStatus.FAILED
 
 
-def test_needs_input_synchronizes_agent_phase_to_clarifying(app_config):
-    coordinator = service_coordinator(app_config)
-    service, _ = make_service(
-        app_config,
-        FakeAgent(outcome(question="which Python version?")),
-        investigation=coordinator,
-    )
-
-    task = service.start("version-sensitive bug")
-    state = coordinator.state(task.task_id)
-
-    assert task.status is TaskStatus.CLARIFYING
-    assert state.agent_phase is AgentPhase.CLARIFYING
-    assert state.paused_agent_phase is AgentPhase.INVESTIGATING
-
-
 def test_user_information_records_lifecycle_and_clears_recovery(app_config):
     coordinator = service_coordinator(app_config)
     service, _ = make_service(
@@ -1390,8 +1321,8 @@ def test_recovery_metadata_clears_only_after_successful_resumed_invoke(app_confi
     assert resumed.context_recovery is None
 
 
-def test_service_records_only_current_task_artifacts(app_config, memory_store):
-    service, _ = make_service(app_config, FakeAgent(), memory_store)
+def test_service_records_only_current_task_artifacts(app_config):
+    service, _ = make_service(app_config, FakeAgent())
     task = TaskState.create(app_config.project_root, "测试失败", ApprovalMode.MANUAL)
     current_history = app_config.artifacts_path / "conversation_history" / f"{task.task_id}.md"
     foreign_history = app_config.artifacts_path / "conversation_history" / "other-task.md"

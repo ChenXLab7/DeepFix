@@ -13,7 +13,6 @@ class ProvenanceRef(StrictModel):
     kind: Literal[
         "user_message",
         "work_unit",
-        "working_memory",
         "system_evidence",
         "artifact",
         "snapshot_record",
@@ -199,9 +198,9 @@ class WorkUnit(StrictModel):
     message_ids: list[str] = Field(min_length=1)
     tool_call_ids: list[str] = Field(default_factory=list)
     state: Literal["complete", "incomplete", "ambiguous"]
-    categories: set[
-        Literal["read", "search", "modify", "verify_pass", "verify_fail", "other"]
-    ] = Field(default_factory=set)
+    categories: set[Literal["read", "search", "modify", "verify_pass", "verify_fail", "other"]] = (
+        Field(default_factory=set)
+    )
     start_index: int = Field(ge=0)
     end_index: int = Field(ge=0)
     must_keep: bool = False
@@ -307,7 +306,6 @@ class ContextRecoveryMetadata(StrictModel):
     ]
     error_code: str = Field(min_length=1)
     usage_ratio: float | None = None
-    working_memory_version: int | None = None
     active_snapshot_version: int | None = None
     prepared_snapshot_version: int | None = None
     prepared_snapshot_lifecycle: Literal["prepared", "active", "abandoned"] | None = None

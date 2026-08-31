@@ -20,18 +20,16 @@ from deepfix.compaction.models import (
     CompactionSnapshot,
     DeepFixCompactionEvent,
     DeterministicEvidenceBlock,
-    ExperimentRecord,
     FileChangeEvidence,
-    ProvenancedText,
-    ProvenanceRef,
     SystemTestEvidence,
     UserConstraint,
 )
 from deepfix.compaction.snapshot import snapshot_content_hash
 from deepfix.compaction.store import CompactionStore
+from deepfix.domain_repositories import DomainRepositories
 from deepfix.domain_repositories.history import HistoryRepository
-from deepfix.memory import WorkingMemoryStore
 from deepfix.persistence import TaskRepository
+from deepfix.protected_context import ProtectedContextBuilder
 
 _MIGRATION_VERSION = 1
 
@@ -39,15 +37,13 @@ _MIGRATION_VERSION = 1
 @dataclass(frozen=True)
 class LegacyContextStores:
     tasks: TaskRepository
-    memory: WorkingMemoryStore
     compaction: CompactionStore
+    repositories: DomainRepositories
     history: HistoryRepository | None = None
 
 
 class LegacyContextMigrationState(DeepFixCompactionState):
-    _summarization_event: NotRequired[
-        Annotated[dict[str, object] | None, PrivateStateAttr]
-    ]
+    _summarization_event: NotRequired[Annotated[dict[str, object] | None, PrivateStateAttr]]
 
 
 class LegacyContextMigrationMiddleware(AgentMiddleware):
@@ -101,9 +97,7 @@ def migrate_legacy_context_state(
     if not task_id:
         raise ValueError("task_id 不能为空")
     state = dict(graph_state)
-    messages = ensure_message_ids(
-        task_id, list(state.get("messages", ()))
-    ).messages
+    messages = ensure_message_ids(task_id, list(state.get("messages", ()))).messages
     state["messages"] = messages
     legacy_event = state.get("_summarization_event")
     if legacy_event is None:
@@ -133,7 +127,6 @@ def migrate_legacy_context_state(
         retained_ids,
     )
 
-    memory = stores.memory.latest(task_id)
     existing_snapshots = stores.compaction.list_snapshots(task_id)
     version = (existing_snapshots[-1].version if existing_snapshots else 0) + 1
     evidence = _legacy_evidence(task_id, task)
@@ -144,12 +137,13 @@ def migrate_legacy_context_state(
         *evidence.research,
     ]:
         stores.compaction.save_evidence(task_id, item)
+    current = ProtectedContextBuilder(stores.repositories).build(
+        task_id,
+        messages,
+        None,
+    )
     source_message_id = next(
-        (
-            str(message.id)
-            for message in reversed(messages)
-            if isinstance(message, HumanMessage)
-        ),
+        (str(message.id) for message in reversed(messages) if isinstance(message, HumanMessage)),
         stable_generated_message_id(task_id, "legacy-task-goal", "user"),
     )
     constraint = UserConstraint(
@@ -168,76 +162,22 @@ def migrate_legacy_context_state(
         source_work_unit_ids=[],
         task_goal=task.user_problem,
         user_constraints=[constraint],
-        confirmed_facts=(memory.snapshot.facts if memory else []),
+        confirmed_facts=list(current.confirmed_facts),
         deterministic_evidence=evidence,
-        active_hypotheses=(memory.snapshot.active_hypotheses if memory else []),
-        rejected_hypotheses=(memory.snapshot.rejected_hypotheses if memory else []),
-        confirmed_hypotheses=(memory.snapshot.confirmed_hypotheses if memory else []),
+        active_hypotheses=[item for item in current.hypotheses if item.state == "active"],
+        rejected_hypotheses=[item for item in current.hypotheses if item.state == "rejected"],
+        confirmed_hypotheses=[item for item in current.hypotheses if item.state == "confirmed"],
         changed_files=evidence.files,
-        experiments=(
-            [
-                ExperimentRecord(
-                    experiment_id=_stable_id(
-                        "experiment", task_id, "legacy-working-memory", text
-                    ),
-                    purpose=text,
-                    action=text,
-                    result=text,
-                    sources=[
-                        ProvenanceRef(
-                            kind="working_memory",
-                            ref_id=f"working-memory-{memory.version}",
-                        )
-                    ],
-                )
-                for text in memory.snapshot.experiments
-            ]
-            if memory
-            else []
-        ),
+        experiments=[],
         test_results=evidence.tests,
         conflicts=[],
-        unresolved_questions=(
-            [
-                ProvenancedText(
-                    text=text,
-                    sources=[
-                        ProvenanceRef(
-                            kind="working_memory",
-                            ref_id=f"working-memory-{memory.version}",
-                        )
-                    ],
-                )
-                for text in memory.snapshot.unresolved_questions
-            ]
-            if memory
-            else []
-        ),
-        next_steps=(
-            [
-                ProvenancedText(
-                    text=text,
-                    sources=[
-                        ProvenanceRef(
-                            kind="working_memory",
-                            ref_id=f"working-memory-{memory.version}",
-                        )
-                    ],
-                )
-                for text in memory.snapshot.next_steps
-            ]
-            if memory
-            else []
-        ),
+        unresolved_questions=list(current.unresolved_questions),
+        next_steps=[],
         artifact_references=[artifact],
         content_hash="pending",
     )
-    snapshot = snapshot.model_copy(
-        update={"content_hash": snapshot_content_hash(snapshot)}
-    )
-    prepared = stores.compaction.save_prepared_snapshot(
-        snapshot, artifact.content_hash
-    )
+    snapshot = snapshot.model_copy(update={"content_hash": snapshot_content_hash(snapshot)})
+    prepared = stores.compaction.save_prepared_snapshot(snapshot, artifact.content_hash)
     snapshot_message_id = stable_generated_message_id(
         task_id, f"snapshot-{prepared.version}", "compaction-snapshot"
     )
@@ -252,7 +192,7 @@ def migrate_legacy_context_state(
     )
     stores.compaction.activate_from_event(task_id, event)
     stores.compaction.record_migration(task_id, _MIGRATION_VERSION, event)
-    history = stores.history or HistoryRepository(stores.memory.database_path)
+    history = stores.history or stores.repositories.history
     history.record_compaction_outcome(
         task_id,
         event_id=event.event_id,
@@ -287,9 +227,7 @@ def _legacy_evidence(task_id: str, task: Any) -> DeterministicEvidenceBlock:
             exit_code=result.exit_code,
             summary=result.summary,
             tool_call_id=result.tool_call_id or f"legacy:{task_id}:test:{index}",
-            source_message_id=(
-                result.source_message_id or f"legacy:{task_id}:test-result:{index}"
-            ),
+            source_message_id=(result.source_message_id or f"legacy:{task_id}:test-result:{index}"),
         )
         for index, result in enumerate(task.test_results)
     ]

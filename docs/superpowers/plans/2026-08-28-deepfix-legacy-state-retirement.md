@@ -486,11 +486,11 @@ Do not continue until approved.
 - Modify: tests currently importing `WorkingMemoryStore` or calling `save_progress`
 - Add: retirement assertions in `tests/test_legacy_authority_retirement.py`
 
-- [ ] **Step 1: Add failing retirement tests.**
+- [x] **Step 1: Add failing retirement tests.**
 
 Assert the Agent tool list excludes `save_progress`; no production constructor accepts Working Memory; snapshot/context correctness survives three compactions; user constraints, rejected hypotheses, experiments, and real test results survive because they come from current repositories/history provenance rather than a memory summary.
 
-- [ ] **Step 2: Migrate unresolved legacy semantic fields.**
+- [x] **Step 2: Migrate unresolved legacy semantic fields.**
 
 Before removal, backfill:
 
@@ -504,15 +504,15 @@ Before removal, backfill:
 
 Validate counts, stable IDs, hashes, and provenance before setting the final Working Memory migration marker.
 
-- [ ] **Step 3: Remove public `save_progress`.**
+- [x] **Step 3: Remove public `save_progress`.**
 
 The model uses native `write_todos` for navigation and explicit domain tools such as `record_hypothesis` for semantic candidates. Deterministic Tool results continue to be collected from Receipts/Evidence automatically. Do not introduce a replacement catch-all tool.
 
-- [ ] **Step 4: Remove Working Memory from Snapshot/context schemas.**
+- [x] **Step 4: Remove Working Memory from Snapshot/context schemas.**
 
 Delete `WorkingMemoryVersion`, `ProgressSnapshot`, renderers, `working_memory_version`, and Working Memory provenance categories from current models. Historical parser compatibility belongs only in migration code and cannot be imported by runtime modules.
 
-- [ ] **Step 5: Delete `memory.py` after import search is clean.**
+- [x] **Step 5: Delete `memory.py` after import search is clean.**
 
 ```powershell
 rg -n "WorkingMemoryStore|WorkingMemoryVersion|ProgressSnapshot|save_progress|render_working_memory|working_memory_version" src/deepfix
@@ -520,14 +520,14 @@ rg -n "WorkingMemoryStore|WorkingMemoryVersion|ProgressSnapshot|save_progress|re
 
 Expected: no production runtime references. Migration-only literal field names are allowed only in `task_domain/legacy_payload.py` or `domain_repositories/migration.py` and must be documented inline.
 
-- [ ] **Step 6: Verify.**
+- [x] **Step 6: Verify.**
 
 ```powershell
 python -m pytest tests/test_legacy_authority_retirement.py tests/test_context.py tests/test_protected_context.py tests/compaction tests/navigation tests/investigation -q
 python -m ruff check src/deepfix tests/test_legacy_authority_retirement.py
 ```
 
-- [ ] **Step 7: Commit.**
+- [x] **Step 7: Commit.**
 
 ```powershell
 git add -A src/deepfix/memory.py src/deepfix/context.py src/deepfix/agent.py src/deepfix/compaction src/deepfix/domain_repositories/migration.py tests

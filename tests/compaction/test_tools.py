@@ -24,7 +24,6 @@ from deepfix.compaction.snapshot import CompactionSnapshotBuilder
 from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.tools import build_compact_conversation_tool
 from deepfix.domain_repositories.execution import ExecutionIntegrity
-from deepfix.memory import WorkingMemoryStore
 from deepfix.protected_context import ProtectedContext
 
 
@@ -122,7 +121,6 @@ def _coordinator(tmp_path, zone="normal_compaction", ratio=0.85, adapter=None):
         delta_generator=_Delta(),
         snapshot_builder=CompactionSnapshotBuilder(),
         snapshot_store=CompactionStore(database),
-        memory_store=WorkingMemoryStore(database),
         budget_monitor=_Budget(zone, ratio),
         protected_builder=_ProtectedBuilder(),
         model=object(),
@@ -152,9 +150,7 @@ def test_manual_below_threshold_returns_stable_noop_without_event(tmp_path):
     assert "_deepfix_compaction_event" not in command.update
     message = command.update["messages"][0]
     assert message.status == "success"
-    assert message.id == stable_generated_message_id(
-        "task-a", "compact-call-1", "manual_noop"
-    )
+    assert message.id == stable_generated_message_id("task-a", "compact-call-1", "manual_noop")
     assert runtime.state["messages"] == _messages()
 
 
@@ -167,9 +163,7 @@ def test_manual_success_returns_event_session_and_stable_tool_message(tmp_path):
     attempt_id = command.update["_deepfix_compaction_session_id"]
     message = command.update["messages"][0]
     assert message.status == "success"
-    assert message.id == stable_generated_message_id(
-        "task-a", attempt_id, "manual_success"
-    )
+    assert message.id == stable_generated_message_id("task-a", attempt_id, "manual_success")
 
 
 def test_async_manual_success_uses_async_artifact_and_delta_paths(tmp_path):

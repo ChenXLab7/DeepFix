@@ -8,7 +8,6 @@ from langgraph.types import Interrupt
 from deepfix.approval import ApprovalPolicy
 from deepfix.compaction.models import SystemTestEvidence
 from deepfix.config import ApprovalMode, load_config
-from deepfix.memory import WorkingMemoryStore
 from deepfix.models import RepairOutcome, TaskStatus
 from deepfix.models import TestResult as RepairTestResult
 from deepfix.research.store import ResearchEvidenceStore
@@ -68,12 +67,9 @@ def service_for(config, agent, *, repository=None, workspace=False):
         repository,
         ApprovalPolicy(config.approval_mode),
         config,
-        WorkingMemoryStore(config.database_path),
         ResearchEvidenceStore(config.database_path),
         workspace_factory=(
-            WorkspaceFactory(config.database_path.parent / "workspaces")
-            if workspace
-            else None
+            WorkspaceFactory(config.database_path.parent / "workspaces") if workspace else None
         ),
         verification_policy_store=VerificationPolicyStore(tasks=repository),
     )
@@ -157,8 +153,7 @@ def test_service_boundaries_update_business_lifecycle(config) -> None:
     failed_service = service_for(config, FakeAgent(RuntimeError("model failed")))
     failed = failed_service.start("触发失败")
     assert (
-        failed_service.repository.get_lifecycle(failed.task_id).status
-        is TaskLifecycleStatus.FAILED
+        failed_service.repository.get_lifecycle(failed.task_id).status is TaskLifecycleStatus.FAILED
     )
 
 
@@ -179,9 +174,7 @@ def test_legacy_phase_change_does_not_increment_business_lifecycle(config) -> No
 def test_completed_outcome_records_adjudication_with_evidence_ids(config) -> None:
     service = service_for(config, FakeAgent(no_response()), workspace=True)
     task = service.start("验证当前实现，运行 python -m pytest -q")
-    task.test_results = [
-        RepairTestResult("python -m pytest -q", 0, "1 passed")
-    ]
+    task.test_results = [RepairTestResult("python -m pytest -q", 0, "1 passed")]
     service.compaction_store.save_evidence(
         task.task_id,
         SystemTestEvidence(

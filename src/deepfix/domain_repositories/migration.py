@@ -16,13 +16,19 @@ from deepfix.compaction.models import (
     CompactionFailureRecord,
     CompactionSnapshot,
     DeepFixCompactionEvent,
+    DeterministicEvidenceBlock,
+    ExperimentRecord,
     FileChangeEvidence,
     HypothesisRecord,
+    ProvenancedClaim,
     ProvenancedText,
+    ProvenanceRef,
     ResearchStatusEvidence,
+    SnapshotCoverage,
     StrictModel,
     SystemTestEvidence,
 )
+from deepfix.compaction.snapshot import snapshot_content_hash
 from deepfix.database import SQLiteDatabase
 from deepfix.domain_repositories.evidence import (
     EvidenceKind,
@@ -57,7 +63,6 @@ from deepfix.investigation.receipts import (
     legacy_receipt_task_guard,
     receipt_task_segment,
 )
-from deepfix.memory import ProgressSnapshot
 from deepfix.operations import OperationJournalEntry
 from deepfix.research.models import ExternalEvidence, ResearchQuery, SearchCandidate
 
@@ -112,20 +117,163 @@ class DomainMigrator:
             database if isinstance(database, SQLiteDatabase) else SQLiteDatabase(database)
         )
         self.artifact_root = (
-            Path(artifact_root).expanduser().resolve()
-            if artifact_root is not None
-            else None
+            Path(artifact_root).expanduser().resolve() if artifact_root is not None else None
         )
         self.evidence = EvidenceRepository(
             self.database,
-            artifact_verifier=(
-                self._verify_artifact if self.artifact_root is not None else None
-            ),
+            artifact_verifier=(self._verify_artifact if self.artifact_root is not None else None),
         )
         self.investigation = InvestigationRepository(self.database)
         self.execution = ExecutionRepository(self.database)
         self.history = HistoryRepository(self.database)
         self._initialize_schema()
+
+    @_fenced_migration("working_memory")
+    def migrate_working_memory(self, task_id: str) -> DomainMigrationReport:
+        """One-way migration from the retired catch-all memory table."""
+        task_id = _required(task_id, "task_id")
+        existing = self._load_report("working_memory", task_id)
+        if existing is not None:
+            return existing
+        rows = self._legacy_working_memory_rows(task_id)
+        expected: list[tuple[str, str, str]] = []
+        missing_references: list[str] = []
+        existing_versions = [item.version for item in self.history.list_for_task(task_id)]
+        next_version = max(existing_versions, default=0) + 1
+        for ordinal, (legacy_version, payload, created_at) in enumerate(rows):
+            value = json.loads(payload)
+            provenance = ProvenanceRef(
+                kind="snapshot_record",
+                ref_id=f"legacy-memory:{legacy_version}",
+            )
+            facts = [_legacy_claim(item, legacy_version) for item in value.get("facts", [])]
+            hypotheses = [
+                _legacy_hypothesis_record(item, state, legacy_version)
+                for field_name, state in (
+                    ("active_hypotheses", "active"),
+                    ("rejected_hypotheses", "rejected"),
+                    ("confirmed_hypotheses", "confirmed"),
+                )
+                for item in value.get(field_name, [])
+            ]
+            questions = [
+                ProvenancedText(text=str(item), sources=[provenance])
+                for item in value.get("unresolved_questions", [])
+                if str(item).strip()
+            ]
+            experiments = [
+                ExperimentRecord(
+                    experiment_id=_stable_legacy_id(
+                        "experiment", task_id, str(legacy_version), str(item)
+                    ),
+                    purpose=str(item),
+                    action=str(item),
+                    result=str(item),
+                    sources=[provenance],
+                )
+                for item in value.get("experiments", [])
+                if str(item).strip()
+            ]
+            for claim in facts:
+                self.evidence.record_semantic_candidate(
+                    task_id,
+                    claim,
+                    provenance_root_ids=[provenance.ref_id],
+                )
+            for item in hypotheses:
+                imported = InvestigationHypothesis(
+                    hypothesis_id=item.hypothesis_id,
+                    statement=item.text,
+                    state={
+                        "active": "candidate",
+                        "rejected": "rejected",
+                        "confirmed": "supported",
+                    }[item.state],
+                    evidence_ids=[
+                        source.ref_id for source in item.sources if source.kind == "system_evidence"
+                    ],
+                    checked_locations=[],
+                    reason=item.reason or "legacy working memory",
+                    reopens_hypothesis_id=item.reopens_hypothesis_id,
+                )
+                missing = self.investigation.missing_current_evidence_ids(
+                    task_id, imported.evidence_ids
+                )
+                if missing:
+                    missing_references.extend(
+                        f"hypothesis:{imported.hypothesis_id}:evidence:{evidence_id}"
+                        for evidence_id in missing
+                    )
+                else:
+                    self.investigation.backfill_current_hypothesis(task_id, imported)
+            for item in questions:
+                self.investigation.open_question(
+                    UnresolvedQuestion(
+                        question_id=stable_question_id(task_id, item.text),
+                        task_id=task_id,
+                        text=item.text,
+                        status="open",
+                        source_ids=[provenance.ref_id],
+                        created_at=created_at,
+                    )
+                )
+            snapshot = CompactionSnapshot(
+                task_id=task_id,
+                version=next_version + ordinal,
+                previous_version=(next_version + ordinal - 1 if ordinal else None),
+                lifecycle="prepared",
+                created_at=created_at,
+                source_work_unit_ids=[],
+                coverage=SnapshotCoverage(),
+                task_goal=str(value.get("summary", "legacy memory history")),
+                user_constraints=[],
+                confirmed_facts=facts,
+                deterministic_evidence=DeterministicEvidenceBlock(),
+                active_hypotheses=[item for item in hypotheses if item.state == "active"],
+                rejected_hypotheses=[item for item in hypotheses if item.state == "rejected"],
+                confirmed_hypotheses=[item for item in hypotheses if item.state == "confirmed"],
+                changed_files=[],
+                experiments=experiments,
+                test_results=[],
+                conflicts=[],
+                unresolved_questions=questions,
+                next_steps=[],
+                artifact_references=[],
+                content_hash="pending",
+            )
+            snapshot = snapshot.model_copy(update={"content_hash": snapshot_content_hash(snapshot)})
+            record = history_record_from_snapshot(
+                snapshot,
+                input_hash=_canonical_hash(value),
+            )
+            self.history.backfill(record)
+            expected.extend(
+                (item.kind, item.item_id, _canonical_payload(item.payload))
+                for item in record.semantic_items
+                if item.kind != "next_step"
+            )
+        target = [
+            (item.kind, item.item_id, _canonical_payload(item.payload))
+            for record in self.history.list_for_task(task_id)
+            if record.version >= next_version
+            for item in record.semantic_items
+            if item.kind != "next_step"
+        ]
+        source = sorted(expected)
+        target = sorted(target)
+        report = DomainMigrationReport(
+            domain="working_memory",
+            task_id=task_id,
+            source_count=len(source),
+            target_count=len(target),
+            source_hash=_canonical_hash(source),
+            target_hash=_canonical_hash(target),
+            missing_references=sorted(set(missing_references)),
+            ready_to_switch=source == target and not missing_references,
+        )
+        if report.ready_to_switch:
+            self._save_report(report)
+        return report
 
     @_fenced_migration("context_telemetry")
     def migrate_context_telemetry(self, task_id: str) -> DomainMigrationReport:
@@ -139,23 +287,13 @@ class DomainMigrator:
             telemetry = ContextTelemetry(
                 task_id=task_id,
                 context_peak_tokens=int(legacy_payload.get("context_peak_tokens", 0)),
-                context_overflow_count=int(
-                    legacy_payload.get("context_overflow_count", 0)
-                ),
-                active_compaction_count=int(
-                    legacy_payload.get("active_compaction_count", 0)
-                ),
+                context_overflow_count=int(legacy_payload.get("context_overflow_count", 0)),
+                active_compaction_count=int(legacy_payload.get("active_compaction_count", 0)),
                 latest_usage_ratio=float(legacy_payload.get("latest_usage_ratio", 0.0)),
                 latest_budget_zone=legacy_payload.get("latest_budget_zone"),
-                normal_compaction_count=int(
-                    legacy_payload.get("normal_compaction_count", 0)
-                ),
-                emergency_compaction_count=int(
-                    legacy_payload.get("emergency_compaction_count", 0)
-                ),
-                compaction_failure_count=int(
-                    legacy_payload.get("compaction_failure_count", 0)
-                ),
+                normal_compaction_count=int(legacy_payload.get("normal_compaction_count", 0)),
+                emergency_compaction_count=int(legacy_payload.get("emergency_compaction_count", 0)),
+                compaction_failure_count=int(legacy_payload.get("compaction_failure_count", 0)),
                 normal_zone_passthrough_count=int(
                     legacy_payload.get("normal_zone_passthrough_count", 0)
                 ),
@@ -163,9 +301,7 @@ class DomainMigrator:
                     legacy_payload.get("manual_compaction_error_count", 0)
                 ),
                 overflow_retry_count=int(legacy_payload.get("overflow_retry_count", 0)),
-                active_snapshot_version=legacy_payload.get(
-                    "active_compaction_snapshot_version"
-                ),
+                active_snapshot_version=legacy_payload.get("active_compaction_snapshot_version"),
                 last_compaction_artifact=legacy_payload.get("last_compaction_artifact"),
                 last_compaction_error=legacy_payload.get("last_compaction_error"),
                 last_compaction_at=legacy_payload.get("last_compaction_at"),
@@ -233,12 +369,10 @@ class DomainMigrator:
             if source_by_id[evidence_id] != target_by_id[evidence_id]
         )
         source_projection = [
-            (evidence_id, source_by_id[evidence_id])
-            for evidence_id in sorted(source_by_id)
+            (evidence_id, source_by_id[evidence_id]) for evidence_id in sorted(source_by_id)
         ]
         target_projection = [
-            (evidence_id, target_by_id[evidence_id])
-            for evidence_id in sorted(target_by_id)
+            (evidence_id, target_by_id[evidence_id]) for evidence_id in sorted(target_by_id)
         ]
         report = DomainMigrationReport(
             domain="deterministic_evidence",
@@ -251,9 +385,7 @@ class DomainMigrator:
             hash_mismatches=hash_mismatches,
             missing_references=[],
             ready_to_switch=(
-                len(source) == len(target)
-                and not identity_mismatches
-                and not hash_mismatches
+                len(source) == len(target) and not identity_mismatches and not hash_mismatches
             ),
         )
         if report.ready_to_switch:
@@ -333,12 +465,10 @@ class DomainMigrator:
         source_ids = {f"{kind}:{identity}" for kind, identity, _ in source_projection}
         target_ids = {f"{kind}:{identity}" for kind, identity, _ in target_projection}
         source_payloads = {
-            f"{kind}:{identity}": payload
-            for kind, identity, payload in source_projection
+            f"{kind}:{identity}": payload for kind, identity, payload in source_projection
         }
         target_payloads = {
-            f"{kind}:{identity}": payload
-            for kind, identity, payload in target_projection
+            f"{kind}:{identity}": payload for kind, identity, payload in target_projection
         }
         identity_mismatches = sorted(source_ids ^ target_ids)
         hash_mismatches = sorted(
@@ -390,12 +520,9 @@ class DomainMigrator:
                 continue
             self.investigation.backfill_current_hypothesis(task_id, hypothesis)
 
-        historical_hypotheses, historical_questions = self._historical_investigation(
-            task_id
-        )
-        current_by_id = {
-            item.hypothesis_id: item for item in current_hypotheses
-        }
+        historical_hypotheses, historical_questions = self._historical_investigation(task_id)
+        source_hypotheses = list(current_hypotheses)
+        current_by_id = {item.hypothesis_id: item for item in current_hypotheses}
         for historical, source_id in historical_hypotheses:
             current = current_by_id.get(historical.hypothesis_id)
             if current is not None and current.statement != historical.text:
@@ -406,6 +533,37 @@ class DomainMigrator:
                     historical_statement=historical.text,
                     source_id=source_id,
                 )
+                continue
+            if current is not None:
+                continue
+            evidence_ids = [
+                source.ref_id for source in historical.sources if source.kind == "system_evidence"
+            ]
+            missing = self.investigation.missing_current_evidence_ids(
+                task_id,
+                evidence_ids,
+            )
+            if missing:
+                missing_references.extend(
+                    f"hypothesis:{historical.hypothesis_id}:evidence:{item}" for item in missing
+                )
+                continue
+            imported = InvestigationHypothesis(
+                hypothesis_id=historical.hypothesis_id,
+                statement=historical.text,
+                state={
+                    "active": "candidate",
+                    "rejected": "rejected",
+                    "confirmed": "supported",
+                }[historical.state],
+                evidence_ids=evidence_ids,
+                checked_locations=[],
+                reason=historical.reason or f"legacy semantic record: {source_id}",
+                reopens_hypothesis_id=historical.reopens_hypothesis_id,
+            )
+            self.investigation.backfill_current_hypothesis(task_id, imported)
+            current_by_id[imported.hypothesis_id] = imported
+            source_hypotheses.append(imported)
 
         source_questions = [
             UnresolvedQuestion(
@@ -423,7 +581,7 @@ class DomainMigrator:
             self.investigation.open_question(question)
 
         source_projection = _investigation_projection(
-            current_hypotheses,
+            source_hypotheses,
             source_questions,
         )
         target_projection = _investigation_projection(
@@ -433,12 +591,10 @@ class DomainMigrator:
         source_ids = {f"{kind}:{identity}" for kind, identity, _ in source_projection}
         target_ids = {f"{kind}:{identity}" for kind, identity, _ in target_projection}
         source_payloads = {
-            f"{kind}:{identity}": payload
-            for kind, identity, payload in source_projection
+            f"{kind}:{identity}": payload for kind, identity, payload in source_projection
         }
         target_payloads = {
-            f"{kind}:{identity}": payload
-            for kind, identity, payload in target_projection
+            f"{kind}:{identity}": payload for kind, identity, payload in target_projection
         }
         identity_mismatches = sorted(source_ids ^ target_ids)
         hash_mismatches = sorted(
@@ -510,12 +666,8 @@ class DomainMigrator:
             ],
             self.execution.list_approvals(task_id),
         )
-        source_by_id = {
-            f"{kind}:{identity}": payload for kind, identity, payload in source
-        }
-        target_by_id = {
-            f"{kind}:{identity}": payload for kind, identity, payload in target
-        }
+        source_by_id = {f"{kind}:{identity}": payload for kind, identity, payload in source}
+        target_by_id = {f"{kind}:{identity}": payload for kind, identity, payload in target}
         source_ids = set(source_by_id)
         target_ids = set(target_by_id)
         identity_mismatches = sorted(source_ids ^ target_ids)
@@ -563,8 +715,7 @@ class DomainMigrator:
             invalid_references = [
                 reference.path
                 for reference in record.artifact_references
-                if self.artifact_root is not None
-                and not self._verify_artifact(reference)
+                if self.artifact_root is not None and not self._verify_artifact(reference)
             ]
             if invalid_references:
                 missing_references.extend(invalid_references)
@@ -584,12 +735,8 @@ class DomainMigrator:
         target_event = self.history.migrated_event(task_id)
         source = _history_projection(source_records, failures, migration_event)
         target = _history_projection(target_records, target_failures, target_event)
-        source_by_id = {
-            f"{kind}:{identity}": payload for kind, identity, payload in source
-        }
-        target_by_id = {
-            f"{kind}:{identity}": payload for kind, identity, payload in target
-        }
+        source_by_id = {f"{kind}:{identity}": payload for kind, identity, payload in source}
+        target_by_id = {f"{kind}:{identity}": payload for kind, identity, payload in target}
         source_ids = set(source_by_id)
         target_ids = set(target_by_id)
         identity_mismatches = sorted(source_ids ^ target_ids)
@@ -638,6 +785,31 @@ class DomainMigrator:
                 (task_id,),
             ).fetchall()
         return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
+
+    def _legacy_working_memory_rows(
+        self,
+        task_id: str,
+    ) -> list[tuple[int, str, str]]:
+        """Migration-only SQL reader; runtime code never imports memory models."""
+        with self.database.connection() as connection:
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'working_memory'
+                """
+            ).fetchone()
+            rows = (
+                []
+                if table is None
+                else connection.execute(
+                    """
+                    SELECT version, payload, created_at FROM working_memory
+                    WHERE task_id = ? ORDER BY version
+                    """,
+                    (task_id,),
+                ).fetchall()
+            )
+        return [(int(row[0]), str(row[1]), str(row[2])) for row in rows]
 
     def _legacy_context_telemetry(self, task_id: str) -> dict[str, object] | None:
         with self.database.connection() as connection:
@@ -710,10 +882,7 @@ class DomainMigrator:
                 (str(row[0]), CompactionSnapshot.model_validate_json(str(row[1])))
                 for row in snapshot_rows
             ],
-            [
-                CompactionFailureRecord.model_validate_json(str(row[0]))
-                for row in failure_rows
-            ],
+            [CompactionFailureRecord.model_validate_json(str(row[0])) for row in failure_rows],
             (
                 None
                 if migration_row is None
@@ -778,11 +947,7 @@ class DomainMigrator:
                     (task_id,),
                 ).fetchone()
             )
-        return (
-            None
-            if row is None
-            else InvestigationState.model_validate_json(str(row[0]))
-        )
+        return None if row is None else InvestigationState.model_validate_json(str(row[0]))
 
     def _legacy_operations(self, task_id: str) -> list[OperationJournalEntry]:
         with self.database.connection() as connection:
@@ -808,11 +973,7 @@ class DomainMigrator:
     def _legacy_receipts(self, task_id: str) -> list[ToolExecutionReceipt]:
         if self.artifact_root is None:
             return []
-        directory = (
-            self.artifact_root
-            / "investigation_receipts"
-            / receipt_task_segment(task_id)
-        )
+        directory = self.artifact_root / "investigation_receipts" / receipt_task_segment(task_id)
         if not directory.is_dir():
             return []
         return [
@@ -928,9 +1089,9 @@ class DomainMigrator:
                 hypotheses.append((item, source_id))
             for raw in snapshot.get("unresolved_questions", []):
                 item = ProvenancedText.model_validate(raw)
-                source_ids = [
-                    f"{source.kind}:{source.ref_id}" for source in item.sources
-                ] or [f"snapshot:{version}"]
+                source_ids = [f"{source.kind}:{source.ref_id}" for source in item.sources] or [
+                    f"snapshot:{version}"
+                ]
                 _merge_historical_question(
                     questions,
                     item.text,
@@ -953,23 +1114,32 @@ class DomainMigrator:
                     _merge_historical_question(
                         questions,
                         item.text,
-                        semantic.provenance_root_ids
-                        or [f"history:{record.version}"],
+                        semantic.provenance_root_ids or [f"history:{record.version}"],
                         record.created_at,
                     )
 
         for version, payload, created_at in memory_rows:
-            memory = ProgressSnapshot.model_validate_json(str(payload))
-            for item in memory.unresolved_questions:
+            memory = json.loads(str(payload))
+            for field_name, state in (
+                ("active_hypotheses", "active"),
+                ("rejected_hypotheses", "rejected"),
+                ("confirmed_hypotheses", "confirmed"),
+            ):
+                for raw in memory.get(field_name, []):
+                    item = _legacy_hypothesis_record(raw, state, int(version))
+                    hypotheses.append((item, f"working_memory:{version}"))
+            for item in memory.get("unresolved_questions", []):
+                text = str(item).strip()
+                if not text:
+                    continue
                 _merge_historical_question(
                     questions,
-                    item,
+                    text,
                     [f"working_memory:{version}"],
                     str(created_at),
                 )
         unique_hypotheses = {
-            (item.hypothesis_id, source_id): (item, source_id)
-            for item, source_id in hypotheses
+            (item.hypothesis_id, source_id): (item, source_id) for item, source_id in hypotheses
         }
         return list(unique_hypotheses.values()), list(questions.values())
 
@@ -979,9 +1149,7 @@ class DomainMigrator:
         prefix = "/.deepfix-artifacts/"
         if not virtual_path.startswith(prefix):
             return None
-        candidate = (
-            self.artifact_root / Path(virtual_path.removeprefix(prefix))
-        ).resolve()
+        candidate = (self.artifact_root / Path(virtual_path.removeprefix(prefix))).resolve()
         try:
             candidate.relative_to(self.artifact_root)
         except ValueError:
@@ -1032,9 +1200,7 @@ class DomainMigrator:
         )
         with ExitStack() as stack:
             if receipt_root is not None:
-                stack.enter_context(
-                    legacy_receipt_task_guard(receipt_root, normalized_task_id)
-                )
+                stack.enter_context(legacy_receipt_task_guard(receipt_root, normalized_task_id))
             try:
                 with self.database.unit_of_work(immediate=True) as connection:
                     existing = connection.execute(
@@ -1169,9 +1335,7 @@ def switched_domains_for_task(
     switched = set(domains) & stored
     if stored & {"evidence", "deterministic_evidence"}:
         switched.update(
-            domain
-            for domain in domains
-            if domain in {"evidence", "deterministic_evidence"}
+            domain for domain in domains if domain in {"evidence", "deterministic_evidence"}
         )
     return frozenset(switched)
 
@@ -1355,6 +1519,87 @@ def _historical_hypothesis_source(
         return default
     source = item.sources[0]
     return f"{source.kind}:{source.ref_id}"
+
+
+def _legacy_hypothesis_record(
+    raw: object,
+    state: str,
+    version: int,
+) -> HypothesisRecord:
+    """Migration-only parser for retired Working Memory hypothesis payloads."""
+    if isinstance(raw, str):
+        text = raw.strip()
+        identity = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+        return HypothesisRecord(
+            hypothesis_id=f"legacy_hyp_{identity}",
+            text=text,
+            state=state,
+            reason=("legacy working memory" if state != "active" else None),
+            sources=[
+                ProvenanceRef(
+                    kind="snapshot_record",
+                    ref_id=f"legacy-memory:{version}",
+                )
+            ],
+            updated_in_version=max(version, 1),
+        )
+    payload = dict(raw) if isinstance(raw, dict) else {}
+    payload.setdefault("state", state)
+    payload.setdefault("updated_in_version", max(version, 1))
+    payload["sources"] = [
+        {
+            "kind": (
+                "snapshot_record" if item.get("kind") == "working_memory" else item.get("kind")
+            ),
+            "ref_id": item.get("ref_id"),
+        }
+        for item in payload.get("sources", [])
+        if isinstance(item, dict) and item.get("ref_id")
+    ] or [
+        {
+            "kind": "snapshot_record",
+            "ref_id": f"legacy-memory:{version}",
+        }
+    ]
+    return HypothesisRecord.model_validate(payload)
+
+
+def _legacy_claim(raw: object, version: int) -> ProvenancedClaim:
+    """Migration-only parser for retired Working Memory fact payloads."""
+    if isinstance(raw, str):
+        text = raw.strip()
+        return ProvenancedClaim(
+            claim_id=_stable_legacy_id("claim", text),
+            text=text,
+            sources=[
+                ProvenanceRef(
+                    kind="snapshot_record",
+                    ref_id=f"legacy-memory:{version}",
+                )
+            ],
+        )
+    payload = dict(raw) if isinstance(raw, dict) else {}
+    payload["sources"] = [
+        {
+            "kind": (
+                "snapshot_record" if item.get("kind") == "working_memory" else item.get("kind")
+            ),
+            "ref_id": item.get("ref_id"),
+        }
+        for item in payload.get("sources", [])
+        if isinstance(item, dict) and item.get("ref_id")
+    ] or [
+        {
+            "kind": "snapshot_record",
+            "ref_id": f"legacy-memory:{version}",
+        }
+    ]
+    return ProvenancedClaim.model_validate(payload)
+
+
+def _stable_legacy_id(prefix: str, *parts: str) -> str:
+    material = "\0".join((prefix, *parts))
+    return f"legacy_{prefix}_{hashlib.sha256(material.encode('utf-8')).hexdigest()[:32]}"
 
 
 def _normalize_text(value: str) -> str:

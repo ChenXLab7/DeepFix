@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -8,12 +9,13 @@ from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 from langgraph.runtime import ExecutionInfo, Runtime
 
 from deepfix.compaction.store import CompactionStore
+from deepfix.database import SQLiteDatabase
+from deepfix.domain_repositories.migration import DomainMigrator
 from deepfix.investigation.migration import (
     InvestigationMigrationMiddleware,
     InvestigationMigrator,
 )
 from deepfix.investigation.store import InvestigationStore
-from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
 from deepfix.models import TaskState, TaskStatus
 from deepfix.persistence import TaskRepository
 
@@ -37,30 +39,57 @@ def _migrator_fixture(
             status=status,
         )
     )
-    memory = WorkingMemoryStore(database)
     if memory_phase is not None:
-        memory.save(
-            "task-a",
-            ProgressSnapshot(
-                phase=memory_phase,
-                summary="legacy memory",
-                facts=[],
-                evidence=[],
-                active_hypotheses=(
-                    [] if active_hypothesis is None else [active_hypothesis]
-                ),
-                rejected_hypotheses=[],
-                checked_files=[],
-                experiments=[],
-                next_steps=[],
-                unresolved_questions=[],
+        sqlite = SQLiteDatabase(database)
+        payload = {
+            "phase": memory_phase,
+            "summary": "legacy memory",
+            "facts": [],
+            "evidence": [],
+            "active_hypotheses": (
+                []
+                if active_hypothesis is None
+                else [
+                    {
+                        "hypothesis_id": "hyp-legacy",
+                        "text": active_hypothesis,
+                        "state": "active",
+                        "reason": "legacy candidate",
+                        "sources": [],
+                        "updated_in_version": 1,
+                    }
+                ]
             ),
-        )
+            "rejected_hypotheses": [],
+            "confirmed_hypotheses": [],
+            "checked_files": [],
+            "experiments": [],
+            "next_steps": [],
+            "unresolved_questions": [],
+            "coverage": {"covered_message_ids": [], "covered_work_unit_ids": []},
+        }
+        with sqlite.unit_of_work() as connection:
+            connection.execute(
+                """
+                CREATE TABLE working_memory (
+                    task_id TEXT NOT NULL, version INTEGER NOT NULL,
+                    payload TEXT NOT NULL, created_at TEXT NOT NULL,
+                    PRIMARY KEY(task_id, version)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO working_memory(task_id, version, payload, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                ("task-a", 1, json.dumps(payload), "2026-08-31T00:00:00+00:00"),
+            )
+        assert DomainMigrator(sqlite).migrate_working_memory("task-a").ready_to_switch
     return InvestigationMigrator(
         tasks=tasks,
         store=InvestigationStore(database),
         compaction_store=CompactionStore(database),
-        memory=memory,
     )
 
 
@@ -74,9 +103,7 @@ def _tool_pair(
         AIMessage(
             id=f"ai-{call_id}",
             content="",
-            tool_calls=[
-                {"name": name, "id": call_id, "args": args, "type": "tool_call"}
-            ],
+            tool_calls=[{"name": name, "id": call_id, "args": args, "type": "tool_call"}],
         ),
         ToolMessage(
             id=f"tool-{call_id}",
@@ -137,7 +164,7 @@ def test_legacy_messages_migrate_durable_evidence_without_phase(
     assert "agent_phase" not in type(state).model_fields
 
 
-def test_working_memory_phase_and_unproven_hypothesis_do_not_unlock_editing(
+def test_legacy_hypothesis_moves_to_domain_store_without_unlocking_runtime_state(
     tmp_path: Path,
 ) -> None:
     migrator = _migrator_fixture(
@@ -150,7 +177,9 @@ def test_working_memory_phase_and_unproven_hypothesis_do_not_unlock_editing(
     state = migrator.migrate("task-a", [])
 
     assert state.supported_hypothesis_ids == []
-    assert [(item.statement, item.state) for item in state.hypotheses] == [
+    assert state.hypotheses == []
+    repository = DomainMigrator(SQLiteDatabase(tmp_path / "deepfix.sqlite3")).investigation
+    assert [(item.statement, item.state) for item in repository.list_hypotheses("task-a")] == [
         ("maybe cache", "candidate")
     ]
 
@@ -188,9 +217,7 @@ def test_migration_replay_is_idempotent(tmp_path: Path) -> None:
     second = migrator.migrate("task-a", _pytest_pair(1))
 
     assert second == first
-    assert [
-        item.event_id for item in migrator.store.list_events("task-a")
-    ] == event_ids
+    assert [item.event_id for item in migrator.store.list_events("task-a")] == event_ids
 
 
 def test_middleware_migrates_using_runtime_task_id(tmp_path: Path) -> None:

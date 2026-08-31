@@ -16,13 +16,11 @@ from deepfix.investigation.classification import is_pytest_verification
 from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.models import (
     InvestigationEventType,
-    InvestigationHypothesis,
     InvestigationState,
     NewInvestigationEvent,
     ProgressKind,
 )
 from deepfix.investigation.store import InvestigationStore
-from deepfix.memory import WorkingMemoryStore
 from deepfix.persistence import TaskRepository
 
 _FILE_OPERATIONS = {
@@ -51,12 +49,10 @@ class InvestigationMigrator:
         tasks: TaskRepository,
         store: InvestigationStore,
         compaction_store: CompactionStore,
-        memory: WorkingMemoryStore,
     ) -> None:
         self.tasks = tasks
         self.store = store
         self.compaction_store = compaction_store
-        self.memory = memory
 
     def migrate(
         self,
@@ -78,11 +74,7 @@ class InvestigationMigrator:
             task.project_python,
             self.compaction_store,
         )
-        hypotheses = _working_memory_candidates(
-            normalized_task_id,
-            self.memory,
-            existing.hypotheses if existing is not None else [],
-        )
+        hypotheses = existing.hypotheses if existing is not None else []
         state = (existing or InvestigationState.new(normalized_task_id)).model_copy(
             update={
                 "hypotheses": hypotheses,
@@ -143,8 +135,7 @@ def _durable_observations(
     evidence_by_call = {
         item.tool_call_id: item
         for item in compaction_store.list_evidence(task_id)
-        if isinstance(item, (SystemTestEvidence, FileChangeEvidence))
-        and item.tool_call_id
+        if isinstance(item, (SystemTestEvidence, FileChangeEvidence)) and item.tool_call_id
     }
     observations: list[tuple[int, _LegacyObservation]] = []
     for call_id, call_items in calls.items():
@@ -220,33 +211,6 @@ def _observation_from_pair(
         evidence_id=evidence_id,
         path=path.strip(),
     )
-
-
-def _working_memory_candidates(
-    task_id: str,
-    memory: WorkingMemoryStore,
-    existing: Sequence[InvestigationHypothesis],
-) -> list[InvestigationHypothesis]:
-    candidates = {item.hypothesis_id: item for item in existing}
-    latest = memory.latest(task_id)
-    if latest is None:
-        return list(candidates.values())
-    for item in latest.snapshot.active_hypotheses:
-        hypothesis_id = stable_investigation_id(
-            "hyp", task_id, "legacy-working-memory", item.hypothesis_id, item.text
-        )
-        candidates.setdefault(
-            hypothesis_id,
-            InvestigationHypothesis(
-                hypothesis_id=hypothesis_id,
-                statement=item.text,
-                state="candidate",
-                evidence_ids=[],
-                checked_locations=[],
-                reason="legacy Working Memory candidate; unverified",
-            ),
-        )
-    return list(candidates.values())
 
 
 def _test_evidence_ids(

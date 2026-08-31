@@ -27,8 +27,14 @@ from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import InvestigationCoordinationError
 from deepfix.investigation.models import InvestigationRecoveryMetadata
 from deepfix.investigation.receipts import receipt_task_segment
-from deepfix.memory import WorkingMemoryStore
-from deepfix.models import ApprovalRecord, RepairOutcome, TaskState, TaskStatus, TestResult
+from deepfix.models import (
+    ApprovalRecord,
+    ContextMetrics,
+    RepairOutcome,
+    TaskState,
+    TaskStatus,
+    TestResult,
+)
 from deepfix.operations import OperationReconciler
 from deepfix.persistence import TaskRepository
 from deepfix.research.store import ResearchEvidenceStore
@@ -50,7 +56,6 @@ class BugfixService:
         repository: TaskRepository,
         policy: ApprovalPolicy,
         config: AppConfig,
-        working_memory_store: WorkingMemoryStore,
         research_evidence_store: ResearchEvidenceStore,
         compaction_store: CompactionStore | None = None,
         investigation: InvestigationCoordinator | None = None,
@@ -65,7 +70,6 @@ class BugfixService:
         self.repository = repository
         self.policy = policy
         self.config = config
-        self.working_memory_store = working_memory_store
         self.research_evidence_store = research_evidence_store
         self.repositories = repositories or DomainRepositories.create(repository.database)
         self.compaction_store = compaction_store or CompactionStore(
@@ -624,6 +628,7 @@ class BugfixService:
             ("investigation", self.domain_migrator.migrate_investigation),
             ("execution", self.domain_migrator.migrate_execution),
             ("history", self.domain_migrator.migrate_history),
+            ("working_memory", self.domain_migrator.migrate_working_memory),
         )
         for domain, migrate in migrations:
             try:
@@ -679,9 +684,7 @@ class BugfixService:
                     task.verification_policy_version,
                 ),
                 verification=verification,
-                execution_integrity=self.repositories.execution.integrity_view(
-                    task.task_id
-                ),
+                execution_integrity=self.repositories.execution.integrity_view(task.task_id),
                 successful_change_evidence_ids=[
                     item.evidence_id
                     for item in verification.file_change_evidence
@@ -689,9 +692,7 @@ class BugfixService:
                 ],
                 scope_violation_evidence_ids=[],
                 reproduction_state=(
-                    "not_reproduced"
-                    if task.resolution == "not_reproduced"
-                    else "reproduced"
+                    "not_reproduced" if task.resolution == "not_reproduced" else "reproduced"
                 ),
             )
         )
@@ -729,24 +730,6 @@ class BugfixService:
             return
 
     def _sync_context(self, task: TaskState) -> None:
-        latest = self.working_memory_store.latest(task.task_id)
-        if latest is not None:
-            task.working_memory_version = latest.version
-            evidence_keys = {(item.source, item.observation) for item in task.evidence}
-            for item in latest.snapshot.evidence:
-                key = (item.source, item.observation)
-                if key not in evidence_keys:
-                    task.evidence.append(item)
-                    evidence_keys.add(key)
-            task.hypotheses = list(
-                dict.fromkeys(
-                    [
-                        *task.hypotheses,
-                        *(item.text for item in latest.snapshot.active_hypotheses),
-                    ]
-                )
-            )
-
         deterministic_evidence = self.compaction_store.list_evidence(task.task_id)
         successful_changed_files: list[str] = []
         changed_files: list[str] = []
@@ -808,7 +791,24 @@ class BugfixService:
                 for item in self.repositories.execution.list_incomplete(task.task_id)
             ]
 
-        task.context_metrics = self.working_memory_store.metrics(task.task_id)
+        telemetry = self.repositories.history.context_telemetry(task.task_id)
+        task.context_metrics = ContextMetrics(
+            context_peak_tokens=telemetry.context_peak_tokens,
+            context_overflow_count=telemetry.context_overflow_count,
+            active_compaction_count=telemetry.active_compaction_count,
+            last_compaction_at=telemetry.last_compaction_at,
+            latest_usage_ratio=telemetry.latest_usage_ratio,
+            latest_budget_zone=telemetry.latest_budget_zone,
+            normal_compaction_count=telemetry.normal_compaction_count,
+            emergency_compaction_count=telemetry.emergency_compaction_count,
+            compaction_failure_count=telemetry.compaction_failure_count,
+            normal_zone_passthrough_count=telemetry.normal_zone_passthrough_count,
+            manual_compaction_error_count=telemetry.manual_compaction_error_count,
+            overflow_retry_count=telemetry.overflow_retry_count,
+            active_compaction_snapshot_version=telemetry.active_snapshot_version,
+            last_compaction_artifact=telemetry.last_compaction_artifact,
+            last_compaction_error=telemetry.last_compaction_error,
+        )
         external_evidence = self.research_evidence_store.list_evidence(task.task_id)
         task.external_evidence_ids = [item.evidence_id for item in external_evidence]
         query_count, provider_errors = self.research_evidence_store.query_summary(task.task_id)

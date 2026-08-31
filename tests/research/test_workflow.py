@@ -17,7 +17,6 @@ from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.store import InvestigationStore
-from deepfix.memory import WorkingMemoryStore
 from deepfix.models import Evidence, RepairOutcome, TaskStatus
 from deepfix.persistence import TaskRepository
 from deepfix.reporting import render_report
@@ -121,8 +120,7 @@ def test_offline_research_evidence_workflow_is_task_local_and_cannot_bypass_test
     requirements.write_text("pydantic>=2,<3\n", encoding="utf-8")
     smoke_test.write_text("def test_smoke():\n    assert 2 + 2 == 4\n", encoding="utf-8")
     original_project_files = {
-        path.name: path.read_text(encoding="utf-8")
-        for path in (requirements, smoke_test)
+        path.name: path.read_text(encoding="utf-8") for path in (requirements, smoke_test)
     }
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "offline-test-key")
@@ -141,14 +139,12 @@ def test_offline_research_evidence_workflow_is_task_local_and_cannot_bypass_test
         compaction_store=compaction_store,
         evidence_collector=EvidenceCollector(compaction_store, research_store),
     )
-    working_memory = WorkingMemoryStore(config.database_path)
     backend = build_backend(config)
     service = BugfixService(
         _FakeAgent(_outcome("needs_input"), _outcome("completed")),
         repository,
         ApprovalPolicy(config.approval_mode),
         config,
-        working_memory,
         research_store,
         compaction_store,
         investigation,
@@ -304,17 +300,14 @@ def test_offline_research_evidence_workflow_is_task_local_and_cannot_bypass_test
         "unverified",
     }
     for item in evidence:
-        artifact = config.artifacts_path / item.artifact_path.removeprefix(
-            "/.deepfix-artifacts/"
-        )
+        artifact = config.artifacts_path / item.artifact_path.removeprefix("/.deepfix-artifacts/")
         assert artifact.is_file()
         marker = urlsplit(item.url).path.strip("/").replace("/", "-") or "home"
         assert f"FULL-BODY-ONLY-{marker}" in artifact.read_text(encoding="utf-8")
         assert f"FULL-BODY-ONLY-{marker}" not in item.model_dump_json()
 
     assert original_project_files == {
-        path.name: path.read_text(encoding="utf-8")
-        for path in (requirements, smoke_test)
+        path.name: path.read_text(encoding="utf-8") for path in (requirements, smoke_test)
     }
     assert all(
         "FULL-BODY-ONLY" not in path.read_text(encoding="utf-8")
@@ -326,9 +319,7 @@ def test_offline_research_evidence_workflow_is_task_local_and_cannot_bypass_test
     assert continued.final_summary == "缺少通过的测试证据，不能标记为完成"
     assert set(continued.external_evidence_ids) == set(fetched_ids.values())
     assert continued.research_query_count == 1
-    assert continued.research_provider_errors == [
-        "github_discussions: GITHUB_TOKEN 未配置，已跳过"
-    ]
+    assert continued.research_provider_errors == ["github_discussions: GITHUB_TOKEN 未配置，已跳过"]
 
     report = render_report(continued, research_store.list_evidence(task.task_id))
     assert "已通过真实测试关联" in report

@@ -25,7 +25,6 @@ from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.work_units import partition_work_units
 from deepfix.domain_repositories.execution import ExecutionIntegrity
 from deepfix.domain_repositories.history import HistoryRepository
-from deepfix.memory import WorkingMemoryStore
 from deepfix.protected_context import ProtectedContext
 
 
@@ -148,31 +147,33 @@ def _coordinator(
 ):
     database = tmp_path / "deepfix.sqlite3"
     actual_store = CompactionStore(database)
-    memory = WorkingMemoryStore(database)
     history = HistoryRepository(database)
     calls = calls if calls is not None else []
     artifact = adapter or DeepAgentsArtifactAdapter(
         FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True)
     )
     snapshot_store = store or actual_store
-    return CompactionCoordinator(
-        adapter=(
-            _RecordingAdapter(artifact, calls) if calls is not None and not adapter else artifact
+    return (
+        CompactionCoordinator(
+            adapter=(
+                _RecordingAdapter(artifact, calls)
+                if calls is not None and not adapter
+                else artifact
+            ),
+            delta_generator=delta_generator or _RecordingDelta(calls),
+            snapshot_builder=_RecordingBuilder(calls),
+            snapshot_store=(
+                _RecordingStore(snapshot_store, calls)
+                if calls is not None and store is None
+                else snapshot_store
+            ),
+            history_repository=history,
+            model=model,
+            partitioner=lambda messages, conflicts: _record_partition(calls, messages, conflicts),
         ),
-        delta_generator=delta_generator or _RecordingDelta(calls),
-        snapshot_builder=_RecordingBuilder(calls),
-        snapshot_store=(
-            _RecordingStore(snapshot_store, calls)
-            if calls is not None and store is None
-            else snapshot_store
-        ),
-        memory_store=memory,
-        history_repository=history,
-        model=model,
-        partitioner=lambda messages, conflicts: _record_partition(
-            calls, messages, conflicts
-        ),
-    ), actual_store, history
+        actual_store,
+        history,
+    )
 
 
 def _record_partition(calls, messages, conflicts):
@@ -210,8 +211,9 @@ def test_success_returns_event_and_identical_prepare_reuses_snapshot(tmp_path):
 
     result = coordinator.invoke_automatic(
         request,
-        lambda messages: received.append(messages)
-        or ModelResponse(result=[AIMessage(content="ok")]),
+        lambda messages: (
+            received.append(messages) or ModelResponse(result=[AIMessage(content="ok")])
+        ),
     )
     first = coordinator.prepare(request)
     second = coordinator.prepare(request)
@@ -302,8 +304,9 @@ def test_delta_failure_never_falls_back_to_main_model(tmp_path):
 
     coordinator.invoke_automatic(
         request,
-        lambda messages: handler_calls.append(messages)
-        or ModelResponse(result=[AIMessage(content="continued")]),
+        lambda messages: (
+            handler_calls.append(messages) or ModelResponse(result=[AIMessage(content="continued")])
+        ),
     )
 
     assert delta.models == [compaction_model]
@@ -367,7 +370,6 @@ def _stage_failure_coordinator(tmp_path, stage):
             delta_generator=delta,
             snapshot_builder=builder,
             snapshot_store=snapshot_store,
-            memory_store=WorkingMemoryStore(database),
         ),
         store,
     )
@@ -390,8 +392,7 @@ def test_each_normal_preparation_failure_calls_original_handler_once(tmp_path, s
 
     result = coordinator.invoke_automatic(
         _request(ratio=0.85),
-        lambda messages: calls.append(messages)
-        or ModelResponse(result=[AIMessage(content="ok")]),
+        lambda messages: calls.append(messages) or ModelResponse(result=[AIMessage(content="ok")]),
     )
 
     assert isinstance(result, ModelResponse)
@@ -433,8 +434,7 @@ def test_post_commit_activation_failure_does_not_mask_normal_passthrough(tmp_pat
 
     result = coordinator.invoke_automatic(
         _request(ratio=0.85),
-        lambda messages: calls.append(messages)
-        or ModelResponse(result=[AIMessage(content="ok")]),
+        lambda messages: calls.append(messages) or ModelResponse(result=[AIMessage(content="ok")]),
     )
 
     assert isinstance(result, ModelResponse)
@@ -463,8 +463,8 @@ def test_normal_failure_passthrough_once_and_same_input_skips_reprepare(tmp_path
     adapter = _FailingAdapter()
     coordinator, store, history = _coordinator(tmp_path, adapter=adapter)
     handler_calls = []
-    handler = lambda messages: handler_calls.append(messages) or ModelResponse(
-        result=[AIMessage(content="ok")]
+    handler = lambda messages: (
+        handler_calls.append(messages) or ModelResponse(result=[AIMessage(content="ok")])
     )
 
     first = coordinator.invoke_automatic(_request(ratio=0.85), handler)
@@ -512,11 +512,7 @@ class _CoverageCorruptStore:
     def get_snapshot(self, task_id, version):
         snapshot = self.actual.get_snapshot(task_id, version)
         return snapshot.model_copy(
-            update={
-                "coverage": snapshot.coverage.model_copy(
-                    update={"covered_message_ids": []}
-                )
-            }
+            update={"coverage": snapshot.coverage.model_copy(update={"covered_message_ids": []})}
         )
 
     def __getattr__(self, name):
@@ -534,8 +530,7 @@ def test_invalid_history_coverage_preserves_original_messages(tmp_path):
 
     result = coordinator.invoke_automatic(
         _request(ratio=0.85),
-        lambda messages: calls.append(messages)
-        or ModelResponse(result=[AIMessage(content="ok")]),
+        lambda messages: calls.append(messages) or ModelResponse(result=[AIMessage(content="ok")]),
     )
 
     assert isinstance(result, ModelResponse)

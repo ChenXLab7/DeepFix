@@ -28,7 +28,6 @@ from deepfix.compaction.adapter import DeepAgentsArtifactAdapter
 from deepfix.compaction.budget import ContextBudgetReport
 from deepfix.compaction.coordinator import CompactionCoordinator, CompactionRequest
 from deepfix.compaction.evidence import EvidenceCollector
-from deepfix.compaction.identity import stable_work_unit_id
 from deepfix.compaction.middleware import (
     DeepFixCompactionMiddleware,
     DeepFixCompactionState,
@@ -37,11 +36,7 @@ from deepfix.compaction.models import (
     CompactionDelta,
     DeepFixCompactionEvent,
     DeterministicEvidenceBlock,
-    FactCandidate,
-    HypothesisProgressInput,
-    ProvenanceRef,
     ResearchStatusEvidence,
-    SnapshotCoverage,
     TaskAnchor,
     UserConstraint,
 )
@@ -51,11 +46,9 @@ from deepfix.compaction.work_units import partition_work_units
 from deepfix.config import AppConfig, ApprovalMode, ModelRoleConfig
 from deepfix.domain_repositories import DomainRepositories
 from deepfix.domain_repositories.execution import ExecutionIntegrity
-from deepfix.domain_repositories.migration import DomainMigrator
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.models import InvestigationHypothesis
 from deepfix.investigation.store import InvestigationStore
-from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, TaskState, TaskStatus
 from deepfix.models import TestResult as RepairTestResult
 from deepfix.navigation.models import TodoNavigationState
@@ -149,9 +142,7 @@ class _RecordingCompactionMiddleware(DeepFixCompactionMiddleware):
         self.navigation_inputs: list[dict[str, object]] = []
 
     def wrap_model_call(self, request, handler):
-        self.navigation_inputs.append(
-            {key: request.state.get(key) for key in _NAVIGATION_STATE}
-        )
+        self.navigation_inputs.append({key: request.state.get(key) for key in _NAVIGATION_STATE})
         return super().wrap_model_call(request, handler)
 
 
@@ -204,7 +195,6 @@ class _LongBugWorkflow:
         constraint = "只修复符号归一化，不得修改公开 API"
         repositories = DomainRepositories.create(database)
         tasks = repositories.tasks
-        memory = WorkingMemoryStore(database)
         snapshots = CompactionStore(database, repositories=repositories)
         artifact_adapter = DeepAgentsArtifactAdapter(
             FilesystemBackend(root_dir=self.state / "artifacts", virtual_mode=True)
@@ -214,7 +204,6 @@ class _LongBugWorkflow:
             delta_generator=_FakeDeltaModel(),
             snapshot_builder=CompactionSnapshotBuilder(),
             snapshot_store=snapshots,
-            memory_store=memory,
         )
         project_backend = LocalShellBackend(
             root_dir=self.project,
@@ -240,7 +229,9 @@ class _LongBugWorkflow:
                 ],
             ),
             ToolMessage(id="m-src", content="return abs on both branches", tool_call_id="read-src"),
-            ToolMessage(id="m-test", content="negative sign must return -4", tool_call_id="read-test"),
+            ToolMessage(
+                id="m-test", content="negative sign must return -4", tool_call_id="read-test"
+            ),
             AIMessage(id="m-read-explain", content="失败分支丢失了负号"),
             AIMessage(
                 id="m-fail-call",
@@ -255,54 +246,8 @@ class _LongBugWorkflow:
             ),
             AIMessage(id="m-fail-explain", content="负号用例稳定失败"),
         ]
-        read_unit_id = stable_work_unit_id(
-            task.task_id, ["m-read", "m-src", "m-test", "m-read-explain"]
-        )
-        source = ProvenanceRef(kind="work_unit", ref_id=read_unit_id)
-        first_memory = memory.save_progress(
-            task.task_id,
-            phase="investigating",
-            summary="已定位符号分支",
-            facts=[FactCandidate(text="负号用例稳定失败", sources=[source])],
-            evidence=[],
-            hypotheses=[
-                HypothesisProgressInput(
-                    text="缓存污染导致失败",
-                    target_state="active",
-                    sources=[source],
-                )
-            ],
-            checked_files=["src/calculator.py", "tests/test_calculator.py"],
-            experiments=["基线 pytest exit_code=1"],
-            next_steps=["排除缓存后修复负号分支"],
-            unresolved_questions=[],
-            coverage=SnapshotCoverage(covered_work_unit_ids=[read_unit_id]),
-            valid_source_ids={read_unit_id},
-        )
-        hypothesis_id = first_memory.snapshot.active_hypotheses[0].hypothesis_id
+        hypothesis_id = "hyp-cache-pollution"
         rejected_reason = "全新进程仍失败，缓存假设被排除"
-        second_memory = memory.save_progress(
-            task.task_id,
-            phase="planning",
-            summary="缓存已排除，准备最小修改",
-            facts=[],
-            evidence=[],
-            hypotheses=[
-                HypothesisProgressInput(
-                    hypothesis_id=hypothesis_id,
-                    text="缓存污染导致失败",
-                    target_state="rejected",
-                    reason=rejected_reason,
-                    sources=[source],
-                )
-            ],
-            checked_files=["src/calculator.py", "tests/test_calculator.py"],
-            experiments=["新进程 pytest exit_code=1"],
-            next_steps=["修改 else 分支"],
-            unresolved_questions=[],
-            coverage=SnapshotCoverage(covered_work_unit_ids=[read_unit_id]),
-            valid_source_ids={read_unit_id},
-        )
         snapshots.save_evidence(
             task.task_id,
             ResearchStatusEvidence(
@@ -311,17 +256,15 @@ class _LongBugWorkflow:
                 artifact_path="/.deepfix-artifacts/research/sign.md",
             ),
         )
-        assert DomainMigrator(database).migrate_investigation(task.task_id).ready_to_switch
-        rejected = second_memory.snapshot.rejected_hypotheses[0]
         repositories.investigation.backfill_current_hypothesis(
             task.task_id,
             InvestigationHypothesis(
-                hypothesis_id=rejected.hypothesis_id,
-                statement=rejected.text,
+                hypothesis_id=hypothesis_id,
+                statement="缓存污染导致失败",
                 state="rejected",
                 evidence_ids=[],
                 checked_locations=[],
-                reason=rejected.reason or rejected_reason,
+                reason=rejected_reason,
             ),
         )
         events = []
@@ -362,10 +305,10 @@ class _LongBugWorkflow:
             )
             response = compaction_middleware.wrap_model_call(
                 request,
-                lambda compacted: compaction_model_inputs.append(
-                    list(compacted.messages)
-                )
-                or ModelResponse(result=[AIMessage(content="continue")]),
+                lambda compacted: (
+                    compaction_model_inputs.append(list(compacted.messages))
+                    or ModelResponse(result=[AIMessage(content="continue")])
+                ),
             )
             command_update = getattr(response, "command", None)
             failures = snapshots.list_failures(task.task_id)
@@ -377,9 +320,7 @@ class _LongBugWorkflow:
         navigation_graph_builder.add_node("compact", force_compaction)
         navigation_graph_builder.add_edge(START, "compact")
         navigation_graph_builder.add_edge("compact", END)
-        navigation_graph = navigation_graph_builder.compile(
-            checkpointer=navigation_checkpointer
-        )
+        navigation_graph = navigation_graph_builder.compile(checkpointer=navigation_checkpointer)
         restored_navigation_state: dict[str, object] = {}
 
         def compact(current_messages):
@@ -393,9 +334,7 @@ class _LongBugWorkflow:
             if not events:
                 graph_input.update(_NAVIGATION_STATE)
             navigation_graph.invoke(graph_input, navigation_config)
-            restored_navigation_state = dict(
-                navigation_graph.get_state(navigation_config).values
-            )
+            restored_navigation_state = dict(navigation_graph.get_state(navigation_config).values)
             event = DeepFixCompactionEvent.model_validate(
                 restored_navigation_state["_deepfix_compaction_event"]
             )
@@ -416,13 +355,19 @@ class _LongBugWorkflow:
                 AIMessage(
                     id="m-edit-call",
                     content="执行已审批的最小修改",
-                    tool_calls=[_call("edit_file", "edit-sign", {"file_path": "src/calculator.py"})],
+                    tool_calls=[
+                        _call("edit_file", "edit-sign", {"file_path": "src/calculator.py"})
+                    ],
                 ),
                 ToolMessage(
                     id="m-edit-result",
                     content="edit succeeded",
                     tool_call_id="edit-sign",
-                    artifact={"operation": "edit", "status": "succeeded", "path": "src/calculator.py"},
+                    artifact={
+                        "operation": "edit",
+                        "status": "succeeded",
+                        "path": "src/calculator.py",
+                    },
                 ),
                 AIMessage(id="m-edit-explain", content="仅恢复负号，公开 API 未变化"),
             ]
@@ -461,9 +406,7 @@ class _LongBugWorkflow:
         scoped_partition = partition_work_units(_scoped(task.task_id, messages), set())
         units = {unit.unit_id: unit for unit in scoped_partition.units}
         compressed_ids = {
-            unit_id
-            for event in events
-            for unit_id in event.conversation_artifact.work_unit_ids
+            unit_id for event in events for unit_id in event.conversation_artifact.work_unit_ids
         }
         no_split = all(
             all(message_id in history for message_id in units[unit_id].message_ids)
@@ -536,12 +479,14 @@ def _failure_coordinator(tmp_path, adapter):
         delta_generator=_FakeDeltaModel(),
         snapshot_builder=CompactionSnapshotBuilder(),
         snapshot_store=CompactionStore(database),
-        memory_store=WorkingMemoryStore(database),
     )
 
 
 def _failure_request(task_id, ratio, zone):
-    messages = (HumanMessage(id="m1", content="保留这些原始消息"), AIMessage(id="m2", content="调查"))
+    messages = (
+        HumanMessage(id="m1", content="保留这些原始消息"),
+        AIMessage(id="m2", content="调查"),
+    )
     return CompactionRequest(
         task_id=task_id,
         entrypoint="automatic",
@@ -625,7 +570,6 @@ def _service(tmp_path, agent):
         project_python=Path(sys.executable),
     )
     repository = TaskRepository(database)
-    memory = WorkingMemoryStore(database)
     research = ResearchEvidenceStore(database)
     compaction = CompactionStore(database)
     investigation = InvestigationCoordinator(
@@ -639,7 +583,6 @@ def _service(tmp_path, agent):
         repository,
         ApprovalPolicy(ApprovalMode.MANUAL),
         config,
-        memory,
         research,
         compaction,
         investigation,

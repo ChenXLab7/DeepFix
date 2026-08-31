@@ -38,7 +38,6 @@ from deepfix.compaction.snapshot import (
 from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.tools import build_compact_conversation_tool
 from deepfix.config import AppConfig, ModelRoleConfig
-from deepfix.context import build_save_progress_tool
 from deepfix.debug import LLMTraceMiddleware
 from deepfix.domain_repositories import DomainRepositories
 from deepfix.extensions import AgentExtensions, merge_extensions
@@ -56,7 +55,6 @@ from deepfix.investigation.store import InvestigationStore
 from deepfix.investigation.tools import (
     build_record_hypothesis_tool,
 )
-from deepfix.memory import WorkingMemoryStore
 from deepfix.models import RepairOutcome
 from deepfix.navigation.feedback import RepositoryNavigationFeedbackSource
 from deepfix.navigation.middleware import TodoNavigationMiddleware
@@ -102,7 +100,6 @@ def build_compaction_model(config: AppConfig) -> ChatDeepSeek:
 def build_agent(
     config: AppConfig,
     checkpointer,
-    working_memory_store: WorkingMemoryStore,
     task_repository: TaskRepository | None = None,
     compaction_store: CompactionStore | None = None,
     investigation: InvestigationCoordinator | None = None,
@@ -163,16 +160,10 @@ def build_agent(
         delta_generator=CompactionDeltaGenerator(),
         snapshot_builder=CompactionSnapshotBuilder(),
         snapshot_store=compaction,
-        memory_store=working_memory_store,
         history_repository=(repositories.history if repositories is not None else None),
         budget_monitor=budget_monitor,
         protected_builder=protected_builder,
         model=compaction_model,
-    )
-    save_progress = build_save_progress_tool(
-        working_memory_store,
-        compaction_store=compaction,
-        investigation_store=investigation_store,
     )
     compact_conversation = build_compact_conversation_tool(coordinator)
     record_hypothesis = build_record_hypothesis_tool(investigation)
@@ -199,7 +190,6 @@ def build_agent(
         "glob",
         "grep",
         "execute",
-        "save_progress",
         "compact_conversation",
         "record_hypothesis",
         "search_diagnostic_artifacts",
@@ -220,7 +210,6 @@ def build_agent(
         "glob": InvestigationCapability.SEARCH,
         "grep": InvestigationCapability.SEARCH,
         "execute": InvestigationCapability.EXECUTE,
-        "save_progress": InvestigationCapability.MEMORY,
         "compact_conversation": InvestigationCapability.COMPACTION,
         "record_hypothesis": InvestigationCapability.META,
         "search_diagnostic_artifacts": InvestigationCapability.READ,
@@ -245,7 +234,6 @@ def build_agent(
             EXPERIMENT_EXECUTOR_SYSTEM_PROMPT if _experiment_mode else CORE_REPAIR_PROMPT
         ),
         tools=[
-            save_progress,
             compact_conversation,
             record_hypothesis,
             search_diagnostic_artifacts,
@@ -262,9 +250,9 @@ def build_agent(
             LegacyContextMigrationMiddleware(
                 LegacyContextStores(
                     tasks,
-                    working_memory_store,
                     compaction,
-                    repositories.history if repositories is not None else None,
+                    repositories,
+                    repositories.history,
                 ),
                 DeepAgentsArtifactAdapter(resolved_backend),
             ),
@@ -273,7 +261,6 @@ def build_agent(
                     tasks=tasks,
                     store=investigation_store,
                     compaction_store=compaction,
-                    memory=working_memory_store,
                 )
             ),
             InvestigationMiddleware(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -13,15 +13,13 @@ from langchain.agents.middleware import (
     ModelResponse,
     ToolCallRequest,
 )
-from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
+from langchain_core.messages import SystemMessage, ToolMessage
 from langgraph.types import Command
 
 from deepfix.compaction.identity import (
-    ensure_message_ids,
     stable_generated_message_id,
 )
 from deepfix.compaction.models import ArtifactReference
-from deepfix.compaction.work_units import partition_work_units
 from deepfix.investigation.classification import is_pytest_verification
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import InvestigationStateError
@@ -129,10 +127,7 @@ class InvestigationMiddleware(AgentMiddleware):
         if not task_id:
             return request
         state = self.coordinator.state(task_id)
-        block = render_investigation_state(
-            state,
-            _available_work_unit_refs(task_id, request.messages),
-        )
+        block = render_investigation_state(state)
         original = request.system_message.text if request.system_message else ""
         content = f"{original}\n\n{block}" if original else block
         return request.override(
@@ -244,11 +239,16 @@ class InvestigationMiddleware(AgentMiddleware):
             if authorization.correction_kind == "duplicate_execute":
                 return task_id, None, _duplicate_execute_message(task_id, call_id), None
             if authorization.correction_kind == "duplicate_hypothesis":
-                return task_id, None, _duplicate_hypothesis_message(
+                return (
                     task_id,
-                    call_id,
-                    authorization.correction_ref_id or "unknown",
-                ), None
+                    None,
+                    _duplicate_hypothesis_message(
+                        task_id,
+                        call_id,
+                        authorization.correction_ref_id or "unknown",
+                    ),
+                    None,
+                )
             return task_id, None, _decision_correction_message(task_id, call_id), None
         if operation is None:
             operation = self._prepare_operation(task_id, request)
@@ -347,9 +347,7 @@ class InvestigationMiddleware(AgentMiddleware):
     ) -> OperationJournalEntry | None:
         if self.operation_journal is None or name not in _SIDE_EFFECT_KINDS:
             return None
-        return self.operation_journal.load(
-            stable_investigation_id("operation", task_id, call_id)
-        )
+        return self.operation_journal.load(stable_investigation_id("operation", task_id, call_id))
 
     def _prepare_operation(
         self,
@@ -371,21 +369,15 @@ class InvestigationMiddleware(AgentMiddleware):
         pre_state = self._operation_snapshot(task_id, request)
         return self.operation_journal.prepare(
             NewOperationEntry(
-                operation_id=stable_investigation_id(
-                    "operation", task_id, call_id
-                ),
+                operation_id=stable_investigation_id("operation", task_id, call_id),
                 task_id=task_id,
-                experiment_id=stable_investigation_id(
-                    "experiment", task_id, call_id
-                ),
+                experiment_id=stable_investigation_id("experiment", task_id, call_id),
                 tool_call_id=call_id,
                 operation_kind=_SIDE_EFFECT_KINDS[name],
                 call_hash=tool_call_hash(task_id, request.tool_call),
                 workspace_baseline_id=task.workspace_baseline_id,
                 pre_state=pre_state,
-                expected_post_state=self._expected_post_state(
-                    task_id, request, pre_state
-                ),
+                expected_post_state=self._expected_post_state(task_id, request, pre_state),
             )
         )
 
@@ -495,41 +487,18 @@ class InvestigationMiddleware(AgentMiddleware):
 
 def render_investigation_state(
     state: InvestigationState,
-    work_unit_refs: Sequence[tuple[str, str, str]] = (),
 ) -> str:
     lines = [
         "<deepfix_investigation_state>",
         f"<progress_generation>{state.progress_generation}</progress_generation>",
         "<checked_paths>",
     ]
-    lines.extend(
-        f"<path>{escape(item.path[:500])}</path>"
-        for item in state.checked_files[-8:]
-    )
+    lines.extend(f"<path>{escape(item.path[:500])}</path>" for item in state.checked_files[-8:])
     lines.extend(("</checked_paths>", "<recent_tool_signatures>"))
     lines.extend(
-        f"<signature>{escape(item[:160])}</signature>"
-        for item in state.recent_tool_signatures[-8:]
+        f"<signature>{escape(item[:160])}</signature>" for item in state.recent_tool_signatures[-8:]
     )
     lines.append("</recent_tool_signatures>")
-    if state.memory_save_blocked_generation == state.progress_generation:
-        lines.extend(
-            (
-                "<memory_save_checkpoint>",
-                "本进展代次内不再调用 save_progress；确定性证据仍由系统保留。",
-                "若任务已经完成，请直接返回 RepairOutcome；否则继续产生新的有效证据。",
-                "</memory_save_checkpoint>",
-            )
-        )
-    elif state.memory_saved_generation == state.progress_generation:
-        lines.extend(
-            (
-                "<memory_save_checkpoint>",
-                "当前进展代次的 Working Memory 已保存，不要重复调用 save_progress。",
-                "完成复核后直接返回 RepairOutcome。",
-                "</memory_save_checkpoint>",
-            )
-        )
     lines.append("<current_hypotheses>")
     lines.extend(
         (
@@ -540,62 +509,18 @@ def render_investigation_state(
         for item in state.hypotheses[-8:]
     )
     lines.append("</current_hypotheses>")
-    lines.extend(
-        (
-            "<available_work_unit_refs>",
-            "save_progress 中 kind=work_unit 的 ref_id 必须使用下列稳定 ID，不能使用文件路径。",
-        )
-    )
-    lines.extend(
-        (
-            f'<work_unit ref_id="{escape(ref_id, quote=True)}" '
-            f'path="{escape(path, quote=True)}" '
-            f'purpose="{escape(purpose[:300], quote=True)}" />'
-        )
-        for ref_id, path, purpose in work_unit_refs[-8:]
-    )
-    lines.append("</available_work_unit_refs>")
     lines.append("</deepfix_investigation_state>")
     return "\n".join(lines)
 
 
-def _available_work_unit_refs(
-    task_id: str,
-    messages: Sequence[AnyMessage],
-) -> list[tuple[str, str, str]]:
-    identified = ensure_message_ids(task_id, messages).messages
-    units = partition_work_units(identified, set()).units
-    refs: list[tuple[str, str, str]] = []
-    for unit in units:
-        paths: list[str] = []
-        for message in identified[unit.start_index : unit.end_index + 1]:
-            if not isinstance(message, AIMessage):
-                continue
-            for call in message.tool_calls:
-                arguments = call.get("args", {})
-                if not isinstance(arguments, Mapping):
-                    continue
-                path = str(
-                    arguments.get("file_path", arguments.get("path", ""))
-                ).strip()
-                if path and path not in paths:
-                    paths.append(path)
-        refs.append((unit.unit_id, ", ".join(paths), unit.purpose))
-    return refs
-
-
 def _runtime_task_id(request: ToolCallRequest) -> str:
-    return str(
-        request.runtime.config.get("configurable", {}).get("thread_id", "")
-    ).strip()
+    return str(request.runtime.config.get("configurable", {}).get("thread_id", "")).strip()
 
 
 def _experiment_allowed_capabilities(
     request: ToolCallRequest,
 ) -> set[InvestigationCapability] | None:
-    raw = request.runtime.config.get("configurable", {}).get(
-        "allowed_capabilities"
-    )
+    raw = request.runtime.config.get("configurable", {}).get("allowed_capabilities")
     if raw is None:
         return None
     return {InvestigationCapability(item) for item in raw}
@@ -622,9 +547,7 @@ def _diagnostic_artifact_redirect(
     arguments = _tool_arguments(request.tool_call)
     path = str(arguments.get("file_path", "")).strip().replace("\\", "/")
     normalized = f"/{path.lstrip('/')}"
-    if name != "read_file" or not normalized.startswith(
-        "/.deepfix-artifacts/large_tool_results/"
-    ):
+    if name != "read_file" or not normalized.startswith("/.deepfix-artifacts/large_tool_results/"):
         return None
     call_id = str(request.tool_call.get("id", "")).strip()
     return ToolMessage(
@@ -729,8 +652,7 @@ def _windows_shell_correction(
     command = str(_tool_arguments(request.tool_call).get("command", ""))
     normalized = command.lower()
     has_unix_pipeline = any(
-        marker in normalized
-        for marker in ("| head", "| tail", "| grep", "| sed")
+        marker in normalized for marker in ("| head", "| tail", "| grep", "| sed")
     )
     if not has_unix_pipeline:
         clean_pytest = _pytest_prefix_before_shell_control(command, project_python)

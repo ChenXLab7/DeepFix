@@ -27,10 +27,7 @@ from deepfix.research.models import ExternalEvidence
 from deepfix.verification import VerificationPolicy
 
 DeterministicEvidence = Annotated[
-    SystemTestEvidence
-    | FileChangeEvidence
-    | ApprovalEvidence
-    | ResearchStatusEvidence,
+    SystemTestEvidence | FileChangeEvidence | ApprovalEvidence | ResearchStatusEvidence,
     Field(union_mode="left_to_right"),
 ]
 
@@ -62,7 +59,6 @@ class CaseBlackboardView(StrictModel):
     fingerprint: str = Field(min_length=1)
     task_anchor: TaskAnchor
     reproduction_state: Literal["unknown", "reproduced", "not_reproduced"]
-    working_memory_version: int | None = None
     confirmed_claims: list[ProvenancedClaim]
     hypotheses: list[BlackboardHypothesis]
     evidence_gaps: list[ProvenancedText]
@@ -81,17 +77,13 @@ class CaseBlackboardView(StrictModel):
     @property
     def test_results(self) -> list[SystemTestEvidence]:
         return [
-            item
-            for item in self.deterministic_evidence
-            if isinstance(item, SystemTestEvidence)
+            item for item in self.deterministic_evidence if isinstance(item, SystemTestEvidence)
         ]
 
     @property
     def changed_files(self) -> list[FileChangeEvidence]:
         return [
-            item
-            for item in self.deterministic_evidence
-            if isinstance(item, FileChangeEvidence)
+            item for item in self.deterministic_evidence if isinstance(item, FileChangeEvidence)
         ]
 
 
@@ -151,12 +143,8 @@ class CaseBlackboardBuilder:
             ],
             "constraint_id",
         )
-        anchor = context.task_anchor.model_copy(
-            update={"user_constraints": constraints}
-        )
-        external_research = (
-            self._research_loader(task_id) if self._research_loader else []
-        )
+        anchor = context.task_anchor.model_copy(update={"user_constraints": constraints})
+        external_research = self._research_loader(task_id) if self._research_loader else []
         research_evidence = _unique_by_id(
             [
                 *(
@@ -183,33 +171,22 @@ class CaseBlackboardBuilder:
             *(snapshot.unresolved_questions if snapshot else []),
         ]
         evidence_gaps = _unique_text(unresolved_questions)
-        operations = (
-            self._operation_loader(task_id) if self._operation_loader else []
-        )
+        operations = self._operation_loader(task_id) if self._operation_loader else []
         payload = {
             "task_id": task_id,
             "task_anchor": anchor,
             "reproduction_state": _reproduction_state(deterministic_evidence),
-            "working_memory_version": None,
             "confirmed_claims": confirmed_claims,
             "hypotheses": hypotheses,
             "evidence_gaps": evidence_gaps,
-            "recent_experiments": (
-                snapshot.experiments[-5:] if snapshot else []
-            ),
+            "recent_experiments": (snapshot.experiments[-5:] if snapshot else []),
             "deterministic_evidence": deterministic_evidence,
             "research_evidence": research_evidence,
             "unresolved_conflicts": snapshot.conflicts if snapshot else [],
             "artifact_references": snapshot.artifact_references if snapshot else [],
-            "verification_policy": (
-                self._policy_loader(task_id) if self._policy_loader else None
-            ),
+            "verification_policy": (self._policy_loader(task_id) if self._policy_loader else None),
             "incomplete_operation_ids": [item.operation_id for item in operations],
-            "budget": (
-                self._budget_loader(task_id)
-                if self._budget_loader
-                else LoopBudgetView()
-            ),
+            "budget": (self._budget_loader(task_id) if self._budget_loader else LoopBudgetView()),
             # Legacy fields remain in the serialized view until the migration
             # boundary is removed. They no longer control navigation.
             "stagnation_level": 0,

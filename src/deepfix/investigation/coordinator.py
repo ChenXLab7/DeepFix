@@ -115,19 +115,8 @@ class InvestigationCoordinator:
         state: InvestigationState,
         capabilities: Mapping[str, InvestigationCapability],
     ) -> set[str]:
-        return self._filter_memory_tool(state, set(capabilities))
-
-    @staticmethod
-    def _filter_memory_tool(
-        state: InvestigationState,
-        allowed: set[str],
-    ) -> set[str]:
-        if state.progress_generation in {
-            state.memory_save_blocked_generation,
-            state.memory_saved_generation,
-        }:
-            allowed.discard("save_progress")
-        return allowed
+        del state
+        return set(capabilities)
 
     def state(self, task_id: str) -> InvestigationState:
         try:
@@ -197,8 +186,7 @@ class InvestigationCoordinator:
             )
             event_type = (
                 InvestigationEventType.POST_EDIT_TEST_OBSERVED
-                if evidence.timing in {"post_change", "post_recovery"}
-                or has_successful_change
+                if evidence.timing in {"post_change", "post_recovery"} or has_successful_change
                 else InvestigationEventType.TEST_OBSERVED
             )
             return self.record_observation(
@@ -329,9 +317,7 @@ class InvestigationCoordinator:
         evaluated, progress = self.progress_evaluator.apply(state, observation)
         if observation.progress_kind is not None:
             progress = observation.progress_kind
-        effective_observation = observation.model_copy(
-            update={"progress_kind": progress}
-        )
+        effective_observation = observation.model_copy(update={"progress_kind": progress})
         origin = NewInvestigationEvent(
             event_id=event_id,
             task_id=task_id,
@@ -358,30 +344,9 @@ class InvestigationCoordinator:
                 updated,
                 effective_observation,
             )
-        if observation.payload.get("tool_name") == "save_progress":
-            if observation.payload.get("status") == "success":
-                updated = updated.model_copy(
-                    update={
-                        "memory_save_failure_count": 0,
-                        "memory_save_blocked_generation": None,
-                        "memory_saved_generation": updated.progress_generation,
-                    }
-                )
-            else:
-                failures = state.memory_save_failure_count + 1
-                updated = updated.model_copy(
-                    update={
-                        "memory_save_failure_count": failures,
-                        "memory_save_blocked_generation": (
-                            updated.progress_generation if failures >= 2 else None
-                        ),
-                    }
-                )
         if observation.event_type is InvestigationEventType.TEST_OBSERVED:
             diagnostic_tests = (
-                state.diagnostic_test_count_since_decision + 1
-                if observation.exit_code != 0
-                else 0
+                state.diagnostic_test_count_since_decision + 1 if observation.exit_code != 0 else 0
             )
             updated = updated.model_copy(
                 update={
@@ -436,8 +401,7 @@ class InvestigationCoordinator:
             )
         if (
             observation.payload.get("tool_name") == "execute"
-            and observation.payload.get("result_type")
-            != "duplicate_execute_correction"
+            and observation.payload.get("result_type") != "duplicate_execute_correction"
         ):
             updated = updated.model_copy(
                 update={
@@ -456,16 +420,10 @@ class InvestigationCoordinator:
         source_id: str,
     ) -> InvestigationHypothesis:
         state = self.state(task_id)
-        evidence_ids = {
-            item.evidence_id
-            for item in self.compaction_store.list_evidence(task_id)
-        }
+        evidence_ids = {item.evidence_id for item in self.compaction_store.list_evidence(task_id)}
         if not set(command.evidence_ids) <= evidence_ids:
             raise ValueError("假设证据不属于当前任务")
-        if not all(
-            self._location_was_checked(state, item)
-            for item in command.checked_locations
-        ):
+        if not all(self._location_was_checked(state, item) for item in command.checked_locations):
             raise ValueError("假设位置尚未被当前任务检查")
         semantic_statement = _semantic_statement(command.statement)
         hypothesis_id = command.hypothesis_id or (
@@ -481,10 +439,7 @@ class InvestigationCoordinator:
         existing = self._hypothesis(state, hypothesis_id)
         if command.hypothesis_id and existing is None:
             raise ValueError("hypothesis_id 不存在于当前任务")
-        if (
-            existing is not None
-            and _semantic_statement(existing.statement) != semantic_statement
-        ):
+        if existing is not None and _semantic_statement(existing.statement) != semantic_statement:
             raise ValueError("hypothesis_id 不能更换假设陈述")
         if (
             state.repair_reevaluation_required
@@ -492,9 +447,7 @@ class InvestigationCoordinator:
             and existing.state == "supported"
             and command.target_state == "supported"
         ):
-            raise ValueError(
-                "修改后验证失败，不能再次支持同一假设；请先排除旧假设或建立新假设"
-            )
+            raise ValueError("修改后验证失败，不能再次支持同一假设；请先排除旧假设或建立新假设")
         record = InvestigationHypothesis(
             hypothesis_id=hypothesis_id,
             statement=semantic_statement,
@@ -527,9 +480,7 @@ class InvestigationCoordinator:
             payload={"hypothesis": record.model_dump(mode="json")},
         )
         updated = self.record_observation(task_id, observation)
-        return next(
-            item for item in updated.hypotheses if item.hypothesis_id == hypothesis_id
-        )
+        return next(item for item in updated.hypotheses if item.hypothesis_id == hypothesis_id)
 
     def record_user_information(
         self,
@@ -701,9 +652,7 @@ class InvestigationCoordinator:
             )
             self._record_lifecycle(
                 state,
-                state.model_copy(
-                    update={"duplicate_execute_correction_signature": signature}
-                ),
+                state.model_copy(update={"duplicate_execute_correction_signature": signature}),
                 InvestigationEventType.REEVALUATION_REQUIRED,
                 source_id,
             )
@@ -759,11 +708,7 @@ class InvestigationCoordinator:
         hypothesis_id: str,
     ) -> InvestigationHypothesis | None:
         return next(
-            (
-                item
-                for item in state.hypotheses
-                if item.hypothesis_id == hypothesis_id
-            ),
+            (item for item in state.hypotheses if item.hypothesis_id == hypothesis_id),
             None,
         )
 
@@ -776,8 +721,7 @@ class InvestigationCoordinator:
         return any(
             _normalized_path(item.path) == path
             and any(
-                checked.start_line <= location.start_line
-                and checked.end_line >= location.end_line
+                checked.start_line <= location.start_line and checked.end_line >= location.end_line
                 for checked in item.ranges
             )
             for item in state.checked_files
@@ -828,6 +772,7 @@ class InvestigationCoordinator:
             identity,
             result,
         )
+
     @staticmethod
     def _event_payload(observation: ToolObservation) -> dict[str, Any]:
         payload = dict(observation.payload)
@@ -866,16 +811,12 @@ class InvestigationCoordinator:
             raw = observation.payload.get("hypothesis")
             record = InvestigationHypothesis.model_validate(raw)
             hypotheses = [
-                item
-                for item in state.hypotheses
-                if item.hypothesis_id != record.hypothesis_id
+                item for item in state.hypotheses if item.hypothesis_id != record.hypothesis_id
             ]
             hypotheses.append(record)
             updates["hypotheses"] = hypotheses[-64:]
             updates["supported_hypothesis_ids"] = [
-                item.hypothesis_id
-                for item in hypotheses
-                if item.state == "supported"
+                item.hypothesis_id for item in hypotheses if item.state == "supported"
             ][-64:]
         if (
             observation.event_type
@@ -886,9 +827,7 @@ class InvestigationCoordinator:
             and observation.evidence_id
         ):
             updates["test_evidence_ids"] = list(
-                dict.fromkeys(
-                    [*state.test_evidence_ids, observation.evidence_id]
-                )
+                dict.fromkeys([*state.test_evidence_ids, observation.evidence_id])
             )[-64:]
         return state.model_copy(update=updates) if updates else state
 
@@ -958,16 +897,12 @@ def _merge_checked_file(
     ranges = [*existing.ranges, location]
     replacement = existing.model_copy(
         update={
-            "content_fingerprint": str(
-                observation.payload["content_fingerprint"]
-            ),
+            "content_fingerprint": str(observation.payload["content_fingerprint"]),
             "ranges": ranges,
             "latest_event_id": event_id,
         }
     )
-    return [
-        replacement if item is existing else item for item in state.checked_files
-    ]
+    return [replacement if item is existing else item for item in state.checked_files]
 
 
 def _diagnostic_artifact_observation(
@@ -983,9 +918,7 @@ def _diagnostic_artifact_observation(
     if result.status != "success" or event_type is None:
         return None
     payload = {
-        key: artifact[key]
-        for key in _DIAGNOSTIC_PAYLOAD_FIELDS[result_type]
-        if key in artifact
+        key: artifact[key] for key in _DIAGNOSTIC_PAYLOAD_FIELDS[result_type] if key in artifact
     }
     return ToolObservation(
         event_type=event_type,

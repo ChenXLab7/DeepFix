@@ -282,12 +282,10 @@ def _default_service_factory(
     from deepfix.domain_repositories import DomainRepositories
     from deepfix.investigation.coordinator import InvestigationCoordinator
     from deepfix.investigation.store import InvestigationStore
-    from deepfix.memory import WorkingMemoryStore
     from deepfix.research.store import ResearchEvidenceStore
 
     repositories = DomainRepositories.create(config.database_path)
     repository = repositories.tasks
-    working_memory_store = WorkingMemoryStore(config.database_path)
     compaction_store = CompactionStore(
         config.database_path,
         repositories=repositories,
@@ -325,7 +323,6 @@ def _default_service_factory(
             agent = build_agent(
                 config,
                 SqliteSaver(connection),
-                working_memory_store,
                 task_repository=repository,
                 compaction_store=compaction_store,
                 extensions=extensions,
@@ -340,7 +337,6 @@ def _default_service_factory(
                 repository,
                 ApprovalPolicy(config.approval_mode),
                 config,
-                working_memory_store,
                 research_evidence_store,
                 compaction_store,
                 investigation,

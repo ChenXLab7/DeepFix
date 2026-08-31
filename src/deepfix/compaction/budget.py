@@ -51,7 +51,6 @@ class ContextBudgetMonitor:
         self._count = token_counter or _count_tokens_approximately
         self.output_reserve_tokens = output_reserve_tokens
         self.model_input_limits = dict(model_input_limits or _MODEL_INPUT_LIMITS)
-        self._emitted_memory_hints: set[tuple[int, str]] = set()
 
     def measure(
         self,
@@ -63,9 +62,7 @@ class ContextBudgetMonitor:
         if request.system_message is not None:
             counted_values.append(_content_text(request.system_message.content))
         counted_values.extend(_content_text(block) for block in protected_blocks)
-        counted_values.extend(
-            _content_text(message.content) for message in request.messages
-        )
+        counted_values.extend(_content_text(message.content) for message in request.messages)
         counted_values.extend(_canonical_text(tool) for tool in request.tools)
         request_tokens = (
             sum(max(0, int(self._count(value))) for value in counted_values)
@@ -81,17 +78,6 @@ class ContextBudgetMonitor:
             zone=zone,
             target_ratio=_target_ratio(zone),
         )
-
-    def should_emit_memory_hint(
-        self,
-        working_memory_version: int,
-        latest_work_unit_id: str,
-    ) -> bool:
-        key = (working_memory_version, latest_work_unit_id)
-        if key in self._emitted_memory_hints:
-            return False
-        self._emitted_memory_hints.add(key)
-        return True
 
     def _max_input_tokens(self, model: Any) -> int:
         profile = getattr(model, "profile", None)
@@ -135,9 +121,7 @@ def select_retained_units(
 ) -> RetentionPlan:
     ordered = tuple(units)
     if not ordered or report.target_ratio is None:
-        retained_ids = frozenset(
-            message_id for unit in ordered for message_id in unit.message_ids
-        )
+        retained_ids = frozenset(message_id for unit in ordered for message_id in unit.message_ids)
         return RetentionPlan(
             retained_units=ordered,
             compressed_units=(),
@@ -147,18 +131,14 @@ def select_retained_units(
 
     total_messages = sum(len(unit.message_ids) for unit in ordered)
     unit_costs = {
-        unit.unit_id: (
-            report.request_tokens * len(unit.message_ids) / total_messages
-        )
+        unit.unit_id: (report.request_tokens * len(unit.message_ids) / total_messages)
         for unit in ordered
     }
     target_tokens = report.max_input_tokens * report.target_ratio
     mandatory = {
         unit.unit_id
         for unit in ordered
-        if unit.must_keep
-        or unit.state != "complete"
-        or latest_user_message_id in unit.message_ids
+        if unit.must_keep or unit.state != "complete" or latest_user_message_id in unit.message_ids
     }
     selected = set(mandatory)
     selected_cost = sum(unit_costs[unit_id] for unit_id in selected)

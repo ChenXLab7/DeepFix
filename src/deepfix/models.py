@@ -133,7 +133,6 @@ class ContextMetrics:
     context_peak_tokens: int = 0
     context_overflow_count: int = 0
     active_compaction_count: int = 0
-    working_memory_version: int = 0
     last_compaction_at: str | None = None
     latest_usage_ratio: float = 0.0
     latest_budget_zone: str | None = None
@@ -178,9 +177,7 @@ class TaskState:
     passed_required_oracle_count: int = 0
     supplemental_failure_count: int = 0
     unresolved_operation_ids: list[str] = field(default_factory=list)
-    project_python: str = field(
-        default_factory=lambda: str(Path(sys.executable).resolve())
-    )
+    project_python: str = field(default_factory=lambda: str(Path(sys.executable).resolve()))
     status: TaskStatus = TaskStatus.CREATED
     resolution: Literal["fixed", "not_reproduced"] | None = None
     conversation: list[dict[str, str]] = field(default_factory=list)
@@ -190,9 +187,9 @@ class TaskState:
     repair_plan: list[str] = field(default_factory=list)
     changed_files: list[str] = field(default_factory=list)
     successful_changed_files: list[str] = field(default_factory=list)
-    latest_change_verification: Literal[
-        "not_applicable", "pending", "passed", "failed"
-    ] = "not_applicable"
+    latest_change_verification: Literal["not_applicable", "pending", "passed", "failed"] = (
+        "not_applicable"
+    )
     test_results: list[TestResult] = field(default_factory=list)
     approvals: list[ApprovalRecord] = field(default_factory=list)
     review: str | None = None
@@ -207,7 +204,6 @@ class TaskState:
     shell_calls: int = 0
     agent_invocations: int = 0
     consecutive_test_failures: int = 0
-    working_memory_version: int = 0
     context_metrics: ContextMetrics = field(default_factory=ContextMetrics)
     offloaded_artifacts: list[str] = field(default_factory=list)
     external_evidence_ids: list[str] = field(default_factory=list)
@@ -250,9 +246,7 @@ class TaskState:
             workspace_baseline_id=workspace_baseline_id,
             user_problem=normalized_problem,
             approval_mode=approval_mode.value,
-            project_python=str(
-                Path(project_python or sys.executable).expanduser().resolve()
-            ),
+            project_python=str(Path(project_python or sys.executable).expanduser().resolve()),
         )
 
     def transition_to(self, next_status: TaskStatus) -> None:
@@ -274,9 +268,7 @@ class TaskState:
         payload["status"] = self.status.value
         payload["paused_from"] = self.paused_from.value if self.paused_from else None
         payload["context_recovery"] = (
-            self.context_recovery.model_dump(mode="json")
-            if self.context_recovery
-            else None
+            self.context_recovery.model_dump(mode="json") if self.context_recovery else None
         )
         payload["investigation_recovery"] = (
             self.investigation_recovery.model_dump(mode="json")
@@ -292,12 +284,15 @@ class TaskState:
         payload["conversation"] = [
             {
                 **entry,
-                "id": str(entry.get("id") or stable_conversation_message_id(
-                    task_id,
-                    ordinal,
-                    str(entry.get("role", "user")),
-                    entry.get("content", ""),
-                )),
+                "id": str(
+                    entry.get("id")
+                    or stable_conversation_message_id(
+                        task_id,
+                        ordinal,
+                        str(entry.get("role", "user")),
+                        entry.get("content", ""),
+                    )
+                ),
             }
             for ordinal, entry in enumerate(payload.get("conversation", []))
         ]
@@ -323,16 +318,12 @@ class TaskState:
         if context_recovery is not None and not isinstance(
             context_recovery, ContextRecoveryMetadata
         ):
-            payload["context_recovery"] = ContextRecoveryMetadata.model_validate(
-                context_recovery
-            )
+            payload["context_recovery"] = ContextRecoveryMetadata.model_validate(context_recovery)
         investigation_recovery = payload.get("investigation_recovery")
         if investigation_recovery is not None and not isinstance(
             investigation_recovery, InvestigationRecoveryMetadata
         ):
-            payload["investigation_recovery"] = (
-                InvestigationRecoveryMetadata.model_validate(
-                    investigation_recovery
-                )
+            payload["investigation_recovery"] = InvestigationRecoveryMetadata.model_validate(
+                investigation_recovery
             )
         return cls(**payload)

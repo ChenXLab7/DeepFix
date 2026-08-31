@@ -21,9 +21,7 @@ def external_evidence(**overrides):
         "documented_version": "2.8",
         "project_version": "2.8.4",
         "local_verification": "verified",
-        "local_evidence": [
-            Evidence("tests/test_models.py:10", "目标回归测试通过")
-        ],
+        "local_evidence": [Evidence("tests/test_models.py:10", "目标回归测试通过")],
         "linked_test_tool_call_ids": ["pytest-call-1"],
         "verification_explanation": "本地回归确认官方结论适用",
         "artifact_path": "/.deepfix-artifacts/research/task-1/evidence-1.md",
@@ -112,9 +110,7 @@ def test_report_uses_exit_code_not_success_wording_to_mark_test_result(tmp_path)
 def test_report_labels_not_reproduced_resolution(tmp_path):
     task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
     task.resolution = "not_reproduced"
-    task.final_summary = (
-        "未复现用户描述的问题：当前环境中所运行的 pytest 测试通过，且未修改代码。"
-    )
+    task.final_summary = "未复现用户描述的问题：当前环境中所运行的 pytest 测试通过，且未修改代码。"
 
     report = render_report(task)
 
@@ -125,9 +121,7 @@ def test_report_labels_not_reproduced_resolution(tmp_path):
 def test_paused_report_preserves_successful_unverified_change(tmp_path):
     task = TaskState.create(tmp_path, "查找首个元素失败", ApprovalMode.MANUAL)
     task.changed_files.append("python_programs/find_first_in_sorted.py")
-    task.successful_changed_files.append(
-        "python_programs/find_first_in_sorted.py"
-    )
+    task.successful_changed_files.append("python_programs/find_first_in_sorted.py")
     task.latest_change_verification = "pending"
     task.pause_reason = "调查协调需要恢复：investigation_state_commit_failed"
     task.final_summary = task.pause_reason
@@ -152,12 +146,10 @@ def test_approved_change_without_success_evidence_is_not_reported_as_written(tmp
 
 def test_report_renders_deterministic_context_metrics_and_artifacts(tmp_path):
     task = TaskState.create(tmp_path, "超长修复任务", ApprovalMode.MANUAL)
-    task.working_memory_version = 3
     task.context_metrics = ContextMetrics(
         context_peak_tokens=4200,
         context_overflow_count=0,
         active_compaction_count=1,
-        working_memory_version=3,
         last_compaction_at="2026-08-21T10:00:00+00:00",
         latest_usage_ratio=0.91,
         latest_budget_zone="emergency",
@@ -175,7 +167,6 @@ def test_report_renders_deterministic_context_metrics_and_artifacts(tmp_path):
 
     report = render_report(task)
 
-    assert "工作记忆版本：3" in report
     assert "上下文峰值估算：4200 tokens" in report
     assert "主动压缩次数：1" in report
     assert "上下文溢出次数：0" in report

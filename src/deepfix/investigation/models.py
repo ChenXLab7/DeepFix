@@ -30,7 +30,6 @@ class InvestigationCapability(StrEnum):
     EXECUTE = "execute"
     MODIFY = "modify"
     RESEARCH = "research"
-    MEMORY = "memory"
     COMPACTION = "compaction"
     META = "meta"
 
@@ -131,9 +130,7 @@ class UnresolvedQuestion(StrictModel):
 
     @model_validator(mode="after")
     def validate_resolution(self) -> UnresolvedQuestion:
-        if self.status == "open" and (
-            self.resolution_evidence_ids or self.resolved_at is not None
-        ):
+        if self.status == "open" and (self.resolution_evidence_ids or self.resolved_at is not None):
             raise ValueError("open question 不能包含解决证据或 resolved_at")
         if self.status == "resolved" and (
             not self.resolution_evidence_ids or self.resolved_at is None
@@ -251,9 +248,6 @@ class InvestigationState(StrictModel):
     diagnostic_test_count_since_decision: int = 0
     repair_reevaluation_required: bool = False
     decision_correction_used: bool = False
-    memory_save_failure_count: int = 0
-    memory_save_blocked_generation: int | None = None
-    memory_saved_generation: int | None = None
     last_execute_signature: str | None = None
     last_execute_generation: int | None = None
     duplicate_execute_correction_signature: str | None = None

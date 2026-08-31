@@ -29,7 +29,6 @@ def _recovery_metadata():
         stage="overflow_retry",
         error_code="overflow_after_retry",
         usage_ratio=0.95,
-        working_memory_version=3,
         active_snapshot_version=2,
         prepared_snapshot_version=3,
         prepared_snapshot_lifecycle="prepared",

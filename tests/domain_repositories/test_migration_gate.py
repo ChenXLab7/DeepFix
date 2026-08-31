@@ -45,7 +45,6 @@ from deepfix.investigation.receipts import (
     legacy_receipt_task_guard,
 )
 from deepfix.investigation.store import InvestigationStore
-from deepfix.memory import WorkingMemoryStore
 from deepfix.models import ApprovalRecord, TaskState, TaskStatus
 from deepfix.operations import (
     NewOperationEntry,
@@ -822,7 +821,6 @@ def test_restore_context_reporting_and_execution_reconciliation_use_current_auth
         migrated_fixture.database,
         repositories=repositories,
     )
-    memory = WorkingMemoryStore(migrated_fixture.database.path)
     coordinator = InvestigationCoordinator(
         store=investigation_store,
         tasks=repositories.tasks,
@@ -851,7 +849,6 @@ def test_restore_context_reporting_and_execution_reconciliation_use_current_auth
         repositories.tasks,
         ApprovalPolicy(ApprovalMode.MANUAL),
         config,
-        memory,
         research,
         compaction,
         coordinator,

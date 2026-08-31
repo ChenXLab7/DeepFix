@@ -1,4 +1,3 @@
-
 import asyncio
 
 import pytest
@@ -17,7 +16,6 @@ from deepfix.compaction.snapshot import CompactionSnapshotBuilder
 from deepfix.compaction.store import CompactionStore
 from deepfix.domain_repositories.execution import ExecutionIntegrity
 from deepfix.domain_repositories.history import HistoryRepository
-from deepfix.memory import WorkingMemoryStore
 from deepfix.protected_context import ProtectedContext
 
 from .test_middleware import _request
@@ -106,7 +104,6 @@ def _empty_delta():
 
 def _middleware(tmp_path, adapter=None):
     database = tmp_path / "deepfix.sqlite3"
-    memory = WorkingMemoryStore(database)
     history = HistoryRepository(database)
     coordinator = CompactionCoordinator(
         adapter=adapter
@@ -116,7 +113,6 @@ def _middleware(tmp_path, adapter=None):
         delta_generator=_Delta(),
         snapshot_builder=CompactionSnapshotBuilder(),
         snapshot_store=CompactionStore(database),
-        memory_store=memory,
         history_repository=history,
     )
     return DeepFixCompactionMiddleware(_ProtectedBuilder(), _Budget(), coordinator), history
@@ -189,9 +185,7 @@ def test_async_overflow_path_uses_one_async_retry(tmp_path):
             raise ContextOverflowError("too large")
         return ModelResponse(result=[AIMessage(content="ok")])
 
-    result = asyncio.run(
-        middleware.awrap_model_call(_request(_messages()), handler)
-    )
+    result = asyncio.run(middleware.awrap_model_call(_request(_messages()), handler))
 
     assert result is not None
     assert len(calls) == 2

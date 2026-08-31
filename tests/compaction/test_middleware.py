@@ -24,7 +24,6 @@ from deepfix.compaction.snapshot import CompactionSnapshotBuilder
 from deepfix.compaction.store import CompactionStore
 from deepfix.domain_repositories.execution import ExecutionIntegrity
 from deepfix.domain_repositories.history import HistoryRepository
-from deepfix.memory import WorkingMemoryStore
 from deepfix.protected_context import ProtectedContext
 
 
@@ -41,9 +40,7 @@ def _runtime(task_id="task-a"):
 
 def _request(messages, task_id="task-a"):
     return ModelRequest(
-        model=FakeListChatModel(
-            responses=["ok"], profile={"max_input_tokens": 100}
-        ),
+        model=FakeListChatModel(responses=["ok"], profile={"max_input_tokens": 100}),
         messages=list(messages),
         system_message=SystemMessage(content="base-system"),
         tools=[],
@@ -109,9 +106,8 @@ def _report(zone, ratio, target=None):
 
 
 class _Coordinator:
-    def __init__(self, memory):
-        self.memory_store = memory
-        self.history_repository = HistoryRepository(memory.database_path)
+    def __init__(self, database):
+        self.history_repository = HistoryRepository(database)
         self.snapshot_store = SimpleNamespace()
         self.requests = []
 
@@ -137,7 +133,7 @@ def test_identity_middleware_replaces_messages_once_without_content_change():
 
 
 def test_normal_observe_and_compaction_threshold_paths(tmp_path):
-    memory = WorkingMemoryStore(tmp_path / "deepfix.sqlite3")
+    database = tmp_path / "deepfix.sqlite3"
     reports = [
         _report("normal", 0.75),
         _report("observe", 0.80),
@@ -146,18 +142,17 @@ def test_normal_observe_and_compaction_threshold_paths(tmp_path):
         _report("emergency", 0.91, 0.65),
     ]
     budget = _Budget(reports)
-    coordinator = _Coordinator(memory)
-    middleware = DeepFixCompactionMiddleware(
-        _ProtectedBuilder("m-latest"), budget, coordinator
-    )
+    coordinator = _Coordinator(database)
+    middleware = DeepFixCompactionMiddleware(_ProtectedBuilder("m-latest"), budget, coordinator)
     messages = [HumanMessage(id="m-latest", content="question")]
     received = []
 
     for _ in reports:
         middleware.wrap_model_call(
             _request(messages),
-            lambda request: received.append(request)
-            or ModelResponse(result=[AIMessage(content="ok")]),
+            lambda request: (
+                received.append(request) or ModelResponse(result=[AIMessage(content="ok")])
+            ),
         )
 
     assert "working memory" not in received[0].system_message.text.lower()
@@ -172,11 +167,11 @@ def test_normal_observe_and_compaction_threshold_paths(tmp_path):
 
 
 def test_protected_blocks_are_request_local_and_not_added_to_messages(tmp_path):
-    memory = WorkingMemoryStore(tmp_path / "deepfix.sqlite3")
+    database = tmp_path / "deepfix.sqlite3"
     middleware = DeepFixCompactionMiddleware(
         _ProtectedBuilder("m-latest"),
         _Budget([_report("normal", 0.70)]),
-        _Coordinator(memory),
+        _Coordinator(database),
     )
     messages = [HumanMessage(id="m-latest", content="question")]
     request = _request(messages)
@@ -184,8 +179,7 @@ def test_protected_blocks_are_request_local_and_not_added_to_messages(tmp_path):
 
     middleware.wrap_model_call(
         request,
-        lambda updated: captured.append(updated)
-        or ModelResponse(result=[AIMessage(content="ok")]),
+        lambda updated: captured.append(updated) or ModelResponse(result=[AIMessage(content="ok")]),
     )
 
     assert captured[0].system_message.text.count("<deepfix_task_anchor>") == 1
@@ -208,7 +202,6 @@ class _EmptyDelta:
 
 def test_committed_event_reconstructs_effective_view_without_deleting_checkpoint(tmp_path):
     database = tmp_path / "deepfix.sqlite3"
-    memory = WorkingMemoryStore(database)
     store = CompactionStore(database)
     coordinator = CompactionCoordinator(
         adapter=DeepAgentsArtifactAdapter(
@@ -217,7 +210,6 @@ def test_committed_event_reconstructs_effective_view_without_deleting_checkpoint
         delta_generator=_EmptyDelta(),
         snapshot_builder=CompactionSnapshotBuilder(),
         snapshot_store=store,
-        memory_store=memory,
     )
     messages = [
         HumanMessage(id="m1", content="old question"),
@@ -243,15 +235,12 @@ def test_committed_event_reconstructs_effective_view_without_deleting_checkpoint
         coordinator,
     )
     request = _request(messages)
-    request.state["_deepfix_compaction_event"] = prepared.event.model_dump(
-        mode="json"
-    )
+    request.state["_deepfix_compaction_event"] = prepared.event.model_dump(mode="json")
     captured = []
 
     middleware.wrap_model_call(
         request,
-        lambda updated: captured.append(updated)
-        or ModelResponse(result=[AIMessage(content="ok")]),
+        lambda updated: captured.append(updated) or ModelResponse(result=[AIMessage(content="ok")]),
     )
 
     effective_ids = [message.id for message in captured[0].messages]
@@ -260,6 +249,4 @@ def test_committed_event_reconstructs_effective_view_without_deleting_checkpoint
     assert {"m3", "m4"} <= set(effective_ids)
     assert request.state["messages"] == messages
     assert store.get_snapshot("task-a", 1).lifecycle == "active"
-    assert coordinator.history_repository.context_telemetry(
-        "task-a"
-    ).active_snapshot_version == 1
+    assert coordinator.history_repository.context_telemetry("task-a").active_snapshot_version == 1

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 
+from deepfix.database import SQLiteDatabase
 from deepfix.domain_repositories.history import (
     ContextTelemetryIdentityConflict,
     HistoryRepository,
 )
 from deepfix.domain_repositories.migration import DomainMigrator, domain_is_switched
-from deepfix.memory import WorkingMemoryStore
+from deepfix.models import ContextMetrics
 
 TASK_ID = "task-context-telemetry"
 
@@ -95,18 +98,28 @@ def test_legacy_context_metrics_migrate_once_before_authority_switch(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "deepfix.db"
-    legacy = WorkingMemoryStore(database)
-    legacy.record_peak_tokens(TASK_ID, 9_100)
-    legacy.record_budget(TASK_ID, 0.91, "emergency")
-    legacy.record_overflow(TASK_ID)
-    legacy.record_overflow_retry(TASK_ID)
-    legacy.record_compaction_failure(TASK_ID, "artifact_write_failed")
-    legacy.record_compaction_event(
-        TASK_ID,
-        snapshot_version=3,
-        artifact_path="/.deepfix-artifacts/conversation_history/legacy.md",
-        emergency=False,
+    metrics = ContextMetrics(
+        context_peak_tokens=9_100,
+        latest_usage_ratio=0.91,
+        latest_budget_zone="emergency",
+        context_overflow_count=1,
+        overflow_retry_count=1,
+        compaction_failure_count=1,
+        last_compaction_error="artifact_write_failed",
+        active_compaction_count=1,
+        normal_compaction_count=1,
+        active_compaction_snapshot_version=3,
+        last_compaction_artifact="/.deepfix-artifacts/conversation_history/legacy.md",
     )
+    sqlite = SQLiteDatabase(database)
+    with sqlite.unit_of_work() as connection:
+        connection.execute(
+            "CREATE TABLE context_metrics (task_id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO context_metrics(task_id, payload, updated_at) VALUES (?, ?, ?)",
+            (TASK_ID, json.dumps(asdict(metrics)), "2026-08-31T00:00:00+00:00"),
+        )
 
     migrator = DomainMigrator(database)
     first = migrator.migrate_context_telemetry(TASK_ID)

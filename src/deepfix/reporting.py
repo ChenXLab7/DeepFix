@@ -101,9 +101,7 @@ def _render_legacy_report(
     task: TaskState,
     external_evidence: Sequence[ExternalEvidence] = (),
 ) -> str:
-    current_evidence = [
-        item for item in external_evidence if item.task_id == task.task_id
-    ]
+    current_evidence = [item for item in external_evidence if item.task_id == task.task_id]
     sections = [
         "# DeepFix 修复报告",
         "",
@@ -148,18 +146,12 @@ def _render_legacy_report(
                 else ""
             )
         ),
-        (
-            "Required Oracle："
-            f"{task.passed_required_oracle_count}/"
-            f"{task.required_oracle_count} 通过"
-        ),
+        (f"Required Oracle：{task.passed_required_oracle_count}/{task.required_oracle_count} 通过"),
         f"Supplemental 失败：{task.supplemental_failure_count}",
-        "未完成 Operation："
-        + ("、".join(task.unresolved_operation_ids) or "无"),
+        "未完成 Operation：" + ("、".join(task.unresolved_operation_ids) or "无"),
         "",
         "## 上下文管理",
         "",
-        f"工作记忆版本：{task.working_memory_version}",
         f"上下文峰值估算：{task.context_metrics.context_peak_tokens} tokens",
         f"主动压缩次数：{task.context_metrics.active_compaction_count}",
         f"上下文溢出次数：{task.context_metrics.context_overflow_count}",
@@ -179,14 +171,8 @@ def _render_legacy_report(
             f"{task.context_metrics.manual_compaction_error_count}"
         ),
         f"Overflow 重试次数：{task.context_metrics.overflow_retry_count}",
-        (
-            "生效 Snapshot 版本："
-            f"{task.context_metrics.active_compaction_snapshot_version or '无'}"
-        ),
-        (
-            "最后压缩 Artifact："
-            f"{task.context_metrics.last_compaction_artifact or '无'}"
-        ),
+        (f"生效 Snapshot 版本：{task.context_metrics.active_compaction_snapshot_version or '无'}"),
+        (f"最后压缩 Artifact：{task.context_metrics.last_compaction_artifact or '无'}"),
         f"最后压缩错误：{task.context_metrics.last_compaction_error or '无'}",
         f"最后主动压缩时间：{task.context_metrics.last_compaction_at or '无'}",
         "卸载文件：",
@@ -209,9 +195,7 @@ def _render_legacy_report(
 def _render_repository_report(view: TaskReportView) -> str:
     tests = list(view.verification.test_evidence)
     changes = [
-        item
-        for item in view.verification.file_change_evidence
-        if item.status == "succeeded"
+        item for item in view.verification.file_change_evidence if item.status == "succeeded"
     ]
     supported = [item for item in view.hypotheses if item.state == "supported"]
     policy = view.verification_policy
@@ -228,9 +212,7 @@ def _render_repository_report(view: TaskReportView) -> str:
         "",
         *(
             [
-                f"- {item.statement}（Evidence: "
-                + (", ".join(item.evidence_ids) or "无")
-                + "）"
+                f"- {item.statement}（Evidence: " + (", ".join(item.evidence_ids) or "无") + "）"
                 for item in supported
             ]
             or ["无"]
@@ -259,16 +241,11 @@ def _render_repository_report(view: TaskReportView) -> str:
         f"Workspace Baseline：{view.definition.workspace_baseline_id or '无'}",
         f"隔离级别：{view.definition.confinement_level}",
         "Verification Policy："
-        + (
-            f"{policy.policy_id} (v{policy.version})"
-            if policy is not None
-            else "无"
-        ),
+        + (f"{policy.policy_id} (v{policy.version})" if policy is not None else "无"),
         (
             "Required Oracle："
             + (
-                f"{len(oracle.passed_required_oracle_ids)}/"
-                f"{len(policy.required_oracles)} 通过"
+                f"{len(oracle.passed_required_oracle_ids)}/{len(policy.required_oracles)} 通过"
                 if oracle is not None and policy is not None
                 else "0/0 通过"
             )
@@ -283,10 +260,7 @@ def _render_repository_report(view: TaskReportView) -> str:
         f"上下文峰值估算：{metrics.context_peak_tokens} tokens",
         f"主动压缩次数：{metrics.active_compaction_count}",
         f"上下文溢出次数：{metrics.context_overflow_count}",
-        (
-            f"最近预算区域：{metrics.latest_budget_zone or '无'} "
-            f"({metrics.latest_usage_ratio:.1%})"
-        ),
+        (f"最近预算区域：{metrics.latest_budget_zone or '无'} ({metrics.latest_usage_ratio:.1%})"),
         (
             "普通/紧急压缩次数："
             f"{metrics.normal_compaction_count}/{metrics.emergency_compaction_count}"
@@ -315,9 +289,7 @@ def _render_repository_report(view: TaskReportView) -> str:
         f"结论：{_repository_conclusion(view, changes, tests)}",
         f"暂停原因：{view.lifecycle.reason or '无'}",
         "残余风险：",
-        *_list_or_none(
-            [item.text for item in view.unresolved_questions if item.status == "open"]
-        ),
+        *_list_or_none([item.text for item in view.unresolved_questions if item.status == "open"]),
         "未验证项：",
         *_repository_unverified_lines(view, changes, tests),
     ]
@@ -342,13 +314,9 @@ def _repository_conclusion(
     tests: list[SystemTestEvidence],
 ) -> str:
     if view.decision is not None and view.decision.outcome == "fixed":
-        return "修复已由可信裁决确认；依据：" + ", ".join(
-            view.decision.evidence_ids
-        )
+        return "修复已由可信裁决确认；依据：" + ", ".join(view.decision.evidence_ids)
     if view.decision is not None and view.decision.outcome == "not_reproduced":
-        return "未复现用户描述的问题；依据：" + ", ".join(
-            view.decision.evidence_ids
-        )
+        return "未复现用户描述的问题；依据：" + ", ".join(view.decision.evidence_ids)
     if view.lifecycle.reason and changes:
         latest_test = tests[-1] if tests else None
         verification = (
@@ -392,10 +360,7 @@ def _repository_approval_lines(items: list[ExecutionApproval]) -> list[str]:
 def _evidence_lines(task: TaskState) -> list[str]:
     if not task.evidence:
         return ["无"]
-    return [
-        f"- {item.source}：{item.observation}"
-        for item in task.evidence
-    ]
+    return [f"- {item.source}：{item.observation}" for item in task.evidence]
 
 
 def _conclusion(task: TaskState) -> str:
@@ -407,10 +372,7 @@ def _conclusion(task: TaskState) -> str:
             "failed": "最新修改后的测试仍然失败",
             "not_applicable": "最新修改缺少验证状态",
         }[task.latest_change_verification]
-        return (
-            f"代码修改已成功写入：{paths}；{verification}；"
-            f"Agent 流程已暂停"
-        )
+        return f"代码修改已成功写入：{paths}；{verification}；Agent 流程已暂停"
     return task.final_summary or "无"
 
 
@@ -443,10 +405,7 @@ def _test_lines(task: TaskState) -> list[str]:
 def _approval_lines(task: TaskState) -> list[str]:
     if not task.approvals:
         return ["无"]
-    return [
-        f"- [{record.risk}] {record.operation}：{record.decision}"
-        for record in task.approvals
-    ]
+    return [f"- [{record.risk}] {record.operation}：{record.decision}" for record in task.approvals]
 
 
 def _list_or_none(items: list[str]) -> list[str]:

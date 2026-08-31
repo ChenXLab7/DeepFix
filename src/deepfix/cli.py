@@ -20,7 +20,6 @@ from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.receipts import ToolExecutionReceiptStore
 from deepfix.investigation.store import InvestigationStore
 from deepfix.investigation.token_budget import TokenBudgetStore
-from deepfix.memory import WorkingMemoryStore
 from deepfix.models import TaskState, TaskStatus
 from deepfix.operations import OperationJournalStore, OperationReconciler
 from deepfix.persistence import TaskRepository
@@ -181,7 +180,6 @@ def main(
             project_python=stored_task.project_python or None,
         )
 
-    working_memory_store = WorkingMemoryStore(config.database_path)
     compaction_store = CompactionStore(
         config.database_path,
         repositories=repositories,
@@ -197,9 +195,7 @@ def main(
         ),
         tasks=repository,
         compaction_store=compaction_store,
-        evidence_collector=EvidenceCollector(
-            compaction_store, research_evidence_store
-        ),
+        evidence_collector=EvidenceCollector(compaction_store, research_evidence_store),
     )
     artifact_backend = build_backend(config)
     operation_journal = OperationJournalStore(
@@ -227,7 +223,6 @@ def main(
             agent = build_agent(
                 config,
                 checkpointer,
-                working_memory_store,
                 task_repository=repository,
                 compaction_store=compaction_store,
                 extensions=extensions,
@@ -242,7 +237,6 @@ def main(
                 repository,
                 ApprovalPolicy(config.approval_mode),
                 config,
-                working_memory_store,
                 research_evidence_store,
                 compaction_store,
                 investigation,
@@ -293,11 +287,7 @@ def build_cli_research_extensions(
     tavily = TavilyProvider(
         client,
         url_policy,
-        api_key=(
-            os.environ.get("TAVILY_API_KEY")
-            if config.search_provider == "tavily"
-            else None
-        ),
+        api_key=(os.environ.get("TAVILY_API_KEY") if config.search_provider == "tavily" else None),
     )
     provider = CompositeTechnicalSearchProvider((pypi, github, tavily))
     fetcher = SafeEvidenceFetcher(client, url_policy)

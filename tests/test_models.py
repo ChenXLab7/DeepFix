@@ -1,10 +1,7 @@
 import pytest
 
 from deepfix.config import ApprovalMode
-from deepfix.investigation.models import (
-    AgentPhase,
-    InvestigationRecoveryMetadata,
-)
+from deepfix.investigation.models import InvestigationRecoveryMetadata
 from deepfix.models import (
     ApprovalRecord,
     ContextMetrics,
@@ -81,9 +78,7 @@ def test_paused_task_resumes_previous_status(tmp_path):
 
 def test_task_round_trip_preserves_pending_actions_and_processed_tool_calls(tmp_path):
     task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
-    task.pending_actions.append(
-        {"name": "execute", "args": {"command": "pytest -q"}}
-    )
+    task.pending_actions.append({"name": "execute", "args": {"command": "pytest -q"}})
     task.processed_tool_call_ids.append("call-1")
 
     restored = TaskState.from_dict(task.to_dict())
@@ -94,13 +89,11 @@ def test_task_round_trip_preserves_pending_actions_and_processed_tool_calls(tmp_
 
 def test_task_round_trip_preserves_context_state(tmp_path):
     task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
-    task.working_memory_version = 3
     task.context_metrics.context_peak_tokens = 4200
     task.offloaded_artifacts = ["conversation_history/a.md"]
 
     restored = TaskState.from_dict(task.to_dict())
 
-    assert restored.working_memory_version == 3
     assert restored.context_metrics.context_peak_tokens == 4200
     assert restored.offloaded_artifacts == ["conversation_history/a.md"]
     assert isinstance(restored.context_metrics, ContextMetrics)
@@ -111,7 +104,6 @@ def test_task_round_trip_preserves_investigation_recovery(tmp_path):
     task.investigation_recovery = InvestigationRecoveryMetadata(
         task_id=task.task_id,
         error_code="investigation_stagnated",
-        agent_phase=AgentPhase.DIAGNOSING,
         state_version=3,
         last_event_sequence=7,
         checkpoint_available=True,
@@ -126,13 +118,11 @@ def test_task_round_trip_preserves_investigation_recovery(tmp_path):
 def test_task_from_old_payload_uses_context_defaults(tmp_path):
     task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
     payload = task.to_dict()
-    payload.pop("working_memory_version")
     payload.pop("context_metrics")
     payload.pop("offloaded_artifacts")
 
     restored = TaskState.from_dict(payload)
 
-    assert restored.working_memory_version == 0
     assert restored.context_metrics == ContextMetrics()
     assert restored.offloaded_artifacts == []
     assert restored.context_recovery is None

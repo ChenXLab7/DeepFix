@@ -57,9 +57,7 @@ def test_measure_counts_system_protection_messages_tools_and_reserve():
     assert report.max_input_tokens == 20
     assert report.output_reserve_tokens == 2
     assert len(counted) == 7
-    assert {"base-system", "anchor", "memory", "evidence", "first", "second"} <= set(
-        counted
-    )
+    assert {"base-system", "anchor", "memory", "evidence", "first", "second"} <= set(counted)
 
 
 def test_measure_requires_profile_or_explicit_model_table_entry():
@@ -143,9 +141,7 @@ def test_retention_prioritizes_whole_units_and_mandatory_context():
     }
     assert [unit.unit_id for unit in plan.compressed_units] == ["old"]
     assert plan.retained_message_ids == frozenset(
-        message_id
-        for unit in plan.retained_units
-        for message_id in unit.message_ids
+        message_id for unit in plan.retained_units for message_id in unit.message_ids
     )
     assert plan.estimated_ratio <= 0.75
 
@@ -171,11 +167,3 @@ def test_mandatory_unit_is_retained_even_when_it_exceeds_target():
         "latest",
     }
     assert plan.compressed_units == ()
-
-
-def test_observation_hint_is_once_per_memory_version_and_latest_unit():
-    monitor = ContextBudgetMonitor(output_reserve_tokens=0)
-
-    assert monitor.should_emit_memory_hint(2, "wu-3") is True
-    assert monitor.should_emit_memory_hint(2, "wu-3") is False
-    assert monitor.should_emit_memory_hint(2, "wu-4") is True

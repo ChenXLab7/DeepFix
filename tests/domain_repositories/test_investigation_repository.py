@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 
 import pytest
 
@@ -28,7 +29,6 @@ from deepfix.investigation.models import (
     InvestigationState,
     UnresolvedQuestion,
 )
-from deepfix.memory import ProgressSnapshot, WorkingMemoryStore
 
 
 def _hypothesis(
@@ -84,9 +84,7 @@ def test_hypothesis_transition_requires_stable_id_and_current_evidence(tmp_path)
     candidate = _hypothesis("h-1")
 
     repository.record_hypothesis("task-1", candidate)
-    supported = candidate.model_copy(
-        update={"state": "supported", "evidence_ids": ["e-1"]}
-    )
+    supported = candidate.model_copy(update={"state": "supported", "evidence_ids": ["e-1"]})
 
     assert repository.record_hypothesis("task-1", supported) == supported
     with pytest.raises(HypothesisIdentityConflict):
@@ -104,9 +102,7 @@ def test_hypothesis_transition_rejects_missing_or_invalid_evidence(tmp_path):
     with pytest.raises(InvestigationEvidenceMissing):
         repository.record_hypothesis(
             "task-1",
-            candidate.model_copy(
-                update={"state": "supported", "evidence_ids": ["missing"]}
-            ),
+            candidate.model_copy(update={"state": "supported", "evidence_ids": ["missing"]}),
         )
 
 
@@ -116,9 +112,7 @@ def test_rejected_hypothesis_reopens_only_under_new_identity(tmp_path):
     repository = InvestigationRepository(database)
     candidate = _hypothesis("h-1")
     repository.record_hypothesis("task-1", candidate)
-    rejected = candidate.model_copy(
-        update={"state": "rejected", "evidence_ids": ["e-1"]}
-    )
+    rejected = candidate.model_copy(update={"state": "rejected", "evidence_ids": ["e-1"]})
     repository.record_hypothesis("task-1", rejected)
 
     with pytest.raises(HypothesisTransitionError):
@@ -217,9 +211,7 @@ def test_migration_keeps_current_hypothesis_over_stale_snapshot_projection(tmp_p
         unresolved_questions=[
             ProvenancedText(
                 text="Why does this fail only on Windows?",
-                sources=[
-                    ProvenanceRef(kind="snapshot_record", ref_id="snapshot-question-1")
-                ],
+                sources=[ProvenanceRef(kind="snapshot_record", ref_id="snapshot-question-1")],
             )
         ],
         next_steps=[],
@@ -227,17 +219,41 @@ def test_migration_keeps_current_hypothesis_over_stale_snapshot_projection(tmp_p
         content_hash="a" * 64,
     )
     CompactionStore(database).save_prepared_snapshot(snapshot, "input-1")
-    WorkingMemoryStore(database.path).save(
-        "task-1",
-        ProgressSnapshot(
-            phase="investigating",
-            summary="legacy memory",
-            unresolved_questions=["Why does this fail only on Windows?"],
-        ),
-    )
-    legacy_hash_before = hashlib.sha256(
-        state.model_dump_json().encode("utf-8")
-    ).hexdigest()
+    with database.unit_of_work() as connection:
+        connection.execute(
+            """
+            CREATE TABLE working_memory (
+                task_id TEXT NOT NULL, version INTEGER NOT NULL,
+                payload TEXT NOT NULL, created_at TEXT NOT NULL,
+                PRIMARY KEY(task_id, version)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO working_memory(task_id, version, payload, created_at) VALUES (?, ?, ?, ?)",
+            (
+                "task-1",
+                1,
+                json.dumps(
+                    {
+                        "phase": "investigating",
+                        "summary": "legacy memory",
+                        "facts": [],
+                        "evidence": [],
+                        "active_hypotheses": [],
+                        "rejected_hypotheses": [],
+                        "confirmed_hypotheses": [],
+                        "checked_files": [],
+                        "experiments": [],
+                        "next_steps": [],
+                        "unresolved_questions": ["Why does this fail only on Windows?"],
+                        "coverage": {"covered_message_ids": [], "covered_work_unit_ids": []},
+                    }
+                ),
+                "2026-08-31T00:00:00+00:00",
+            ),
+        )
+    legacy_hash_before = hashlib.sha256(state.model_dump_json().encode("utf-8")).hexdigest()
 
     report = DomainMigrator(database).migrate_investigation("task-1")
     repository = InvestigationRepository(database)
@@ -295,9 +311,7 @@ def test_migration_refuses_terminal_hypothesis_with_missing_evidence(tmp_path):
     report = DomainMigrator(database).migrate_investigation("task-1")
 
     assert not report.ready_to_switch
-    assert report.missing_references == [
-        "hypothesis:h-dangling:evidence:missing-evidence"
-    ]
+    assert report.missing_references == ["hypothesis:h-dangling:evidence:missing-evidence"]
     with database.connection() as connection:
         marker = connection.execute(
             """

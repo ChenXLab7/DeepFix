@@ -56,6 +56,7 @@ PLAN_2_LEGACY_FIELDS = frozenset(
         "shell_calls",
         "agent_invocations",
         "consecutive_test_failures",
+        # Migration-only legacy payload key; no runtime authority is retained.
         "working_memory_version",
         "context_metrics",
         "offloaded_artifacts",
@@ -141,7 +142,9 @@ def legacy_payload_from_task(
         names = ", ".join(sorted(unknown_fields))
         raise ValueError(f"TaskState fields lack an authority assignment: {names}")
     omitted = frozenset().union(*(MIGRATED_LEGACY_FIELDS[domain] for domain in switched_domains))
-    return {key: payload[key] for key in PLAN_2_LEGACY_FIELDS if key not in omitted}
+    return {
+        key: payload[key] for key in PLAN_2_LEGACY_FIELDS if key not in omitted and key in payload
+    }
 
 
 def reconstruct_task_state(
