@@ -12,6 +12,26 @@ from deepfix.domain_repositories.migration import DomainMigrator
 
 SOURCE_ROOT = Path(__file__).parents[1] / "src" / "deepfix"
 
+RETIRED_RUNTIME_SYMBOLS = {
+    "TaskState",
+    "TaskStatus",
+    "CompactionStore",
+    "ResearchEvidenceStore",
+    "VerificationPolicyStore",
+    "ToolExecutionReceiptStore",
+    "OperationJournalStore",
+    "InvestigationStore",
+}
+
+MIGRATION_ONLY_MODULES = {
+    Path("task_domain/legacy_payload.py"),
+    Path("task_domain/migration.py"),
+    Path("domain_repositories/migration.py"),
+    Path("compaction/migration.py"),
+    Path("investigation/migration.py"),
+    Path("evaluation/legacy.py"),
+}
+
 
 def test_agent_constructor_and_tool_assembly_exclude_working_memory() -> None:
     parameters = inspect.signature(build_agent).parameters
@@ -44,6 +64,71 @@ def test_current_snapshot_schema_has_no_working_memory_projection() -> None:
 
 def test_retired_memory_module_is_absent() -> None:
     assert not (SOURCE_ROOT / "memory.py").exists()
+
+
+def test_runtime_modules_do_not_depend_on_retired_state_or_store_facades() -> None:
+    offenders: list[str] = []
+    for path in SOURCE_ROOT.rglob("*.py"):
+        relative = path.relative_to(SOURCE_ROOT)
+        if relative in MIGRATION_ONLY_MODULES:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                names = {item.name for item in node.names}
+                found = names & RETIRED_RUNTIME_SYMBOLS
+                offenders.extend(f"{relative}:{name}" for name in sorted(found))
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id in RETIRED_RUNTIME_SYMBOLS:
+                    offenders.append(f"{relative}:{node.func.id}")
+
+    assert offenders == []
+
+
+def test_retired_giant_models_and_store_classes_are_not_defined() -> None:
+    definitions: list[str] = []
+    for path in SOURCE_ROOT.rglob("*.py"):
+        relative = path.relative_to(SOURCE_ROOT)
+        if relative in MIGRATION_ONLY_MODULES:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name in RETIRED_RUNTIME_SYMBOLS:
+                definitions.append(f"{relative}:{node.name}")
+
+    assert definitions == []
+
+
+def test_service_exposes_no_legacy_aggregate_helpers() -> None:
+    from deepfix.service import BugfixService
+
+    retired_methods = {
+        "_invoke",
+        "_load_current_task",
+        "_save",
+        "_sync_context",
+        "_apply_outcome",
+        "_record_tool_results",
+    }
+
+    assert retired_methods.isdisjoint(vars(BugfixService))
+
+
+def test_model_outcome_is_explicitly_non_authoritative_candidate() -> None:
+    from deepfix.task_domain.outcome import RepairOutcomeCandidate
+
+    assert {
+        "evidence",
+        "changed_files",
+        "test_results",
+        "approvals",
+        "completed_criteria",
+    }.isdisjoint(RepairOutcomeCandidate.model_fields)
+    assert {
+        "hypothesis_candidates",
+        "plan_candidates",
+        "evidence_candidates",
+    } <= RepairOutcomeCandidate.model_fields.keys()
 
 
 def test_legacy_memory_semantics_migrate_to_bounded_domain_owners(tmp_path) -> None:

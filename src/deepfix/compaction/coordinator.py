@@ -45,9 +45,13 @@ from deepfix.compaction.snapshot import (
     CompactionDeltaGenerator,
     CompactionSnapshotBuilder,
 )
-from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.work_units import WorkUnitPartition, partition_work_units
-from deepfix.domain_repositories.history import HistoryRepository
+from deepfix.domain_repositories.evidence import EvidenceRepository
+from deepfix.domain_repositories.history import (
+    HistoryRepository,
+    history_record_from_snapshot,
+)
+from deepfix.domain_repositories.investigation import InvestigationRepository
 from deepfix.protected_context import (
     ProtectedContext,
     ProtectedContextBuilder,
@@ -101,8 +105,9 @@ class CompactionCoordinator:
         adapter: DeepAgentsArtifactAdapter | Any,
         delta_generator: CompactionDeltaGenerator | Any,
         snapshot_builder: CompactionSnapshotBuilder | Any,
-        snapshot_store: CompactionStore | Any,
-        history_repository: HistoryRepository | None = None,
+        history_repository: HistoryRepository,
+        evidence_repository: EvidenceRepository,
+        investigation_repository: InvestigationRepository,
         budget_monitor: ContextBudgetMonitor | None = None,
         protected_builder: ProtectedContextBuilder | None = None,
         model: BaseChatModel | None = None,
@@ -114,15 +119,49 @@ class CompactionCoordinator:
         self.adapter = adapter
         self.delta_generator = delta_generator
         self.snapshot_builder = snapshot_builder
-        self.snapshot_store = snapshot_store
-        self.history_repository = history_repository or HistoryRepository(
-            snapshot_store.database_path
-        )
+        self.history_repository = history_repository
+        self.evidence_repository = evidence_repository
+        self.investigation_repository = investigation_repository
         self.budget_monitor = budget_monitor
         self.protected_builder = protected_builder
         self.model = model
         self.partitioner = partitioner
         self._failed_attempts: set[str] = set()
+
+    def _snapshot(self, task_id: str, version: int) -> CompactionSnapshot:
+        return self.history_repository.project_snapshot(
+            task_id,
+            version,
+            evidence=self.evidence_repository,
+            investigation=self.investigation_repository,
+        )
+
+    def active_snapshot_from_event(
+        self,
+        task_id: str,
+        event: DeepFixCompactionEvent | None,
+    ) -> CompactionSnapshot | None:
+        if event is None:
+            return None
+        record = self.history_repository.active_from_event(task_id, event)
+        return None if record is None else self._snapshot(task_id, record.version)
+
+    def activate_from_event(
+        self,
+        task_id: str,
+        event: DeepFixCompactionEvent,
+    ) -> CompactionSnapshot:
+        self.history_repository.activate(task_id, event.active_snapshot_version, event)
+        return self._snapshot(task_id, event.active_snapshot_version)
+
+    def _abandon_if_prepared(self, task_id: str, version: int, reason: str) -> None:
+        """Best-effort cleanup must never mask the original recovery path."""
+        try:
+            snapshot = self._snapshot(task_id, version)
+            if snapshot.lifecycle == "prepared":
+                self.history_repository.abandon(task_id, version, reason)
+        except Exception:  # noqa: BLE001 - cleanup must not mask recovery
+            return
 
     def compact_manually(self, runtime: Any) -> Command:
         request, immediate = self._manual_request(runtime)
@@ -204,7 +243,7 @@ class CompactionCoordinator:
         error: CompactionPreparationError,
     ) -> Command:
         failure = error.failure
-        self.snapshot_store.record_failure(failure)
+        self.history_repository.record_failure(failure)
         self.history_repository.record_compaction_failure(
             request.task_id,
             event_id=f"{failure.attempt_id}:failure",
@@ -216,14 +255,14 @@ class CompactionCoordinator:
         )
         if request.budget.zone == "emergency":
             if failure.prepared_snapshot_version is not None:
-                self.snapshot_store.abandon_snapshot(
+                self.history_repository.abandon(
                     request.task_id,
                     failure.prepared_snapshot_version,
                     "emergency manual compaction failed",
                 )
             raise _recovery_required(request, failure) from error
         if failure.prepared_snapshot_version is not None:
-            self.snapshot_store.abandon_snapshot(
+            self.history_repository.abandon(
                 request.task_id,
                 failure.prepared_snapshot_version,
                 "manual compaction returned error",
@@ -353,7 +392,10 @@ class CompactionCoordinator:
             ) from exc
 
         try:
-            saved = self.snapshot_store.save_prepared_snapshot(candidate, input_hash)
+            saved_record = self.history_repository.save_prepared(
+                history_record_from_snapshot(candidate, input_hash)
+            )
+            saved = self._snapshot(saved_record.task_id, saved_record.version)
         except CompactionPreparationError as exc:
             raise _rebind_error(
                 exc,
@@ -374,7 +416,7 @@ class CompactionCoordinator:
             ) from exc
 
         try:
-            verified = self.snapshot_store.get_snapshot(
+            verified = self._snapshot(
                 request.task_id,
                 saved.version,
             )
@@ -421,7 +463,7 @@ class CompactionCoordinator:
             input_hash=input_hash,
         )
         try:
-            active = self.snapshot_store.activate_from_event(
+            active = self.activate_from_event(
                 request.task_id,
                 event,
             )
@@ -518,8 +560,9 @@ class CompactionCoordinator:
             adapter=_StaticArtifactAdapter(artifact),
             delta_generator=_StaticDeltaGenerator(delta),
             snapshot_builder=self.snapshot_builder,
-            snapshot_store=self.snapshot_store,
             history_repository=self.history_repository,
+            evidence_repository=self.evidence_repository,
+            investigation_repository=self.investigation_repository,
             partitioner=self.partitioner,
         )
         return coordinator.prepare(request)
@@ -549,7 +592,7 @@ class CompactionCoordinator:
             prepared = self.prepare(request)
         except CompactionPreparationError as exc:
             failure = exc.failure
-            self.snapshot_store.record_failure(failure)
+            self.history_repository.record_failure(failure)
             self.history_repository.record_compaction_failure(
                 request.task_id,
                 event_id=f"{failure.attempt_id}:failure",
@@ -558,8 +601,7 @@ class CompactionCoordinator:
             self._failed_attempts.add(failure.attempt_id)
             if request.budget.zone == "emergency" or request.entrypoint == "overflow_recovery":
                 if failure.prepared_snapshot_version is not None:
-                    _abandon_if_prepared(
-                        self.snapshot_store,
+                    self._abandon_if_prepared(
                         request.task_id,
                         failure.prepared_snapshot_version,
                         "emergency preparation failed",
@@ -571,8 +613,7 @@ class CompactionCoordinator:
                 event_id=f"{failure.attempt_id}:failure-passthrough",
             )
             if failure.prepared_snapshot_version is not None:
-                _abandon_if_prepared(
-                    self.snapshot_store,
+                self._abandon_if_prepared(
                     request.task_id,
                     failure.prepared_snapshot_version,
                     "passthrough produced newer conversation state",
@@ -620,7 +661,7 @@ class CompactionCoordinator:
             prepared = await self.aprepare(request)
         except CompactionPreparationError as exc:
             failure = exc.failure
-            self.snapshot_store.record_failure(failure)
+            self.history_repository.record_failure(failure)
             self.history_repository.record_compaction_failure(
                 request.task_id,
                 event_id=f"{failure.attempt_id}:failure",
@@ -629,8 +670,7 @@ class CompactionCoordinator:
             self._failed_attempts.add(failure.attempt_id)
             if request.budget.zone == "emergency" or request.entrypoint == "overflow_recovery":
                 if failure.prepared_snapshot_version is not None:
-                    _abandon_if_prepared(
-                        self.snapshot_store,
+                    self._abandon_if_prepared(
                         request.task_id,
                         failure.prepared_snapshot_version,
                         "emergency preparation failed",
@@ -642,8 +682,7 @@ class CompactionCoordinator:
                 event_id=f"{failure.attempt_id}:failure-passthrough",
             )
             if failure.prepared_snapshot_version is not None:
-                _abandon_if_prepared(
-                    self.snapshot_store,
+                self._abandon_if_prepared(
                     request.task_id,
                     failure.prepared_snapshot_version,
                     "passthrough produced newer conversation state",
@@ -671,21 +710,6 @@ def _with_task_scope(message: AnyMessage, task_id: str) -> AnyMessage:
     additional = dict(message.additional_kwargs)
     additional["_deepfix_task_id"] = task_id
     return message.model_copy(update={"additional_kwargs": additional}, deep=True)
-
-
-def _abandon_if_prepared(
-    store: CompactionStore,
-    task_id: str,
-    version: int,
-    reason: str,
-) -> None:
-    """Best-effort cleanup must never mask the original recovery path."""
-    try:
-        snapshot = store.get_snapshot(task_id, version)
-        if snapshot.lifecycle == "prepared":
-            store.abandon_snapshot(task_id, version, reason)
-    except Exception:  # noqa: BLE001 - cleanup must not mask recovery
-        return
 
 
 def _input_hash(

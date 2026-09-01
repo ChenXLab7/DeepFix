@@ -59,12 +59,20 @@ class TaskRepository:
         with self.database.connection() as connection:
             definition = self._get_definition(connection, task_id)
         if definition is None:
+            self._backfill_historical_task(task_id)
+            with self.database.connection() as connection:
+                definition = self._get_definition(connection, task_id)
+        if definition is None:
             raise KeyError(task_id)
         return definition
 
     def get_lifecycle(self, task_id: str) -> TaskLifecycle:
         with self.database.connection() as connection:
             lifecycle = self._get_lifecycle(connection, task_id)
+        if lifecycle is None:
+            self._backfill_historical_task(task_id)
+            with self.database.connection() as connection:
+                lifecycle = self._get_lifecycle(connection, task_id)
         if lifecycle is None:
             raise KeyError(task_id)
         return lifecycle
@@ -353,173 +361,6 @@ class TaskRepository:
             estimated=bool(row[1]),
         )
 
-    def save_legacy_projection(self, task) -> None:
-        from deepfix.domain_repositories.migration import (
-            ensure_no_domain_migration_fence,
-            switched_domains_for_task,
-        )
-        from deepfix.task_domain.migration import (
-            MIGRATED_LEGACY_FIELDS,
-            legacy_payload_from_task,
-            lifecycle_status_for_legacy,
-            task_definition_from_legacy,
-        )
-
-        with self.database.unit_of_work(immediate=True) as connection:
-            migration_domains = (
-                "evidence",
-                "research",
-                "investigation",
-                "execution",
-                "history",
-            )
-            ensure_no_domain_migration_fence(
-                connection,
-                task.task_id,
-                migration_domains,
-            )
-            switched_domains = switched_domains_for_task(
-                connection,
-                task.task_id,
-                migration_domains,
-            )
-            payload = legacy_payload_from_task(
-                task,
-                switched_domains=switched_domains,
-            )
-            frozen_fields = frozenset().union(
-                *(MIGRATED_LEGACY_FIELDS[domain] for domain in switched_domains)
-            )
-            existing_projection = connection.execute(
-                "SELECT payload FROM legacy_task_projection WHERE task_id = ?",
-                (task.task_id,),
-            ).fetchone()
-            if existing_projection is not None:
-                previous_payload = json.loads(str(existing_projection[0]))
-                payload.update(
-                    {
-                        field: previous_payload[field]
-                        for field in frozen_fields
-                        if field in previous_payload
-                    }
-                )
-            serialized = _canonical_json(payload)
-            payload_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-            updated_at = _now()
-            existing_definition = self._get_definition(connection, task.task_id)
-            definition = task_definition_from_legacy(
-                task,
-                created_at=(
-                    existing_definition.created_at
-                    if existing_definition is not None
-                    else None
-                ),
-            )
-            if existing_definition is not None:
-                definition = definition.model_copy(
-                    update={
-                        "original_message_id": existing_definition.original_message_id,
-                    }
-                )
-            self._create_definition(connection, definition)
-            self._synchronize_legacy_lifecycle(
-                connection,
-                task.task_id,
-                lifecycle_status_for_legacy(task),
-                reason=task.pause_reason,
-            )
-            connection.execute(
-                """
-                INSERT INTO legacy_task_projection(
-                    task_id, legacy_phase_status, legacy_paused_from,
-                    payload, payload_hash, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(task_id) DO UPDATE SET
-                    legacy_phase_status = excluded.legacy_phase_status,
-                    legacy_paused_from = excluded.legacy_paused_from,
-                    payload = excluded.payload,
-                    payload_hash = excluded.payload_hash,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    task.task_id,
-                    task.status.value,
-                    task.paused_from.value if task.paused_from is not None else None,
-                    serialized,
-                    payload_hash,
-                    updated_at,
-                ),
-            )
-            stored_definition = self._get_definition(connection, task.task_id)
-            stored_projection = connection.execute(
-                "SELECT payload_hash FROM legacy_task_projection WHERE task_id = ?",
-                (task.task_id,),
-            ).fetchone()
-            if (
-                stored_definition is None
-                or _definition_hash(stored_definition) != _definition_hash(definition)
-                or stored_projection is None
-                or str(stored_projection[0]) != payload_hash
-            ):
-                raise sqlite3.IntegrityError("task migration verification failed")
-
-    def save(self, task) -> None:
-        """Compatibility alias retained until Plan 4 removes TaskState writes."""
-        self.save_legacy_projection(task)
-
-    def get(self, task_id: str):
-        from deepfix.task_domain.migration import reconstruct_task_state
-
-        try:
-            definition = self.get_definition(task_id)
-        except KeyError:
-            self._backfill_historical_task(task_id)
-            definition = self.get_definition(task_id)
-        lifecycle = self.get_lifecycle(task_id)
-        with self.database.connection() as connection:
-            row = connection.execute(
-                """
-                SELECT legacy_phase_status, legacy_paused_from, payload
-                FROM legacy_task_projection WHERE task_id = ?
-                """,
-                (task_id,),
-            ).fetchone()
-        if row is None:
-            raise KeyError(task_id)
-        policy = self.load_verification_policy(task_id)
-        adjudication = self.latest_adjudication(task_id)
-        resolution = (
-            adjudication.outcome
-            if adjudication is not None
-            and adjudication.outcome in {"fixed", "not_reproduced"}
-            else None
-        )
-        return reconstruct_task_state(
-            definition,
-            lifecycle,
-            json.loads(str(row[2])),
-            legacy_phase_status=str(row[0]) if row[0] is not None else None,
-            legacy_paused_from=str(row[1]) if row[1] is not None else None,
-            verification_policy_id=(policy.policy_id if policy is not None else None),
-            verification_policy_version=(
-                policy.version if policy is not None else None
-            ),
-            resolution=resolution,
-        )
-
-    def list_recent(self, limit: int = 20) -> list:
-        self._backfill_all_historical_tasks()
-        with self.database.connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT task_id FROM legacy_task_projection
-                ORDER BY updated_at DESC, rowid DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-        return [self.get(str(row[0])) for row in rows]
-
     def list_recent_definitions(self, limit: int = 20) -> list[TaskDefinition]:
         """Return immutable task definitions without loading legacy projections."""
         self._backfill_all_historical_tasks()
@@ -632,37 +473,6 @@ class TaskRepository:
                 )
                 """
             )
-
-    def _synchronize_legacy_lifecycle(
-        self,
-        connection: sqlite3.Connection,
-        task_id: str,
-        desired: TaskLifecycleStatus,
-        *,
-        reason: str | None,
-    ) -> TaskLifecycle:
-        current = self._get_lifecycle(connection, task_id)
-        if current is None:
-            raise KeyError(task_id)
-        if current.status is desired:
-            return current
-        if current.status is TaskLifecycleStatus.CREATED and desired in {
-            TaskLifecycleStatus.WAITING_APPROVAL,
-            TaskLifecycleStatus.COMPLETED,
-        }:
-            current = self._transition_lifecycle(
-                connection,
-                task_id,
-                TaskLifecycleStatus.RUNNING,
-                expected_version=current.version,
-            )
-        return self._transition_lifecycle(
-            connection,
-            task_id,
-            desired,
-            reason=reason,
-            expected_version=current.version,
-        )
 
     def _create_definition(
         self,
@@ -941,7 +751,7 @@ class TaskRepository:
         )
 
     def _backfill_historical_task(self, task_id: str) -> None:
-        from deepfix.models import TaskState
+        from deepfix.task_domain.legacy_payload import LegacyTaskPayload
 
         with self.database.connection() as connection:
             if not _table_exists(connection, "tasks"):
@@ -952,24 +762,30 @@ class TaskRepository:
             ).fetchone()
         if row is None:
             raise KeyError(task_id)
-        task = TaskState.from_dict(json.loads(str(row[0])))
-        self.save_legacy_projection(task)
-        if task.resolution in {"fixed", "not_reproduced"}:
-            lifecycle = self.get_lifecycle(task.task_id)
-            self.record_adjudication(
-                AdjudicationDecision(
-                    decision_id=_adjudication_id(
-                        task.task_id,
-                        lifecycle.version,
-                        task.resolution,
+        legacy = LegacyTaskPayload.parse_json(str(row[0]))
+        with self.database.unit_of_work(immediate=True) as connection:
+            self._create_definition(connection, legacy.definition)
+            connection.execute(
+                """
+                UPDATE task_lifecycle
+                SET status = ?, version = ?, paused_from = ?, reason = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    legacy.lifecycle.status.value,
+                    legacy.lifecycle.version,
+                    (
+                        legacy.lifecycle.paused_from.value
+                        if legacy.lifecycle.paused_from is not None
+                        else None
                     ),
-                    task_id=task.task_id,
-                    outcome=task.resolution,
-                    evidence_ids=sorted(set(task.external_evidence_ids)),
-                    operation_ids=[],
-                    decided_at=lifecycle.updated_at,
-                )
+                    legacy.lifecycle.reason,
+                    legacy.lifecycle.updated_at,
+                    legacy.definition.task_id,
+                ),
             )
+        if legacy.adjudication is not None:
+            self.record_adjudication(legacy.adjudication)
 
     def _backfill_all_historical_tasks(self) -> None:
         with self.database.connection() as connection:
@@ -1053,12 +869,6 @@ def _token_reservation_id(task_id: str, call_id: str) -> str:
         raise ValueError("token reservation identity cannot be empty")
     digest = hashlib.sha256("|".join(values).encode()).hexdigest()[:32]
     return f"token-reservation_{digest}"
-
-
-def _adjudication_id(task_id: str, version: int, outcome: str) -> str:
-    values = ["adjudication", task_id.strip(), str(version), outcome.strip()]
-    digest = hashlib.sha256("|".join(values).encode()).hexdigest()[:32]
-    return f"adjudication_{digest}"
 
 
 def _now() -> str:

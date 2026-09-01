@@ -6,9 +6,9 @@ from html import escape
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import SystemMessage
 
+from deepfix.domain_repositories.evidence import EvidenceRepository
 from deepfix.prompting import model_request_task_id
 from deepfix.research.models import ExternalEvidence
-from deepfix.research.store import ResearchEvidenceStore
 
 _MAX_RECORDS = 5
 _MAX_BLOCK_CHARACTERS = 8_000
@@ -16,7 +16,7 @@ _TRUNCATION_MARKER = "…[truncated]"
 
 
 class ResearchEvidenceMiddleware(AgentMiddleware):
-    def __init__(self, store: ResearchEvidenceStore) -> None:
+    def __init__(self, store: EvidenceRepository) -> None:
         self.store = store
 
     def wrap_model_call(
@@ -25,7 +25,7 @@ class ResearchEvidenceMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelResponse:
         task_id = model_request_task_id(request)
-        evidence = self.store.list_evidence(task_id) if task_id else []
+        evidence = self.store.list_external_evidence(task_id) if task_id else []
         if not evidence:
             return handler(request)
         block = render_research_evidence(evidence)

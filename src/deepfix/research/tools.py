@@ -15,16 +15,20 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
 
 from deepfix.compaction.models import ArtifactReference
-from deepfix.models import Evidence
+from deepfix.domain_repositories.evidence import EvidenceRepository
 from deepfix.research.dependency import DependencyInspector
 from deepfix.research.fetcher import EvidenceFetchError, SafeEvidenceFetcher
-from deepfix.research.models import DependencyContext, ExternalEvidence, SearchCandidate
+from deepfix.research.models import (
+    DependencyContext,
+    ExternalEvidence,
+    LocalEvidenceReference,
+    SearchCandidate,
+)
 from deepfix.research.providers import (
     CompositeTechnicalSearchProvider,
     ProviderFailure,
 )
 from deepfix.research.sanitizer import QueryRejected, QuerySanitizer
-from deepfix.research.store import ResearchEvidenceStore
 
 _TASK_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _MAX_RETURNED_CANDIDATES = 10
@@ -68,7 +72,7 @@ def build_search_technical_sources_tool(
     sanitizer: QuerySanitizer,
     inspector: DependencyInspector,
     provider: CompositeTechnicalSearchProvider,
-    store: ResearchEvidenceStore,
+    store: EvidenceRepository,
 ) -> BaseTool:
     def search_technical_sources(
         query: str,
@@ -103,14 +107,14 @@ def build_search_technical_sources_tool(
                 DependencyContext(package=finding),
             )
         except (ValueError, ProviderFailure) as exc:
-            store.save_query(task_id, sanitized.value, [], [str(exc)])
+            store.save_research_query(task_id, sanitized.value, [], [str(exc)])
             return _error("search_technical_sources", runtime, str(exc))
         except Exception as exc:  # noqa: BLE001 - provider boundary is extensible
             diagnostic = f"技术资料检索失败: {type(exc).__name__}"
-            store.save_query(task_id, sanitized.value, [], [diagnostic])
+            store.save_research_query(task_id, sanitized.value, [], [diagnostic])
             return _error("search_technical_sources", runtime, diagnostic)
 
-        store.save_query(
+        store.save_research_query(
             task_id,
             sanitized.value,
             result.providers,
@@ -130,7 +134,7 @@ def build_search_technical_sources_tool(
             )
             for candidate in result.candidates
         ]
-        saved = store.save_candidates(task_id, sanitized.value, drafts)
+        saved = store.save_research_candidates(task_id, sanitized.value, drafts)
         return _success(
             "search_technical_sources",
             runtime,
@@ -165,7 +169,7 @@ def build_search_technical_sources_tool(
 
 def build_fetch_external_evidence_tool(
     fetcher: SafeEvidenceFetcher,
-    store: ResearchEvidenceStore,
+    store: EvidenceRepository,
     artifact_backend: BackendProtocol,
 ) -> BaseTool:
     def fetch_external_evidence(
@@ -180,7 +184,7 @@ def build_fetch_external_evidence_tool(
                 "运行配置缺少有效的 thread_id",
             )
         try:
-            candidate = store.get_candidate(task_id, candidate_id)
+            candidate = store.get_research_candidate(task_id, candidate_id)
         except KeyError:
             return _error(
                 "fetch_external_evidence",
@@ -286,7 +290,7 @@ def build_fetch_external_evidence_tool(
             artifact_path=artifact_path,
         )
         try:
-            store.save_evidence(
+            store.save_external_evidence(
                 evidence,
                 artifact_reference=artifact_reference,
                 artifact_content=restored,
@@ -319,12 +323,12 @@ def build_fetch_external_evidence_tool(
     )
 
 
-def build_link_external_evidence_tool(store: ResearchEvidenceStore) -> BaseTool:
+def build_link_external_evidence_tool(store: EvidenceRepository) -> BaseTool:
     def link_external_evidence(
         evidence_id: str,
         status: Literal["verified", "contradicted"],
         test_tool_call_ids: list[str],
-        local_evidence: list[Evidence],
+        local_evidence: list[LocalEvidenceReference],
         explanation: str,
         runtime: ToolRuntime,
     ) -> ToolMessage:
@@ -336,7 +340,7 @@ def build_link_external_evidence_tool(store: ResearchEvidenceStore) -> BaseTool:
                 "运行配置缺少有效的 thread_id",
             )
         try:
-            store.get_evidence(task_id, evidence_id)
+            store.get_external_evidence(task_id, evidence_id)
         except KeyError:
             return _error(
                 "link_external_evidence",
@@ -418,7 +422,7 @@ def build_link_external_evidence_tool(store: ResearchEvidenceStore) -> BaseTool:
             )
 
         try:
-            updated = store.update_verification(
+            updated = store.update_external_verification(
                 task_id,
                 evidence_id,
                 local_verification=status,

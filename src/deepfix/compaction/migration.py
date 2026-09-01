@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Annotated, Any, NotRequired
+from typing import Annotated, NotRequired
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import PrivateStateAttr
@@ -25,11 +25,11 @@ from deepfix.compaction.models import (
     UserConstraint,
 )
 from deepfix.compaction.snapshot import snapshot_content_hash
-from deepfix.compaction.store import CompactionStore
 from deepfix.domain_repositories import DomainRepositories
-from deepfix.domain_repositories.history import HistoryRepository
+from deepfix.domain_repositories.history import history_record_from_snapshot
 from deepfix.persistence import TaskRepository
 from deepfix.protected_context import ProtectedContextBuilder
+from deepfix.task_domain.legacy_payload import LegacyTaskPayload
 
 _MIGRATION_VERSION = 1
 
@@ -37,9 +37,7 @@ _MIGRATION_VERSION = 1
 @dataclass(frozen=True)
 class LegacyContextStores:
     tasks: TaskRepository
-    compaction: CompactionStore
     repositories: DomainRepositories
-    history: HistoryRepository | None = None
 
 
 class LegacyContextMigrationState(DeepFixCompactionState):
@@ -104,13 +102,14 @@ def migrate_legacy_context_state(
         state.pop("_summarization_event", None)
         return state
 
-    recorded = stores.compaction.migrated_event(task_id)
+    recorded = stores.repositories.history.migrated_event(task_id)
     if recorded is not None:
         state.pop("_summarization_event", None)
         state["_deepfix_compaction_event"] = recorded.model_dump(mode="json")
         return state
 
-    task = stores.tasks.get(task_id)
+    legacy = _load_legacy_payload(stores.repositories, task_id)
+    task = legacy.definition
     if task.task_id != task_id:
         raise ValueError("legacy migration task_id 不匹配")
     summary = _legacy_summary_message(legacy_event)
@@ -127,16 +126,20 @@ def migrate_legacy_context_state(
         retained_ids,
     )
 
-    existing_snapshots = stores.compaction.list_snapshots(task_id)
+    existing_snapshots = stores.repositories.history.list_for_task(task_id)
     version = (existing_snapshots[-1].version if existing_snapshots else 0) + 1
-    evidence = _legacy_evidence(task_id, task)
+    evidence = _legacy_evidence(task_id, legacy)
     for item in [
         *evidence.tests,
         *evidence.files,
         *evidence.approvals,
         *evidence.research,
     ]:
-        stores.compaction.save_evidence(task_id, item)
+        stores.repositories.evidence.record_deterministic(
+            task_id,
+            item,
+            provenance_root_ids=[item.evidence_id],
+        )
     current = ProtectedContextBuilder(stores.repositories).build(
         task_id,
         messages,
@@ -148,9 +151,9 @@ def migrate_legacy_context_state(
     )
     constraint = UserConstraint(
         constraint_id=_stable_id(
-            "constraint", task_id, source_message_id, task.user_problem, "active"
+            "constraint", task_id, source_message_id, task.original_problem, "active"
         ),
-        text=task.user_problem,
+        text=task.original_problem,
         source_user_message_id=source_message_id,
     )
     snapshot = CompactionSnapshot(
@@ -160,7 +163,7 @@ def migrate_legacy_context_state(
         lifecycle="prepared",
         created_at=_now(),
         source_work_unit_ids=[],
-        task_goal=task.user_problem,
+        task_goal=task.original_problem,
         user_constraints=[constraint],
         confirmed_facts=list(current.confirmed_facts),
         deterministic_evidence=evidence,
@@ -177,7 +180,15 @@ def migrate_legacy_context_state(
         content_hash="pending",
     )
     snapshot = snapshot.model_copy(update={"content_hash": snapshot_content_hash(snapshot)})
-    prepared = stores.compaction.save_prepared_snapshot(snapshot, artifact.content_hash)
+    prepared_record = stores.repositories.history.save_prepared(
+        history_record_from_snapshot(snapshot, artifact.content_hash)
+    )
+    prepared = stores.repositories.history.project_snapshot(
+        task_id,
+        prepared_record.version,
+        evidence=stores.repositories.evidence,
+        investigation=stores.repositories.investigation,
+    )
     snapshot_message_id = stable_generated_message_id(
         task_id, f"snapshot-{prepared.version}", "compaction-snapshot"
     )
@@ -190,10 +201,9 @@ def migrate_legacy_context_state(
         conversation_artifact=artifact,
         input_hash=artifact.content_hash,
     )
-    stores.compaction.activate_from_event(task_id, event)
-    stores.compaction.record_migration(task_id, _MIGRATION_VERSION, event)
-    history = stores.history or stores.repositories.history
-    history.record_compaction_outcome(
+    stores.repositories.history.activate(task_id, prepared.version, event)
+    stores.repositories.history.record_migration(task_id, _MIGRATION_VERSION, event)
+    stores.repositories.history.record_compaction_outcome(
         task_id,
         event_id=event.event_id,
         snapshot_version=prepared.version,
@@ -219,17 +229,22 @@ def _legacy_summary_message(value: object) -> HumanMessage | None:
     return None
 
 
-def _legacy_evidence(task_id: str, task: Any) -> DeterministicEvidenceBlock:
+def _legacy_evidence(task_id: str, task: LegacyTaskPayload) -> DeterministicEvidenceBlock:
+    payload = task.legacy_fields
     tests = [
         SystemTestEvidence(
             evidence_id=_stable_id("evidence", task_id, "legacy-test", str(index)),
-            command=result.command,
-            exit_code=result.exit_code,
-            summary=result.summary,
-            tool_call_id=result.tool_call_id or f"legacy:{task_id}:test:{index}",
-            source_message_id=(result.source_message_id or f"legacy:{task_id}:test-result:{index}"),
+            command=str(result.get("command", "")),
+            exit_code=int(result.get("exit_code", -1)),
+            summary=str(result.get("summary", "")),
+            tool_call_id=str(result.get("tool_call_id") or f"legacy:{task_id}:test:{index}"),
+            source_message_id=str(
+                result.get("source_message_id")
+                or f"legacy:{task_id}:test-result:{index}"
+            ),
         )
-        for index, result in enumerate(task.test_results)
+        for index, result in enumerate(payload.get("test_results", []))
+        if isinstance(result, dict)
     ]
     files = [
         FileChangeEvidence(
@@ -238,16 +253,17 @@ def _legacy_evidence(task_id: str, task: Any) -> DeterministicEvidenceBlock:
             operation="approved_target",
             status="approved_target",
         )
-        for path in dict.fromkeys(task.changed_files)
+        for path in dict.fromkeys(str(item) for item in payload.get("changed_files", []))
     ]
     approvals = [
         ApprovalEvidence(
             evidence_id=_stable_id("evidence", task_id, "legacy-approval", str(index)),
-            operation=item.operation,
-            decision=item.decision,
-            risk=item.risk,
+            operation=str(item.get("operation", "")),
+            decision=str(item.get("decision", "")),
+            risk=str(item.get("risk", "")),
         )
-        for index, item in enumerate(task.approvals)
+        for index, item in enumerate(payload.get("approvals", []))
+        if isinstance(item, dict)
     ]
     return DeterministicEvidenceBlock(
         tests=tests,
@@ -255,6 +271,20 @@ def _legacy_evidence(task_id: str, task: Any) -> DeterministicEvidenceBlock:
         approvals=approvals,
         research=[],
     )
+
+
+def _load_legacy_payload(
+    repositories: DomainRepositories,
+    task_id: str,
+) -> LegacyTaskPayload:
+    with repositories.database.connection() as connection:
+        row = connection.execute(
+            "SELECT payload FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    if row is None:
+        raise KeyError(task_id)
+    return LegacyTaskPayload.parse_json(str(row[0]))
 
 
 def _message_ids(messages: list[AnyMessage]) -> list[str]:

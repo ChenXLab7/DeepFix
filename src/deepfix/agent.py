@@ -35,7 +35,6 @@ from deepfix.compaction.snapshot import (
     CompactionDeltaGenerator,
     CompactionSnapshotBuilder,
 )
-from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.tools import build_compact_conversation_tool
 from deepfix.config import AppConfig, ModelRoleConfig
 from deepfix.debug import LLMTraceMiddleware
@@ -50,27 +49,23 @@ from deepfix.investigation.migration import (
     InvestigationMigrator,
 )
 from deepfix.investigation.models import InvestigationCapability
-from deepfix.investigation.receipts import ToolExecutionReceiptStore
-from deepfix.investigation.store import InvestigationStore
+from deepfix.investigation.receipts import ToolResultArtifactStorage
 from deepfix.investigation.tools import (
     build_record_hypothesis_tool,
 )
-from deepfix.models import RepairOutcome
 from deepfix.navigation.feedback import RepositoryNavigationFeedbackSource
 from deepfix.navigation.middleware import TodoNavigationMiddleware
 from deepfix.navigation.prompts import (
     DEEPFIX_TODO_SYSTEM_PROMPT,
     DEEPFIX_TODO_TOOL_DESCRIPTION,
 )
-from deepfix.operations import OperationJournalStore
 from deepfix.persistence import TaskRepository
 from deepfix.prompting import PromptPolicyMiddleware
 from deepfix.prompts import CORE_REPAIR_PROMPT
 from deepfix.protected_context import (
     ProtectedContextBuilder,
 )
-from deepfix.research.store import ResearchEvidenceStore
-from deepfix.verification import VerificationPolicyStore
+from deepfix.task_domain.outcome import RepairOutcomeCandidate
 
 
 def _build_deepseek_model(role: ModelRoleConfig) -> ChatDeepSeek:
@@ -101,11 +96,8 @@ def build_agent(
     config: AppConfig,
     checkpointer,
     task_repository: TaskRepository | None = None,
-    compaction_store: CompactionStore | None = None,
     investigation: InvestigationCoordinator | None = None,
     extensions: AgentExtensions | None = None,
-    research_evidence_store: ResearchEvidenceStore | None = None,
-    verification_policy_store: VerificationPolicyStore | None = None,
     repositories: DomainRepositories | None = None,
     *,
     allowed_skill_roots: tuple[str | Path, ...] = (),
@@ -129,27 +121,16 @@ def build_agent(
     tasks = task_repository or (
         repositories.tasks if repositories is not None else TaskRepository(config.database_path)
     )
-    compaction = compaction_store or CompactionStore(
-        config.database_path,
-        repositories=repositories,
-    )
-    research = research_evidence_store or ResearchEvidenceStore(
-        config.database_path,
-        repositories=repositories,
-    )
-    evidence_collector = EvidenceCollector(compaction, research)
+    evidence_collector = EvidenceCollector(repositories.evidence)
     investigation_store = (
         investigation.store
         if investigation is not None
-        else InvestigationStore(
-            config.database_path,
-            repositories=repositories,
-        )
+        else repositories.investigation
     )
     investigation = investigation or InvestigationCoordinator(
         store=investigation_store,
         tasks=tasks,
-        compaction_store=compaction,
+        evidence_repository=repositories.evidence,
         evidence_collector=evidence_collector,
     )
     navigation_feedback = RepositoryNavigationFeedbackSource(repositories)
@@ -159,15 +140,16 @@ def build_agent(
         adapter=DeepAgentsArtifactAdapter(resolved_backend),
         delta_generator=CompactionDeltaGenerator(),
         snapshot_builder=CompactionSnapshotBuilder(),
-        snapshot_store=compaction,
-        history_repository=(repositories.history if repositories is not None else None),
+        history_repository=repositories.history,
+        evidence_repository=repositories.evidence,
+        investigation_repository=repositories.investigation,
         budget_monitor=budget_monitor,
         protected_builder=protected_builder,
         model=compaction_model,
     )
     compact_conversation = build_compact_conversation_tool(coordinator)
     record_hypothesis = build_record_hypothesis_tool(investigation)
-    artifact_collector = ArtifactReferenceCollector(compaction, resolved_backend)
+    artifact_collector = ArtifactReferenceCollector(repositories.history, resolved_backend)
     artifact_service = DiagnosticArtifactService(
         tasks,
         artifact_collector,
@@ -250,9 +232,7 @@ def build_agent(
             LegacyContextMigrationMiddleware(
                 LegacyContextStores(
                     tasks,
-                    compaction,
                     repositories,
-                    repositories.history,
                 ),
                 DeepAgentsArtifactAdapter(resolved_backend),
             ),
@@ -260,20 +240,16 @@ def build_agent(
                 InvestigationMigrator(
                     tasks=tasks,
                     store=investigation_store,
-                    compaction_store=compaction,
+                    evidence_repository=repositories.evidence,
                 )
             ),
             InvestigationMiddleware(
                 investigation,
-                ToolExecutionReceiptStore(
-                    config.artifacts_path / "investigation_receipts",
-                    repository=(repositories.execution if repositories is not None else None),
+                repositories.execution,
+                ToolResultArtifactStorage(
+                    config.artifacts_path / "investigation_receipts"
                 ),
                 capabilities,
-                operation_journal=OperationJournalStore(
-                    config.database_path,
-                    repositories=repositories,
-                ),
             ),
             *prompt_policy_middleware,
             DeepFixCompactionMiddleware(
@@ -290,7 +266,9 @@ def build_agent(
         backend=resolved_backend,
         subagents=[],
         skills=list(resolved.skill_sources),
-        response_format=(ExecutorNarrativeResult if _experiment_mode else RepairOutcome),
+        response_format=(
+            ExecutorNarrativeResult if _experiment_mode else RepairOutcomeCandidate
+        ),
         interrupt_on=merge_interrupt_on(core_interrupts, resolved.tools),
         checkpointer=checkpointer,
         name=("deepfix_experiment_executor" if _experiment_mode else "deepfix_repair_agent"),

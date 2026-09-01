@@ -22,8 +22,9 @@ from deepfix.investigation.token_budget import (
     TokenBudgetMiddleware,
     TokenBudgetStore,
 )
-from deepfix.models import TaskState, TaskStatus
 from deepfix.service import BugfixService
+from deepfix.task_domain.models import TaskLifecycleStatus
+from deepfix.task_domain.runtime import TaskRuntime
 
 ConfigFactory = Callable[
     [Path, Path, EvaluationBudget, Path],
@@ -68,7 +69,9 @@ class LegacyLoopRunner:
             self.project_python,
         )
         started_at = self.clock()
-        task: TaskState | None = None
+        task: TaskRuntime | None = None
+        decision_outcome: str | None = None
+        tool_calls = 0
         sanitized_error_code: str | None = None
         middleware: TokenBudgetMiddleware | None = None
 
@@ -89,6 +92,11 @@ class LegacyLoopRunner:
             )
             with service_context as service:
                 task = service.start(case.problem)
+                decision = service.repository.latest_adjudication(task.task_id)
+                decision_outcome = decision.outcome if decision is not None else None
+                tool_calls = service.repositories.execution.integrity_view(
+                    task.task_id
+                ).receipt_count
         except Exception:  # noqa: BLE001 - evaluation records only a stable code
             sanitized_error_code = "legacy_runner_failed"
 
@@ -110,12 +118,10 @@ class LegacyLoopRunner:
         if task is None:
             conclusion = "failed"
             task_id = f"unavailable-{case.case_id}-{run_dir.name}"
-            tool_calls = 0
         else:
-            conclusion, task_error = _task_outcome(task)
+            conclusion, task_error = _task_outcome(task, decision_outcome)
             sanitized_error_code = sanitized_error_code or task_error
             task_id = task.task_id
-            tool_calls = len(set(task.processed_tool_call_ids))
 
         trace_usage = summarize_llm_trace(
             config.artifacts_path / "debug" / "llm_calls.jsonl",
@@ -159,31 +165,26 @@ class LegacyLoopRunner:
 
 
 def _task_outcome(
-    task: TaskState,
+    task: TaskRuntime,
+    decision_outcome: str | None,
 ) -> tuple[str, str | None]:
-    if task.status is TaskStatus.COMPLETED:
-        if task.resolution in {"fixed", "not_reproduced"}:
-            return task.resolution, None
+    if task.lifecycle is TaskLifecycleStatus.COMPLETED:
+        if decision_outcome in {"fixed", "not_reproduced"}:
+            return decision_outcome, None
         return "failed", "completed_without_resolution"
-    if task.status is TaskStatus.WAITING_APPROVAL:
+    if task.lifecycle is TaskLifecycleStatus.WAITING_APPROVAL:
         actions = {str(item.get("policy_action", "ask")) for item in task.pending_actions}
         if "ask" in actions:
             return "blocked", "manual_approval_required"
         if "deny" in actions:
             return "blocked", "policy_denied"
         return "blocked", "pending_approval"
-    if task.status is TaskStatus.CLARIFYING:
-        return "blocked", "additional_input_required"
-    if task.status is TaskStatus.PAUSED:
-        if task.context_recovery is not None:
-            return "blocked", task.context_recovery.error_code
-        if task.investigation_recovery is not None:
-            return "blocked", task.investigation_recovery.error_code
-        return "blocked", "agent_paused"
-    if task.status is TaskStatus.CANCELLED:
+    if task.lifecycle is TaskLifecycleStatus.PAUSED:
+        return "blocked", task.pause_reason or "agent_paused"
+    if task.lifecycle is TaskLifecycleStatus.CANCELLED:
         return "failed", "agent_cancelled"
-    if task.status is TaskStatus.FAILED:
-        return "failed", "agent_failed"
+    if task.lifecycle is TaskLifecycleStatus.FAILED:
+        return "failed", task.pause_reason or "agent_failed"
     return "failed", "incomplete_agent_response"
 
 
@@ -278,33 +279,17 @@ def _default_service_factory(
     from deepfix.backend import build_backend
     from deepfix.cli import build_cli_research_extensions, build_research_client
     from deepfix.compaction.evidence import EvidenceCollector
-    from deepfix.compaction.store import CompactionStore
     from deepfix.domain_repositories import DomainRepositories
     from deepfix.investigation.coordinator import InvestigationCoordinator
-    from deepfix.investigation.store import InvestigationStore
-    from deepfix.research.store import ResearchEvidenceStore
 
     repositories = DomainRepositories.create(config.database_path)
     repository = repositories.tasks
-    compaction_store = CompactionStore(
-        config.database_path,
-        repositories=repositories,
-    )
-    research_evidence_store = ResearchEvidenceStore(
-        config.database_path,
-        repositories=repositories,
-    )
+    research_evidence_store = repositories.evidence
     investigation = InvestigationCoordinator(
-        store=InvestigationStore(
-            config.database_path,
-            repositories=repositories,
-        ),
+        store=repositories.investigation,
         tasks=repository,
-        compaction_store=compaction_store,
-        evidence_collector=EvidenceCollector(
-            compaction_store,
-            research_evidence_store,
-        ),
+        evidence_repository=repositories.evidence,
+        evidence_collector=EvidenceCollector(repositories.evidence),
     )
     backend = build_backend(config)
     with build_research_client() as client:
@@ -324,9 +309,7 @@ def _default_service_factory(
                 config,
                 SqliteSaver(connection),
                 task_repository=repository,
-                compaction_store=compaction_store,
                 extensions=extensions,
-                research_evidence_store=research_evidence_store,
                 investigation=investigation,
                 backend=backend,
                 compaction_model_callbacks=compaction_callbacks,
@@ -337,9 +320,7 @@ def _default_service_factory(
                 repository,
                 ApprovalPolicy(config.approval_mode),
                 config,
-                research_evidence_store,
-                compaction_store,
-                investigation,
+                investigation=investigation,
                 repositories=repositories,
             )
 

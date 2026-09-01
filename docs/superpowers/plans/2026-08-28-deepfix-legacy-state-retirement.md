@@ -615,27 +615,27 @@ Do not continue until approved.
 - Modify/Delete: old `ToolExecutionReceiptStore`, `OperationJournalStore`, `VerificationPolicyStore`, and `InvestigationStore` facade definitions
 - Modify: migration and restore tests
 
-- [ ] **Step 1: Freeze historical fixtures.**
+- [x] **Step 1: Freeze historical fixtures.**
 
 Store representative legacy JSON payloads in tests rather than constructing new runtime `TaskState` instances. Include created/running/approval/paused/completed tasks, legacy Working Memory, legacy Phase, compaction recovery, investigation recovery, approvals, research, and Artifact references.
 
-- [ ] **Step 2: Implement a one-way migration-only parser.**
+- [x] **Step 2: Implement a one-way migration-only parser.**
 
 `LegacyTaskPayload` may understand historical field names, but it must return calls/records for the five repositories. It cannot be saved back, imported into production composition, or exposed by service/CLI APIs.
 
-- [ ] **Step 3: Prove restore before deletion.**
+- [x] **Step 3: Prove restore before deletion.**
 
 For each fixture, migrate and compare definition hash, lifecycle, verification policy, decision IDs, Evidence hashes/provenance, Investigation state, Execution integrity, Snapshot/Artifact references, and context telemetry. Then restore the Graph thread through the normal LangGraph Checkpoint path.
 
-- [ ] **Step 4: Remove production facade construction.**
+- [x] **Step 4: Remove production facade construction.**
 
 Agent, CLI, service, context, navigation, research, compaction, investigation, operation recovery, and artifact retrieval must receive the bounded repositories directly. Remove old class-name exports once no production import remains.
 
-- [ ] **Step 5: Delete giant state models.**
+- [x] **Step 5: Delete giant state models.**
 
 Remove `TaskState`, `TaskStatus`, duplicated `Evidence`, `TestResult`, `ApprovalRecord`, and fact-bearing `RepairOutcome` from `models.py` after callers use final domain types and Graph structured output candidates. If a model-output schema remains necessary, name it as a candidate/proposal and ensure it cannot carry authoritative fact fields.
 
-- [ ] **Step 6: Run the retirement source gate.**
+- [x] **Step 6: Run the retirement source gate.**
 
 ```powershell
 rg -n "TaskState|TaskStatus|WorkingMemoryStore|AgentPhase|PhaseResolver|LegacyNavigationFeedbackSource|save_progress|continue_investigation|CompactionStore|ResearchEvidenceStore|VerificationPolicyStore|ToolExecutionReceiptStore|OperationJournalStore|InvestigationStore" src/deepfix
@@ -643,7 +643,7 @@ rg -n "TaskState|TaskStatus|WorkingMemoryStore|AgentPhase|PhaseResolver|LegacyNa
 
 Expected: no production runtime dependency. Explicit legacy field-name handling is allowed only in migration/evaluation-fixture modules and must not instantiate old authorities.
 
-- [ ] **Step 7: Verify.**
+- [x] **Step 7: Verify.**
 
 ```powershell
 python -m pytest tests/task_domain/test_migration.py tests/domain_repositories/test_migration_gate.py tests/test_legacy_authority_retirement.py tests/compaction/test_migration.py tests/investigation/test_migration.py -q

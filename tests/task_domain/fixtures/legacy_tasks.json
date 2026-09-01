@@ -1,0 +1,82 @@
+[
+  {
+    "task_id": "legacy-created",
+    "project_root": "C:/legacy/project",
+    "user_problem": "repair parser creation failure",
+    "approval_mode": "manual",
+    "project_python": "C:/Python/python.exe",
+    "status": "created",
+    "conversation": [{"role": "user", "content": "repair parser creation failure"}],
+    "context_metrics": {},
+    "offloaded_artifacts": []
+  },
+  {
+    "task_id": "legacy-running",
+    "project_root": "C:/legacy/project",
+    "source_project_root": "C:/legacy/source",
+    "workspace_root": "C:/legacy/worktree",
+    "workspace_baseline_id": "baseline-1",
+    "user_problem": "repair parser branch",
+    "approval_mode": "guarded",
+    "project_python": "C:/Python/python.exe",
+    "status": "investigating",
+    "conversation": [
+      {"role": "user", "content": "repair parser branch"},
+      {"role": "assistant", "content": "I will inspect the failing branch"}
+    ],
+    "hypotheses": ["the empty-input branch returns the wrong sentinel"],
+    "changed_files": [],
+    "test_results": [{"command": "python -m pytest tests/test_parser.py -q", "exit_code": 1, "summary": "1 failed", "tool_call_id": "call-test-1", "source_message_id": "message-test-1"}],
+    "context_metrics": {"context_peak_tokens": 8100, "latest_usage_ratio": 0.81, "latest_budget_zone": "observe"},
+    "offloaded_artifacts": ["/.deepfix-artifacts/conversation_history/legacy-running.md"]
+  },
+  {
+    "task_id": "legacy-approval",
+    "project_root": "C:/legacy/project",
+    "user_problem": "repair and request approval",
+    "approval_mode": "manual",
+    "project_python": "C:/Python/python.exe",
+    "status": "waiting_approval",
+    "pending_actions": [{"name": "execute", "args": {"command": "python -m pytest -q"}, "description": "run regression tests"}],
+    "approvals": [{"operation": "edit_file", "decision": "approve", "risk": "L2"}],
+    "conversation": [{"role": "user", "content": "repair and request approval"}],
+    "context_metrics": {},
+    "offloaded_artifacts": []
+  },
+  {
+    "task_id": "legacy-paused",
+    "project_root": "C:/legacy/project",
+    "user_problem": "repair long-context failure",
+    "approval_mode": "manual",
+    "project_python": "C:/Python/python.exe",
+    "status": "paused",
+    "paused_from": "testing",
+    "pause_reason": "context_overflow",
+    "conversation": [{"role": "user", "content": "repair long-context failure"}],
+    "context_recovery": {"task_id": "legacy-paused", "stage": "overflow_retry", "error_code": "context_overflow", "usage_ratio": 0.98, "active_snapshot_version": 2, "prepared_snapshot_version": 3, "prepared_snapshot_lifecycle": "abandoned", "conversation_artifact": "/.deepfix-artifacts/conversation_history/legacy-paused.md", "original_messages_preserved": true},
+    "investigation_recovery": {"task_id": "legacy-paused", "error_code": "investigation_state_commit_failed", "state_version": 4, "last_event_sequence": 8, "tool_call_id": "call-read-1", "checkpoint_available": true, "recovery_action": "resume from checkpoint"},
+    "context_metrics": {"context_peak_tokens": 9800, "context_overflow_count": 1, "overflow_retry_count": 1, "active_compaction_snapshot_version": 2, "last_compaction_artifact": "/.deepfix-artifacts/conversation_history/legacy-paused.md", "last_compaction_error": "context_overflow"},
+    "offloaded_artifacts": ["/.deepfix-artifacts/conversation_history/legacy-paused.md"]
+  },
+  {
+    "task_id": "legacy-completed",
+    "project_root": "C:/legacy/project",
+    "user_problem": "repair completed parser bug",
+    "approval_mode": "guarded",
+    "project_python": "C:/Python/python.exe",
+    "status": "completed",
+    "resolution": "fixed",
+    "diagnosis": "the empty-input branch returned -1",
+    "changed_files": ["src/parser.py"],
+    "successful_changed_files": ["src/parser.py"],
+    "latest_change_verification": "passed",
+    "test_results": [{"command": "python -m pytest tests/test_parser.py -q", "exit_code": 0, "summary": "1 passed", "tool_call_id": "call-test-2", "source_message_id": "message-test-2"}],
+    "external_evidence_ids": ["external-1"],
+    "research_query_count": 1,
+    "approvals": [{"operation": "edit_file", "decision": "approve", "risk": "L2"}],
+    "final_summary": "fixed and verified",
+    "conversation": [{"id": "user-existing-id", "role": "user", "content": "repair completed parser bug"}],
+    "context_metrics": {"active_compaction_snapshot_version": 1},
+    "offloaded_artifacts": ["/.deepfix-artifacts/research/external-1.md"]
+  }
+]

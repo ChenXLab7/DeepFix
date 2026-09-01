@@ -321,14 +321,14 @@ class DeepFixCompactionMiddleware(AgentMiddleware):
     ) -> tuple[ProtectedContext, tuple[AnyMessage, ...]]:
         if event is None:
             return context, tuple(messages)
-        snapshot = self.coordinator.snapshot_store.active_snapshot_from_event(
+        snapshot = self.coordinator.active_snapshot_from_event(
             task_id,
             event,
         )
         if snapshot is None:
             return replace(context, active_snapshot=None), tuple(messages)
         if snapshot.lifecycle == "prepared":
-            snapshot = self.coordinator.snapshot_store.activate_from_event(
+            snapshot = self.coordinator.activate_from_event(
                 task_id,
                 event,
             )

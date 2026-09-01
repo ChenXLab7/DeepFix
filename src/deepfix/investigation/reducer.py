@@ -3,20 +3,20 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 
+from deepfix.domain_repositories.investigation import InvestigationRepository
 from deepfix.investigation.experiments import ExperimentAssessment, ExperimentResult
 from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.models import (
     ExperimentClaimRecord,
     InvestigationState,
 )
-from deepfix.investigation.store import InvestigationStore
 
 
 class InvestigationStateReducer:
     def __init__(
         self,
         task_id: str,
-        store: InvestigationStore,
+        store: InvestigationRepository,
         *,
         provenance_root_resolver: Callable[[str], list[str]] | None = None,
     ) -> None:

@@ -17,8 +17,11 @@ from deepfix.compaction.models import (
     ResearchStatusEvidence,
     SystemTestEvidence,
 )
-from deepfix.compaction.store import CompactionStore, DeterministicEvidence
-from deepfix.research.store import ResearchEvidenceStore
+from deepfix.domain_repositories.evidence import (
+    DeterministicEvidence,
+    EvidenceRepository,
+    deterministic_provenance_roots,
+)
 from deepfix.verification import (
     classify_pytest_scope,
     extract_user_pytest_commands,
@@ -40,11 +43,9 @@ class TaskEvidenceContext(Protocol):
 class EvidenceCollector:
     def __init__(
         self,
-        store: CompactionStore,
-        research_store: ResearchEvidenceStore,
+        repository: EvidenceRepository,
     ) -> None:
-        self.store = store
-        self.research_store = research_store
+        self.repository = repository
 
     def collect(
         self,
@@ -72,7 +73,7 @@ class EvidenceCollector:
                     result,
                     task_context,
                     has_successful_change=_has_successful_change(
-                        self.store.list_evidence(task_id)
+                        self.repository.list_deterministic(task_id)
                     ),
                 )
                 if test is not None:
@@ -114,7 +115,7 @@ class EvidenceCollector:
                 )
             )
 
-        for item in self.research_store.list_evidence(task_id):
+        for item in self.repository.list_external_evidence(task_id):
             collected.append(
                 ResearchStatusEvidence(
                     evidence_id=_evidence_id(
@@ -130,12 +131,16 @@ class EvidenceCollector:
             )
 
         existing_ids = {
-            item.evidence_id for item in self.store.list_evidence(task_id)
+            item.evidence_id for item in self.repository.list_deterministic(task_id)
         }
         for evidence in collected:
             if evidence.evidence_id not in existing_ids:
-                self.store.save_evidence(task_id, evidence)
-        return _as_block(self.store.list_evidence(task_id))
+                self.repository.record_deterministic(
+                    task_id,
+                    evidence,
+                    provenance_root_ids=deterministic_provenance_roots(evidence),
+                )
+        return _as_block(self.repository.list_deterministic(task_id))
 
     def collect_pair(
         self,

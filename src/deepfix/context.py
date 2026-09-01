@@ -5,15 +5,15 @@ from deepagents.middleware.summarization import (
     SummarizationToolMiddleware,
 )
 
+from deepfix.domain_repositories.evidence import EvidenceRepository
 from deepfix.prompting import PromptPolicyMiddleware
 from deepfix.research.middleware import ResearchEvidenceMiddleware
-from deepfix.research.store import ResearchEvidenceStore
 
 
 def build_context_middleware(
     model,
     backend,
-    research_store: ResearchEvidenceStore,
+    research_store: EvidenceRepository,
 ):
     """Build the legacy summarization stack without a second memory authority."""
     summarization = SummarizationMiddleware(

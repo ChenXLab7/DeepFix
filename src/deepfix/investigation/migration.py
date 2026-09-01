@@ -11,7 +11,8 @@ from langgraph.runtime import Runtime
 
 from deepfix.compaction.identity import ensure_message_ids
 from deepfix.compaction.models import FileChangeEvidence, SystemTestEvidence
-from deepfix.compaction.store import CompactionStore
+from deepfix.domain_repositories.evidence import EvidenceRepository
+from deepfix.domain_repositories.investigation import InvestigationRepository
 from deepfix.investigation.classification import is_pytest_verification
 from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.models import (
@@ -20,7 +21,6 @@ from deepfix.investigation.models import (
     NewInvestigationEvent,
     ProgressKind,
 )
-from deepfix.investigation.store import InvestigationStore
 from deepfix.persistence import TaskRepository
 
 _FILE_OPERATIONS = {
@@ -47,12 +47,12 @@ class InvestigationMigrator:
         self,
         *,
         tasks: TaskRepository,
-        store: InvestigationStore,
-        compaction_store: CompactionStore,
+        store: InvestigationRepository,
+        evidence_repository: EvidenceRepository,
     ) -> None:
         self.tasks = tasks
         self.store = store
-        self.compaction_store = compaction_store
+        self.evidence_repository = evidence_repository
 
     def migrate(
         self,
@@ -66,13 +66,13 @@ class InvestigationMigrator:
         if existing is not None and existing.migration_version >= self.VERSION:
             return existing
 
-        task = self.tasks.get(normalized_task_id)
+        task = self.tasks.get_definition(normalized_task_id)
         identified = ensure_message_ids(normalized_task_id, messages).messages
         observations = _durable_observations(
             normalized_task_id,
             identified,
             task.project_python,
-            self.compaction_store,
+            self.evidence_repository,
         )
         hypotheses = existing.hypotheses if existing is not None else []
         state = (existing or InvestigationState.new(normalized_task_id)).model_copy(
@@ -118,7 +118,7 @@ def _durable_observations(
     task_id: str,
     messages: Sequence[AnyMessage],
     project_python: str,
-    compaction_store: CompactionStore,
+    evidence_repository: EvidenceRepository,
 ) -> list[_LegacyObservation]:
     calls: dict[str, list[dict[str, Any]]] = defaultdict(list)
     results: dict[str, list[ToolMessage]] = defaultdict(list)
@@ -134,7 +134,7 @@ def _durable_observations(
 
     evidence_by_call = {
         item.tool_call_id: item
-        for item in compaction_store.list_evidence(task_id)
+        for item in evidence_repository.list_deterministic(task_id)
         if isinstance(item, (SystemTestEvidence, FileChangeEvidence)) and item.tool_call_id
     }
     observations: list[tuple[int, _LegacyObservation]] = []

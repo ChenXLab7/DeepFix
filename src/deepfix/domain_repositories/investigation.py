@@ -5,11 +5,19 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from deepfix.database import SQLiteDatabase
+from deepfix.investigation.experiments import (
+    ExperimentAssessment,
+    ExperimentResult,
+    StrategyDecision,
+)
 from deepfix.investigation.models import (
+    InvestigationEvent,
     InvestigationHypothesis,
+    InvestigationState,
+    NewInvestigationEvent,
     UnresolvedQuestion,
 )
 
@@ -27,6 +35,10 @@ class InvestigationEvidenceMissing(RuntimeError):
 
 
 class QuestionIdentityConflict(RuntimeError):
+    pass
+
+
+class InvestigationStateConflict(RuntimeError):
     pass
 
 
@@ -51,6 +63,190 @@ class InvestigationRepository:
                 normalized_task_id,
                 hypothesis,
             )
+
+    def load(self, task_id: str) -> InvestigationState | None:
+        with self.database.connection() as connection:
+            state = self._load_state(connection, task_id)
+        if state is None:
+            return None
+        current = {item.hypothesis_id: item for item in self.list_hypotheses(task_id)}
+        if not current:
+            return state
+        merged = {item.hypothesis_id: item for item in state.hypotheses}
+        merged.update(current)
+        hypotheses = list(merged.values())[-64:]
+        return state.model_copy(
+            update={
+                "hypotheses": hypotheses,
+                "supported_hypothesis_ids": [
+                    item.hypothesis_id for item in hypotheses if item.state == "supported"
+                ][-64:],
+            }
+        )
+
+    def ensure_started(self, task_id: str) -> InvestigationState:
+        existing = self.load(task_id)
+        if existing is not None:
+            return existing
+        state = InvestigationState.new(task_id)
+        try:
+            return self.commit(0, [NewInvestigationEvent.task_started(task_id)], state)
+        except InvestigationStateConflict:
+            loaded = self.load(task_id)
+            if loaded is None:
+                raise
+            return loaded
+
+    def commit(
+        self,
+        expected_version: int,
+        events: list[NewInvestigationEvent],
+        next_state: InvestigationState,
+    ) -> InvestigationState:
+        if any(event.task_id != next_state.task_id for event in events):
+            raise InvestigationStateConflict("事件与物化状态的任务不一致")
+        with self.database.unit_of_work(immediate=True) as connection:
+            current = self._load_state(connection, next_state.task_id)
+            current_version = 0 if current is None else current.version
+            existing = self._existing_events(connection, next_state.task_id, events)
+            if len(existing) == len(events):
+                self._validate_replay(events, existing)
+                if current is None:
+                    raise InvestigationStateConflict("重放事件缺少物化状态")
+                return current
+            if existing or current_version != expected_version:
+                raise InvestigationStateConflict("investigation state 版本冲突")
+            committed = next_state.model_copy(update={"version": current_version + 1})
+            self._insert_events(connection, events)
+            self.project_hypotheses(connection, committed.task_id, committed.hypotheses)
+            self._upsert_state(connection, committed)
+            return committed
+
+    def list_events(self, task_id: str) -> list[InvestigationEvent]:
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload, sequence, created_at FROM investigation_events
+                WHERE task_id = ? ORDER BY sequence
+                """,
+                (task_id,),
+            ).fetchall()
+        events: list[InvestigationEvent] = []
+        for row in rows:
+            payload = _legacy_event_payload(cast(dict[str, Any], json.loads(row[0])))
+            if payload is not None:
+                events.append(
+                    InvestigationEvent.model_validate(
+                        {**payload, "sequence": row[1], "created_at": row[2]}
+                    )
+                )
+        return events
+
+    def commit_experiment(
+        self,
+        expected_version: int,
+        *,
+        event_id: str,
+        event_payload: str,
+        result: ExperimentResult,
+        assessment: ExperimentAssessment,
+        next_state: InvestigationState,
+    ) -> InvestigationState:
+        if result.experiment_id != assessment.experiment_id:
+            raise InvestigationStateConflict("experiment result/assessment 不一致")
+        with self.database.unit_of_work(immediate=True) as connection:
+            current = self._load_state(connection, next_state.task_id)
+            current_version = 0 if current is None else current.version
+            existing = connection.execute(
+                "SELECT payload FROM experiment_events WHERE task_id = ? AND event_id = ?",
+                (next_state.task_id, event_id),
+            ).fetchone()
+            if existing is not None:
+                if str(existing[0]) != event_payload:
+                    raise InvestigationStateConflict("相同 experiment event_id 的内容冲突")
+                if current is None:
+                    raise InvestigationStateConflict("重放缺少物化状态")
+                return current
+            if current_version != expected_version:
+                raise InvestigationStateConflict("investigation state 版本冲突")
+            committed = next_state.model_copy(update={"version": current_version + 1})
+            created_at = _utc_now()
+            connection.execute(
+                """
+                INSERT INTO experiment_results(
+                    task_id, experiment_id, result_payload, assessment_payload, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(task_id, experiment_id) DO UPDATE SET
+                    result_payload = excluded.result_payload,
+                    assessment_payload = excluded.assessment_payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    committed.task_id,
+                    result.experiment_id,
+                    result.model_dump_json(),
+                    assessment.model_dump_json(),
+                    created_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO experiment_events(
+                    task_id, event_id, experiment_id, payload, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    committed.task_id,
+                    event_id,
+                    result.experiment_id,
+                    event_payload,
+                    created_at,
+                ),
+            )
+            self.project_hypotheses(connection, committed.task_id, committed.hypotheses)
+            self._upsert_state(connection, committed)
+            return committed
+
+    def count_experiment_events(self, task_id: str) -> int:
+        return self._count(task_id, "experiment_events")
+
+    def save_strategy_decision(self, decision: StrategyDecision) -> None:
+        payload = decision.model_dump_json()
+        with self.database.unit_of_work(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT payload FROM strategy_decisions WHERE task_id = ? AND decision_id = ?",
+                (decision.task_id, decision.decision_id),
+            ).fetchone()
+            if row is not None:
+                if str(row[0]) != payload:
+                    raise InvestigationStateConflict("strategy decision identity conflict")
+                return
+            connection.execute(
+                """
+                INSERT INTO strategy_decisions(task_id, decision_id, payload, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (decision.task_id, decision.decision_id, payload, _utc_now()),
+            )
+
+    def count_strategy_decisions(self, task_id: str) -> int:
+        return self._count(task_id, "strategy_decisions")
+
+    def last_sequence(self, task_id: str) -> int:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM investigation_events WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return int(row[0])
+
+    def has_event(self, task_id: str, event_id: str) -> bool:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM investigation_events WHERE task_id = ? AND event_id = ?",
+                (task_id, event_id),
+            ).fetchone()
+        return row is not None
 
     def backfill_current_hypothesis(
         self,
@@ -583,12 +779,162 @@ class InvestigationRepository:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS investigation_state (
+                    task_id TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+    def _count(self, task_id: str, table: str) -> int:
+        if table not in {"experiment_events", "strategy_decisions"}:
+            raise ValueError("unsupported investigation table")
+        with self.database.connection() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return int(row[0])
+
+    @staticmethod
+    def _load_state(
+        connection: sqlite3.Connection,
+        task_id: str,
+    ) -> InvestigationState | None:
+        row = connection.execute(
+            "SELECT payload FROM investigation_state WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return InvestigationState.model_validate(
+            _legacy_state_payload(cast(dict[str, Any], json.loads(row[0])))
+        )
+
+    @staticmethod
+    def _existing_events(
+        connection: sqlite3.Connection,
+        task_id: str,
+        events: list[NewInvestigationEvent],
+    ) -> dict[str, str]:
+        if not events:
+            return {}
+        event_ids = [event.event_id for event in events]
+        placeholders = ",".join("?" for _ in event_ids)
+        rows = connection.execute(
+            f"""
+            SELECT event_id, payload FROM investigation_events
+            WHERE task_id = ? AND event_id IN ({placeholders})
+            """,
+            (task_id, *event_ids),
+        ).fetchall()
+        return {str(row[0]): str(row[1]) for row in rows}
+
+    @staticmethod
+    def _validate_replay(
+        events: list[NewInvestigationEvent],
+        existing: dict[str, str],
+    ) -> None:
+        for event in events:
+            stored = _legacy_event_payload(
+                cast(dict[str, Any], json.loads(existing[event.event_id]))
+            )
+            normalized = (
+                json.dumps(stored, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                if stored is not None
+                else ""
+            )
+            if normalized != _canonical_event(event):
+                raise InvestigationStateConflict("相同 event_id 的事件内容冲突")
+
+    @staticmethod
+    def _insert_events(
+        connection: sqlite3.Connection,
+        events: list[NewInvestigationEvent],
+    ) -> None:
+        if not events:
+            return
+        row = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) FROM investigation_events WHERE task_id = ?",
+            (events[0].task_id,),
+        ).fetchone()
+        first_sequence = int(row[0]) + 1
+        created_at = _utc_now()
+        connection.executemany(
+            """
+            INSERT INTO investigation_events(
+                task_id, event_id, sequence, event_type, payload, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    event.task_id,
+                    event.event_id,
+                    first_sequence + offset,
+                    event.event_type.value,
+                    _canonical_event(event),
+                    created_at,
+                )
+                for offset, event in enumerate(events)
+            ],
+        )
+
+    @staticmethod
+    def _upsert_state(
+        connection: sqlite3.Connection,
+        state: InvestigationState,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO investigation_state(task_id, version, payload, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                version = excluded.version,
+                payload = excluded.payload,
+                updated_at = excluded.updated_at
+            """,
+            (state.task_id, state.version, state.model_dump_json(), _utc_now()),
+        )
 
 
 def stable_question_id(task_id: str, text: str) -> str:
     normalized = " ".join(text.split()).casefold()
     digest = hashlib.sha256(f"{task_id}\0{normalized}".encode()).hexdigest()[:24]
     return f"question_{digest}"
+
+
+def _canonical_event(event: NewInvestigationEvent) -> str:
+    return json.dumps(
+        event.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _legacy_state_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    for field in (
+        "agent_phase",
+        "paused_agent_phase",
+        "permit",
+        "post_permit_review_pending",
+    ):
+        normalized.pop(field, None)
+    return normalized
+
+
+def _legacy_event_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if payload.get("event_type") in {"phase_changed", "investigation_permit_granted"}:
+        return None
+    normalized = dict(payload)
+    normalized.pop("phase_before", None)
+    normalized.pop("phase_after", None)
+    return normalized
 
 
 def _required(value: str, name: str) -> str:

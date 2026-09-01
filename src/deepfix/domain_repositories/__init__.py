@@ -23,6 +23,7 @@ from deepfix.domain_repositories.investigation import (
     HypothesisTransitionError,
     InvestigationEvidenceMissing,
     InvestigationRepository,
+    InvestigationStateConflict,
     QuestionIdentityConflict,
 )
 from deepfix.task_domain.repository import TaskRepository
@@ -70,6 +71,7 @@ __all__ = [
     "HypothesisTransitionError",
     "InvestigationEvidenceMissing",
     "InvestigationRepository",
+    "InvestigationStateConflict",
     "QuestionIdentityConflict",
     "VerificationEvidenceView",
 ]

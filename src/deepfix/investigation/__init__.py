@@ -31,10 +31,6 @@ _LAZY_EXPORTS = {
         "deepfix.investigation.migration",
         "InvestigationMigrator",
     ),
-    "InvestigationStore": (
-        "deepfix.investigation.store",
-        "InvestigationStore",
-    ),
     "build_record_hypothesis_tool": (
         "deepfix.investigation.tools",
         "build_record_hypothesis_tool",
@@ -63,7 +59,6 @@ __all__ = [
     "InvestigationStagnationError",
     "InvestigationState",
     "InvestigationStateError",
-    "InvestigationStore",
     "NewInvestigationEvent",
     "ProgressKind",
     "RecordHypothesisInput",

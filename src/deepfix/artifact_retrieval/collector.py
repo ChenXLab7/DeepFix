@@ -15,7 +15,7 @@ from deepfix.artifact_retrieval.models import (
     stable_diagnostic_artifact_id,
 )
 from deepfix.compaction.identity import ensure_message_ids
-from deepfix.compaction.store import CompactionStore
+from deepfix.domain_repositories.history import HistoryRepository
 
 _LARGE_ROOT = "/.deepfix-artifacts/large_tool_results/"
 _HISTORY_ROOT = "/.deepfix-artifacts/conversation_history/"
@@ -26,8 +26,8 @@ _LARGE_PATH_TOKEN = re.compile(
 
 
 class ArtifactReferenceCollector:
-    def __init__(self, compaction_store: CompactionStore, backend: Any) -> None:
-        self.compaction_store = compaction_store
+    def __init__(self, history_repository: HistoryRepository, backend: Any) -> None:
+        self.history_repository = history_repository
         self.backend = backend
 
     def collect(
@@ -102,7 +102,7 @@ class ArtifactReferenceCollector:
         task_id: str,
     ) -> list[DiagnosticArtifactDescriptor]:
         try:
-            snapshots = self.compaction_store.list_snapshots(task_id)
+            snapshots = self.history_repository.list_for_task(task_id)
         except Exception as exc:
             raise DiagnosticArtifactSystemError(
                 "diagnostic_artifact_reference_load_failed",

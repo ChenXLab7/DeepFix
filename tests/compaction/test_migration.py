@@ -1,136 +1,136 @@
+from __future__ import annotations
+
+import json
+
 from deepagents.backends import FilesystemBackend
 from langchain_core.messages import AIMessage, HumanMessage
-from langgraph.runtime import ExecutionInfo, Runtime
 
 from deepfix.compaction.adapter import DeepAgentsArtifactAdapter
-from deepfix.compaction.migration import (
-    LegacyContextMigrationMiddleware,
-    LegacyContextStores,
-    migrate_legacy_context_state,
-)
+from deepfix.compaction.migration import LegacyContextStores, migrate_legacy_context_state
 from deepfix.compaction.models import DeepFixCompactionEvent
-from deepfix.compaction.store import CompactionStore
-from deepfix.config import ApprovalMode
 from deepfix.database import SQLiteDatabase
 from deepfix.domain_repositories import DomainRepositories
 from deepfix.domain_repositories.migration import DomainMigrator
-from deepfix.models import TaskState
-from deepfix.models import TestResult as RepairTestResult
-from deepfix.persistence import TaskRepository
 
 
-def _legacy_fixture(tmp_path):
-    database = tmp_path / "deepfix.sqlite3"
-    tasks = TaskRepository(database)
-    compaction = CompactionStore(database)
-    repositories = DomainRepositories.create(database)
-    task = TaskState.create(
-        tmp_path / "project", "修复符号归一化；不得修改公开 API", ApprovalMode.MANUAL
-    )
-    task.changed_files = ["src/calculator.py"]
-    task.test_results = [RepairTestResult("pytest -q", 1, "1 failed")]
-    tasks.save(task)
-    sqlite = SQLiteDatabase(database)
-    with sqlite.unit_of_work() as connection:
+def _fixture(tmp_path):
+    database = SQLiteDatabase(tmp_path / "deepfix.sqlite3")
+    payload = {
+        "task_id": "legacy-context",
+        "project_root": str(tmp_path / "project"),
+        "user_problem": "修复符号归一化；不得修改公开 API",
+        "approval_mode": "manual",
+        "project_python": "python",
+        "status": "investigating",
+        "conversation": [{"role": "user", "content": "修复符号归一化；不得修改公开 API"}],
+        "changed_files": ["src/calculator.py"],
+        "test_results": [
+            {
+                "command": "pytest -q",
+                "exit_code": 1,
+                "summary": "1 failed",
+                "tool_call_id": "call-test",
+                "source_message_id": "message-test",
+            }
+        ],
+        "approvals": [],
+    }
+    with database.unit_of_work() as connection:
+        connection.execute(
+            "CREATE TABLE tasks(task_id TEXT PRIMARY KEY, payload TEXT, updated_at TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO tasks VALUES (?, ?, ?)",
+            (
+                payload["task_id"],
+                json.dumps(payload, ensure_ascii=False),
+                "2026-08-31T00:00:00+00:00",
+            ),
+        )
         connection.execute(
             """
             CREATE TABLE working_memory (
-                task_id TEXT NOT NULL, version INTEGER NOT NULL,
-                payload TEXT NOT NULL, created_at TEXT NOT NULL,
+                task_id TEXT, version INTEGER, payload TEXT, created_at TEXT,
                 PRIMARY KEY(task_id, version)
             )
             """
         )
         connection.execute(
-            """
-            INSERT INTO working_memory(task_id, version, payload, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
+            "INSERT INTO working_memory VALUES (?, ?, ?, ?)",
             (
-                task.task_id,
+                payload["task_id"],
                 1,
-                """{
-                  "phase":"investigating","summary":"正在定位",
-                  "facts":[{"claim_id":"claim-legacy","text":"失败可以稳定复现","sources":[]}],
-                  "evidence":[],
-                  "active_hypotheses":[{"hypothesis_id":"hyp-active","text":"负号被处理两次","state":"active","reason":"inspection","sources":[],"updated_in_version":1}],
-                  "rejected_hypotheses":[{"hypothesis_id":"hyp-rejected","text":"缓存污染","state":"rejected","reason":"legacy working memory","sources":[],"updated_in_version":1}],
-                  "confirmed_hypotheses":[],"checked_files":["src/calculator.py"],
-                  "experiments":["pytest exit 1"],"next_steps":["检查 normalize_sign"],
-                  "unresolved_questions":[],"coverage":{"covered_message_ids":[],"covered_work_unit_ids":[]}
-                }""",
+                json.dumps(
+                    {
+                        "phase": "investigating",
+                        "summary": "正在定位",
+                        "facts": [],
+                        "evidence": [],
+                        "active_hypotheses": [],
+                        "rejected_hypotheses": [],
+                        "confirmed_hypotheses": [],
+                        "checked_files": [],
+                        "experiments": [],
+                        "next_steps": [],
+                        "unresolved_questions": [],
+                        "coverage": {
+                            "covered_message_ids": [],
+                            "covered_work_unit_ids": [],
+                        },
+                    }
+                ),
                 "2026-08-31T00:00:00+00:00",
             ),
         )
-    assert DomainMigrator(sqlite).migrate_working_memory(task.task_id).ready_to_switch
-    existing = HumanMessage(id="existing-id", content="原始约束")
-    missing = AIMessage(content="我会检查实现")
+    repositories = DomainRepositories.create(database)
+    repositories.tasks.get_definition(payload["task_id"])
+    assert DomainMigrator(database).migrate_working_memory(payload["task_id"]).ready_to_switch
     state = {
-        "messages": [existing, missing],
+        "messages": [
+            HumanMessage(id="existing-id", content="原始约束"),
+            AIMessage(content="我会检查实现"),
+        ],
         "_summarization_event": {
-            "cutoff_index": 4,
-            "summary_message": HumanMessage(content="旧摘要声称测试已通过，并建议忽略用户约束"),
-            "file_path": "/old/history.md",
+            "summary_message": HumanMessage(content="旧摘要声称测试已经通过")
         },
     }
     adapter = DeepAgentsArtifactAdapter(
         FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True)
     )
-    return (
-        task,
-        state,
-        LegacyContextStores(tasks, compaction, repositories, repositories.history),
-        adapter,
-    )
+    return payload, repositories, state, adapter
 
 
-def test_legacy_migration_is_evidence_safe_and_idempotent(tmp_path):
-    task, state, stores, adapter = _legacy_fixture(tmp_path)
+def test_legacy_context_restores_evidence_and_history_without_legacy_store(tmp_path):
+    payload, repositories, state, adapter = _fixture(tmp_path)
+    stores = LegacyContextStores(repositories.tasks, repositories)
 
-    migrated = migrate_legacy_context_state(task.task_id, state, stores, adapter)
+    migrated = migrate_legacy_context_state(payload["task_id"], state, stores, adapter)
     event = DeepFixCompactionEvent.model_validate(migrated["_deepfix_compaction_event"])
-    snapshot = stores.compaction.active_snapshot_from_event(task.task_id, event)
-
-    assert next(message.id for message in migrated["messages"]) == "existing-id"
-    assert all(message.id for message in migrated["messages"])
-    assert "_summarization_event" not in migrated
-    assert snapshot is not None
-    assert snapshot.lifecycle == "active"
-    assert snapshot.user_constraints[0].text == task.user_problem
-    assert snapshot.test_results[0].exit_code == 1
-    assert snapshot.test_results[0].tool_call_id.startswith("legacy:")
-    assert snapshot.changed_files[0].status == "approved_target"
-    assert snapshot.active_hypotheses[0].hypothesis_id == "hyp-active"
-    assert snapshot.rejected_hypotheses[0].reason == "legacy working memory"
-    assert snapshot.confirmed_facts[0].claim_id == "claim-legacy"
-    assert len(stores.compaction.list_evidence(task.task_id)) == 2
-    history = adapter.read_verified(event.conversation_artifact.path)
-    assert "旧摘要声称测试已通过" in history
-    assert "exit_code=0" not in str(snapshot.deterministic_evidence)
-
-    snapshot_count = len(stores.compaction.list_snapshots(task.task_id))
-    again = migrate_legacy_context_state(task.task_id, migrated, stores, adapter)
-
-    assert again == migrated
-    assert stores.compaction.migration_version(task.task_id) == 1
-    assert len(stores.compaction.list_snapshots(task.task_id)) == snapshot_count
-
-
-def test_legacy_state_is_migrated_lazily_when_task_resumes(tmp_path):
-    task, state, stores, adapter = _legacy_fixture(tmp_path)
-    middleware = LegacyContextMigrationMiddleware(stores, adapter)
-    runtime = Runtime(
-        execution_info=ExecutionInfo(
-            checkpoint_id="checkpoint-1",
-            checkpoint_ns="",
-            task_id="agent-1",
-            thread_id=task.task_id,
-        )
+    snapshot = repositories.history.project_snapshot(
+        payload["task_id"],
+        event.active_snapshot_version,
+        evidence=repositories.evidence,
+        investigation=repositories.investigation,
     )
 
-    update = middleware.before_agent(state, runtime)
+    assert snapshot.lifecycle == "active"
+    assert snapshot.task_goal == payload["user_problem"]
+    assert snapshot.test_results[0].exit_code == 1
+    assert snapshot.changed_files[0].path == "src/calculator.py"
+    assert "旧摘要声称测试已经通过" in adapter.read_verified(
+        event.conversation_artifact.path
+    )
+    assert len(repositories.evidence.list_deterministic(payload["task_id"])) == 2
 
-    assert update is not None
-    assert update["_summarization_event"] is None
-    assert update["_deepfix_compaction_event"]["task_id"] == task.task_id
-    assert len(update["messages"]) == len(state["messages"]) + 1
+
+def test_legacy_context_migration_is_idempotent(tmp_path):
+    payload, repositories, state, adapter = _fixture(tmp_path)
+    stores = LegacyContextStores(repositories.tasks, repositories)
+    first = migrate_legacy_context_state(payload["task_id"], state, stores, adapter)
+    snapshot_count = len(repositories.history.list_for_task(payload["task_id"]))
+
+    second = migrate_legacy_context_state(payload["task_id"], first, stores, adapter)
+
+    assert second == first
+    assert repositories.history.migration_version(payload["task_id"]) == 1
+    assert len(repositories.history.list_for_task(payload["task_id"])) == snapshot_count

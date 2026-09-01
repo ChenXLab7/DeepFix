@@ -4,8 +4,6 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from deepfix.models import Evidence
-
 EvidenceLevel = Literal["E1", "E2", "E3"]
 VerificationStatus = Literal["unverified", "verified", "contradicted"]
 SourceType = Literal[
@@ -17,6 +15,11 @@ SourceType = Literal[
     "github_pr",
     "github_discussion",
 ]
+
+
+class LocalEvidenceReference(BaseModel):
+    source: str
+    observation: str
 
 
 class DependencyFinding(BaseModel):
@@ -61,7 +64,7 @@ class ExternalEvidence(BaseModel):
     documented_version: str | None
     project_version: str | None
     local_verification: VerificationStatus
-    local_evidence: list[Evidence] = Field(default_factory=list)
+    local_evidence: list[LocalEvidenceReference] = Field(default_factory=list)
     linked_test_tool_call_ids: list[str] = Field(default_factory=list)
     verification_explanation: str | None
     artifact_path: str

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TypeAlias
+from uuid import UUID, uuid4
 
 from pydantic import ConfigDict, Field, JsonValue
 
@@ -21,7 +22,13 @@ from deepfix.compaction.models import (
     SystemTestEvidence,
 )
 from deepfix.database import SQLiteDatabase
-from deepfix.research.models import ExternalEvidence, SearchCandidate
+from deepfix.research.models import (
+    ExternalEvidence,
+    LocalEvidenceReference,
+    ResearchQuery,
+    SearchCandidate,
+    VerificationStatus,
+)
 
 
 class EvidenceIdentityConflict(RuntimeError):
@@ -452,6 +459,113 @@ class EvidenceRepository:
             ),
         )
 
+    def save_research_query(
+        self,
+        task_id: str,
+        sanitized_query: str,
+        providers: list[str],
+        errors: list[str],
+    ) -> ResearchQuery:
+        query_id = uuid4().hex
+        attempt = self.record_research_attempt(
+            task_id=task_id,
+            query_id=query_id,
+            sanitized_query=sanitized_query,
+            providers=providers,
+            provider_errors=errors,
+        )
+        return ResearchQuery(
+            query_id=attempt.query_id,
+            task_id=attempt.task_id,
+            sanitized_query=attempt.sanitized_query,
+            providers=attempt.providers,
+            provider_errors=attempt.provider_errors,
+            created_at=attempt.created_at,
+        )
+
+    def save_research_candidates(
+        self,
+        task_id: str,
+        query: str,
+        candidates: list[SearchCandidate],
+    ) -> list[SearchCandidate]:
+        attempt = self.latest_research_attempt(task_id, query)
+        if attempt is None:
+            generated = self.save_research_query(task_id, query, [], [])
+            attempt = self.get_research_attempt(task_id, generated.query_id)
+        created_at = _now()
+        saved = [
+            candidate.model_copy(
+                update={
+                    "candidate_id": uuid4().hex,
+                    "task_id": task_id,
+                    "query": query,
+                    "created_at": created_at,
+                }
+            )
+            for candidate in candidates
+        ]
+        return self.record_research_candidates(attempt.query_id, saved)
+
+    def save_external_evidence(
+        self,
+        evidence: ExternalEvidence,
+        *,
+        artifact_reference: ArtifactReference | None = None,
+        artifact_content: str | None = None,
+    ) -> None:
+        _validate_uuid4(evidence.evidence_id, "evidence_id")
+        self.get_research_candidate(evidence.task_id, evidence.candidate_id)
+        roots = [f"url:{evidence.url}"]
+        if artifact_reference is not None and artifact_content is not None:
+            self.accept_external_with_content(
+                evidence,
+                provenance_root_ids=roots,
+                artifact_reference=artifact_reference,
+                artifact_content=artifact_content,
+            )
+            return
+        self.accept_external(
+            evidence,
+            provenance_root_ids=roots,
+            artifact_references=(
+                [artifact_reference] if artifact_reference is not None else []
+            ),
+        )
+
+    def get_external_evidence(self, task_id: str, evidence_id: str) -> ExternalEvidence:
+        envelope = self.get(task_id, evidence_id)
+        return restore_external_evidence(envelope)
+
+    def list_external_evidence(self, task_id: str) -> list[ExternalEvidence]:
+        return [
+            restore_external_evidence(item)
+            for item in self.list_for_task(task_id)
+            if item.kind is EvidenceKind.EXTERNAL_RESEARCH
+        ]
+
+    def update_external_verification(
+        self,
+        task_id: str,
+        evidence_id: str,
+        *,
+        local_verification: VerificationStatus,
+        local_evidence: list[LocalEvidenceReference],
+        linked_test_tool_call_ids: list[str],
+        verification_explanation: str | None,
+    ) -> ExternalEvidence:
+        current = self.get_external_evidence(task_id, evidence_id)
+        updated = current.model_copy(
+            update={
+                "local_verification": local_verification,
+                "local_evidence": local_evidence,
+                "linked_test_tool_call_ids": linked_test_tool_call_ids,
+                "verification_explanation": verification_explanation,
+            }
+        )
+        self.update_external(updated)
+        return updated
+
     def record_semantic_candidate(
         self,
         task_id: str,
@@ -499,6 +613,19 @@ class EvidenceRepository:
                 (_required(task_id, "task_id"),),
             ).fetchall()
         return [EvidenceEnvelope.model_validate_json(str(row[0])) for row in rows]
+
+    def list_deterministic(self, task_id: str) -> list[DeterministicEvidence]:
+        return [
+            restore_deterministic_evidence(item)
+            for item in self.list_for_task(task_id)
+            if item.kind
+            in {
+                EvidenceKind.TEST,
+                EvidenceKind.FILE_CHANGE,
+                EvidenceKind.APPROVAL,
+                EvidenceKind.RESEARCH_STATUS,
+            }
+        ]
 
     def verification_view(self, task_id: str) -> VerificationEvidenceView:
         items = self.list_for_task(task_id)
@@ -817,6 +944,15 @@ def _redact_provider_error(value: str) -> str:
         bounded,
     )
     return bounded
+
+
+def _validate_uuid4(value: str, field_name: str) -> None:
+    try:
+        parsed = UUID(value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be UUID4") from exc
+    if parsed.version != 4 or parsed.hex != value.replace("-", "").lower():
+        raise ValueError(f"{field_name} must be UUID4")
 
 
 def _canonical_hash(value: dict[str, object]) -> str:

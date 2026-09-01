@@ -11,16 +11,15 @@ from deepfix.agent import build_agent
 from deepfix.approval import ApprovalPolicy
 from deepfix.backend import build_backend
 from deepfix.compaction.evidence import EvidenceCollector
-from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config, state_database_path
 from deepfix.database import SQLiteDatabase
 from deepfix.domain_repositories import DomainRepositories
+from deepfix.domain_repositories.evidence import EvidenceRepository
 from deepfix.extensions import AgentExtensions, build_research_extensions
 from deepfix.investigation.coordinator import InvestigationCoordinator
-from deepfix.investigation.receipts import ToolExecutionReceiptStore
-from deepfix.investigation.store import InvestigationStore
+from deepfix.investigation.receipts import ToolResultArtifactStorage
 from deepfix.investigation.token_budget import TokenBudgetStore
-from deepfix.operations import OperationJournalStore, OperationReconciler
+from deepfix.operations import OperationReconciler
 from deepfix.persistence import TaskRepository
 from deepfix.reporting import build_task_report_view, render_report
 from deepfix.research.dependency import DependencyInspector
@@ -32,7 +31,6 @@ from deepfix.research.providers import (
     TavilyProvider,
 )
 from deepfix.research.sanitizer import QuerySanitizer, UrlSafetyPolicy
-from deepfix.research.store import ResearchEvidenceStore
 from deepfix.research.tools import (
     build_fetch_external_evidence_tool,
     build_inspect_dependency_tool,
@@ -42,7 +40,6 @@ from deepfix.research.tools import (
 from deepfix.service import BugfixService
 from deepfix.task_domain.models import TaskLifecycleStatus
 from deepfix.task_domain.runtime import TaskRuntime
-from deepfix.verification import VerificationPolicyStore
 from deepfix.workspace import WorkspaceFactory
 
 
@@ -78,7 +75,6 @@ def run_interaction(
     *,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
-    research_evidence_store: ResearchEvidenceStore | None = None,
 ) -> TaskRuntime:
     while (
         task.lifecycle is TaskLifecycleStatus.WAITING_APPROVAL
@@ -177,36 +173,20 @@ def main(
             project_python=stored_task.project_python,
         )
 
-    compaction_store = CompactionStore(
-        config.database_path,
-        repositories=repositories,
-    )
-    research_evidence_store = ResearchEvidenceStore(
-        config.database_path,
-        repositories=repositories,
-    )
+    research_evidence_store = repositories.evidence
     investigation = InvestigationCoordinator(
-        store=InvestigationStore(
-            config.database_path,
-            repositories=repositories,
-        ),
+        store=repositories.investigation,
         tasks=repository,
-        compaction_store=compaction_store,
-        evidence_collector=EvidenceCollector(compaction_store, research_evidence_store),
+        evidence_repository=repositories.evidence,
+        evidence_collector=EvidenceCollector(repositories.evidence),
     )
     artifact_backend = build_backend(config)
-    operation_journal = OperationJournalStore(
-        config.database_path,
-        repositories=repositories,
-    )
-    receipt_store = ToolExecutionReceiptStore(
-        config.artifacts_path / "investigation_receipts",
-        repository=repositories.execution,
+    result_artifacts = ToolResultArtifactStorage(
+        config.artifacts_path / "investigation_receipts"
     )
     workspace_factory = WorkspaceFactory(
         config.workspaces_path or config.database_path.parent / "workspaces"
     )
-    verification_policy_store = VerificationPolicyStore(tasks=repository)
     _token_budget_store = TokenBudgetStore(database=database)
     with build_research_client() as client:
         extensions = build_cli_research_extensions(
@@ -221,11 +201,8 @@ def main(
                 config,
                 checkpointer,
                 task_repository=repository,
-                compaction_store=compaction_store,
                 extensions=extensions,
-                research_evidence_store=research_evidence_store,
                 investigation=investigation,
-                verification_policy_store=verification_policy_store,
                 backend=artifact_backend,
                 repositories=repositories,
             )
@@ -234,15 +211,12 @@ def main(
                 repository,
                 ApprovalPolicy(config.approval_mode),
                 config,
-                research_evidence_store,
-                compaction_store,
-                investigation,
+                investigation=investigation,
                 operation_reconciler=OperationReconciler(
-                    operation_journal,
-                    receipt_store,
+                    repositories.execution,
+                    result_artifacts,
                 ),
                 workspace_factory=workspace_factory,
-                verification_policy_store=verification_policy_store,
                 execution_backend=artifact_backend,
                 repositories=repositories,
             )
@@ -259,7 +233,6 @@ def main(
                 task,
                 input_fn=read_input,
                 output_fn=write_output,
-                research_evidence_store=research_evidence_store,
             )
     return 0
 
@@ -270,7 +243,7 @@ def build_research_client() -> httpx.Client:
 
 def build_cli_research_extensions(
     config,
-    store: ResearchEvidenceStore,
+    store: EvidenceRepository,
     client: httpx.Client,
     artifact_backend,
 ) -> AgentExtensions:

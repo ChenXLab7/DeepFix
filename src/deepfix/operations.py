@@ -4,21 +4,22 @@ import hashlib
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from langchain_core.messages import ToolMessage, message_to_dict
 from pydantic import Field
 
-from deepfix.compaction.models import ArtifactReference, StrictModel
+from deepfix.compaction.models import StrictModel
 from deepfix.investigation.classification import result_fingerprint
-from deepfix.investigation.receipts import (
-    ToolExecutionReceipt,
-    ToolExecutionReceiptStore,
-)
+from deepfix.investigation.receipts import ToolExecutionReceipt, ToolResultArtifactStorage
 from deepfix.workspace import (
     WorkspacePathPolicy,
     WorkspaceScopeError,
     compute_code_state_hash,
 )
+
+if TYPE_CHECKING:
+    from deepfix.domain_repositories.execution import ExecutionRepository
 
 
 class OperationTransitionError(RuntimeError):
@@ -75,120 +76,6 @@ class OperationJournalEntry(NewOperationEntry):
     updated_at: datetime
 
 
-class OperationJournalStore:
-    def __init__(
-        self,
-        database_path: str | Path,
-        *,
-        repositories=None,
-    ) -> None:
-        self.database_path = (
-            repositories.database.path
-            if repositories is not None
-            else Path(database_path).expanduser().resolve()
-        )
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        from deepfix.domain_repositories.execution import ExecutionRepository
-
-        self.repository = (
-            repositories.execution
-            if repositories is not None
-            else ExecutionRepository(self.database_path)
-        )
-
-    def prepare(self, entry: NewOperationEntry) -> OperationJournalEntry:
-        return self.repository.prepare(entry)
-
-    def load(self, operation_id: str) -> OperationJournalEntry | None:
-        return self.repository.load_operation(operation_id)
-
-    def mark_started(self, operation_id: str) -> OperationJournalEntry:
-        return self.repository.mark_started(operation_id)
-
-    def observe_with_receipt(
-        self,
-        operation_id: str,
-        *,
-        post_state: OperationStateSnapshot,
-        receipt: ToolExecutionReceipt,
-        artifact_references: list[ArtifactReference],
-    ) -> OperationJournalEntry:
-        return self.repository.observe_with_receipt(
-            operation_id,
-            post_state=post_state,
-            receipt=receipt,
-            artifact_references=artifact_references,
-        )
-
-    def load_receipt(
-        self,
-        task_id: str,
-        tool_call_id: str,
-    ) -> ToolExecutionReceipt | None:
-        return self.repository.load_receipt(task_id, tool_call_id)
-
-    def artifact_references(self, operation_id: str) -> list[ArtifactReference]:
-        return self.repository.load_artifact_references(operation_id)
-
-    def observe(
-        self,
-        operation_id: str,
-        *,
-        post_state: OperationStateSnapshot,
-        receipt_id: str,
-        artifact_references: list[str],
-    ) -> OperationJournalEntry:
-        current = self.repository.load_operation(operation_id)
-        if current is None:
-            raise OperationTransitionError(f"missing operation: {operation_id}")
-        tool_name = {
-            OperationKind.FILE_WRITE: "write_file",
-            OperationKind.FILE_EDIT: "edit_file",
-            OperationKind.FILE_DELETE: "delete",
-            OperationKind.COMMAND: "execute",
-        }[current.operation_kind]
-        message = ToolMessage(
-            content="legacy operation observation",
-            name=tool_name,
-            tool_call_id=current.tool_call_id,
-        )
-        receipt = ToolExecutionReceipt(
-            task_id=current.task_id,
-            tool_call_id=current.tool_call_id,
-            tool_name=tool_name,
-            call_hash=current.call_hash,
-            tool_message_data=message_to_dict(message),
-            result_fingerprint=receipt_id,
-        )
-        references = [
-            ArtifactReference(
-                path=path,
-                kind="operation_result",
-                content_hash=hashlib.sha256(path.encode("utf-8")).hexdigest(),
-            )
-            for path in artifact_references
-        ]
-        return self.observe_with_receipt(
-            operation_id,
-            post_state=post_state,
-            receipt=receipt,
-            artifact_references=references,
-        )
-
-    def commit(self, operation_id: str) -> OperationJournalEntry:
-        return self.repository.commit(operation_id)
-
-    def mark_unknown(
-        self,
-        operation_id: str,
-        reason: str,
-    ) -> OperationJournalEntry:
-        return self.repository.mark_unknown(operation_id, reason)
-
-    def list_incomplete(self, task_id: str) -> list[OperationJournalEntry]:
-        return self.repository.list_incomplete(task_id)
-
-
 class ReconciliationResult(StrictModel):
     reconstructed_operation_ids: list[str] = Field(default_factory=list)
     replayable_operation_ids: list[str] = Field(default_factory=list)
@@ -204,15 +91,13 @@ class ReconciliationResult(StrictModel):
 class OperationReconciler:
     def __init__(
         self,
-        journal: OperationJournalStore,
-        receipts: ToolExecutionReceiptStore,
+        execution: ExecutionRepository,
+        artifacts: ToolResultArtifactStorage,
         *,
         terminate_process_group=None,
     ) -> None:
-        self.journal = journal
-        self.receipts = receipts
-        if receipts.repository is None:
-            receipts.repository = journal.repository
+        self.execution = execution
+        self.artifacts = artifacts
         self.terminate_process_group = terminate_process_group or (lambda _entry: None)
 
     def reconcile_task(
@@ -227,7 +112,7 @@ class OperationReconciler:
         conflicts: list[str] = []
         unknown: list[str] = []
         prepared: list[str] = []
-        for entry in self.journal.list_incomplete(task_id):
+        for entry in self.execution.list_incomplete(task_id):
             if entry.status is OperationStatus.PREPARED:
                 prepared.append(entry.operation_id)
                 continue
@@ -235,10 +120,10 @@ class OperationReconciler:
                 unknown.append(entry.operation_id)
                 continue
             if entry.status is OperationStatus.OBSERVED:
-                if self.journal.load_receipt(task_id, entry.tool_call_id) is not None:
+                if self.execution.load_receipt(task_id, entry.tool_call_id) is not None:
                     replayable.append(entry.operation_id)
                 else:
-                    self.journal.mark_unknown(
+                    self.execution.mark_unknown(
                         entry.operation_id, "observed operation receipt is missing"
                     )
                     conflicts.append(entry.operation_id)
@@ -252,7 +137,7 @@ class OperationReconciler:
                 continue
             expected = entry.expected_post_state
             if expected is None or not expected.target_path:
-                self.journal.mark_unknown(
+                self.execution.mark_unknown(
                     entry.operation_id, "file operation lacks expected post state"
                 )
                 unknown.append(entry.operation_id)
@@ -260,7 +145,7 @@ class OperationReconciler:
             try:
                 target = paths.resolve_allowed(expected.target_path)
             except WorkspaceScopeError:
-                self.journal.mark_unknown(
+                self.execution.mark_unknown(
                     entry.operation_id, "file operation target escapes workspace"
                 )
                 conflicts.append(entry.operation_id)
@@ -268,7 +153,7 @@ class OperationReconciler:
             current = _file_snapshot(root, target)
             if _matches_expected(current, expected):
                 receipt = _reconstructed_file_receipt(entry)
-                self.journal.observe_with_receipt(
+                self.execution.observe_with_receipt(
                     entry.operation_id,
                     post_state=current,
                     receipt=receipt,
@@ -277,13 +162,13 @@ class OperationReconciler:
                 reconstructed.append(entry.operation_id)
                 replayable.append(entry.operation_id)
             elif _matches_expected(current, entry.pre_state):
-                self.journal.mark_unknown(
+                self.execution.mark_unknown(
                     entry.operation_id,
                     "operation started but workspace still matches pre-state",
                 )
                 unknown.append(entry.operation_id)
             else:
-                self.journal.mark_unknown(
+                self.execution.mark_unknown(
                     entry.operation_id,
                     "workspace state matches neither operation pre-state nor post-state",
                 )
@@ -301,10 +186,10 @@ class OperationReconciler:
         entry: OperationJournalEntry,
         workspace: Path,
     ) -> bool:
-        loaded = self.receipts.load_result_artifact(entry.task_id, entry.tool_call_id)
+        loaded = self.artifacts.load_result_artifact(entry.task_id, entry.tool_call_id)
         if loaded is None or loaded[1].exit_code is None:
             self.terminate_process_group(entry)
-            self.journal.mark_unknown(
+            self.execution.mark_unknown(
                 entry.operation_id,
                 "command exit status cannot be verified",
             )
@@ -328,7 +213,7 @@ class OperationReconciler:
             tool_message_data=message_to_dict(message),
             result_fingerprint=result_fingerprint(message),
         )
-        self.journal.observe_with_receipt(
+        self.execution.observe_with_receipt(
             entry.operation_id,
             post_state=OperationStateSnapshot(
                 code_state_hash=compute_code_state_hash(workspace),
@@ -336,7 +221,7 @@ class OperationReconciler:
                 exit_code=artifact.exit_code,
             ),
             receipt=receipt,
-            artifact_references=[self.receipts.artifact_reference(reference)],
+            artifact_references=[self.artifacts.artifact_reference(reference)],
         )
         return True
 

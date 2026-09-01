@@ -11,7 +11,11 @@ from langchain_core.messages import ToolMessage
 
 from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.models import FileChangeEvidence, SystemTestEvidence
-from deepfix.compaction.store import CompactionStore
+from deepfix.domain_repositories.evidence import EvidenceRepository
+from deepfix.domain_repositories.investigation import (
+    InvestigationRepository,
+    InvestigationStateConflict,
+)
 from deepfix.investigation.classification import (
     is_pytest_verification,
     result_fingerprint,
@@ -38,10 +42,6 @@ from deepfix.investigation.models import (
 )
 from deepfix.investigation.progress import ProgressEvaluator
 from deepfix.investigation.stagnation import StagnationDetector
-from deepfix.investigation.store import (
-    InvestigationStateConflict,
-    InvestigationStore,
-)
 from deepfix.persistence import TaskRepository
 
 
@@ -90,16 +90,16 @@ class InvestigationCoordinator:
     def __init__(
         self,
         *,
-        store: InvestigationStore,
+        store: InvestigationRepository,
         tasks: TaskRepository,
-        compaction_store: CompactionStore,
+        evidence_repository: EvidenceRepository,
         evidence_collector: EvidenceCollector,
         progress_evaluator: ProgressEvaluator | None = None,
         stagnation_detector: StagnationDetector | None = None,
     ) -> None:
         self.store = store
         self.tasks = tasks
-        self.compaction_store = compaction_store
+        self.evidence_repository = evidence_repository
         self.evidence_collector = evidence_collector
         self.progress_evaluator = progress_evaluator or ProgressEvaluator()
         self.stagnation_detector = stagnation_detector or StagnationDetector()
@@ -182,7 +182,7 @@ class InvestigationCoordinator:
                 )
             has_successful_change = any(
                 isinstance(item, FileChangeEvidence) and item.status == "succeeded"
-                for item in self.compaction_store.list_evidence(task_id)
+                for item in self.evidence_repository.list_deterministic(task_id)
             )
             event_type = (
                 InvestigationEventType.POST_EDIT_TEST_OBSERVED
@@ -420,7 +420,10 @@ class InvestigationCoordinator:
         source_id: str,
     ) -> InvestigationHypothesis:
         state = self.state(task_id)
-        evidence_ids = {item.evidence_id for item in self.compaction_store.list_evidence(task_id)}
+        evidence_ids = {
+            item.evidence_id
+            for item in self.evidence_repository.list_deterministic(task_id)
+        }
         if not set(command.evidence_ids) <= evidence_ids:
             raise ValueError("假设证据不属于当前任务")
         if not all(self._location_was_checked(state, item) for item in command.checked_locations):

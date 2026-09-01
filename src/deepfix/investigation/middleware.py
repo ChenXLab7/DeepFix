@@ -20,6 +20,7 @@ from deepfix.compaction.identity import (
     stable_generated_message_id,
 )
 from deepfix.compaction.models import ArtifactReference
+from deepfix.domain_repositories.execution import ExecutionRepository
 from deepfix.investigation.classification import is_pytest_verification
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import InvestigationStateError
@@ -30,14 +31,13 @@ from deepfix.investigation.models import (
 )
 from deepfix.investigation.receipts import (
     ToolExecutionReceipt,
-    ToolExecutionReceiptStore,
+    ToolResultArtifactStorage,
     receipt_from_result,
     tool_call_hash,
 )
 from deepfix.operations import (
     NewOperationEntry,
     OperationJournalEntry,
-    OperationJournalStore,
     OperationKind,
     OperationStateSnapshot,
     OperationStatus,
@@ -58,16 +58,14 @@ class InvestigationMiddleware(AgentMiddleware):
     def __init__(
         self,
         coordinator: InvestigationCoordinator,
-        receipts: ToolExecutionReceiptStore,
+        execution: ExecutionRepository,
+        artifacts: ToolResultArtifactStorage,
         capabilities: Mapping[str, InvestigationCapability],
-        operation_journal: OperationJournalStore | None = None,
     ) -> None:
         self.coordinator = coordinator
-        self.receipts = receipts
+        self.execution = execution
+        self.artifacts = artifacts
         self.capabilities = dict(capabilities)
-        self.operation_journal = operation_journal
-        if operation_journal is not None and receipts.repository is None:
-            receipts.repository = operation_journal.repository
 
     def wrap_model_call(
         self,
@@ -95,7 +93,7 @@ class InvestigationMiddleware(AgentMiddleware):
             result = _diagnostic_artifact_redirect(task_id, request)
             if result is None:
                 if operation is not None:
-                    self.operation_journal.mark_started(operation.operation_id)
+                    self.execution.mark_started(operation.operation_id)
                 result = handler(request)
         else:
             result = receipt.tool_message
@@ -116,7 +114,7 @@ class InvestigationMiddleware(AgentMiddleware):
             result = _diagnostic_artifact_redirect(task_id, request)
             if result is None:
                 if operation is not None:
-                    self.operation_journal.mark_started(operation.operation_id)
+                    self.execution.mark_started(operation.operation_id)
                 result = await handler(request)
         else:
             result = receipt.tool_message
@@ -159,7 +157,7 @@ class InvestigationMiddleware(AgentMiddleware):
                 "pause_and_inspect_operation_journal",
             )
         try:
-            receipt = self.receipts.load(task_id, call_id)
+            receipt = self.execution.load_receipt(task_id, call_id)
         except Exception as exc:
             raise self._state_error(
                 task_id,
@@ -168,8 +166,6 @@ class InvestigationMiddleware(AgentMiddleware):
                 "pause_before_tool_reexecution",
                 cause=exc,
             ) from exc
-        if receipt is None and operation is not None:
-            receipt = self.operation_journal.load_receipt(task_id, call_id)
         if receipt is not None:
             expected = tool_call_hash(task_id, request.tool_call)
             if receipt.call_hash != expected:
@@ -280,7 +276,7 @@ class InvestigationMiddleware(AgentMiddleware):
                 "pause_and_inspect_tool_result",
             )
         artifact_references: list[ArtifactReference] = (
-            self.operation_journal.artifact_references(operation.operation_id)
+            self.execution.load_artifact_references(operation.operation_id)
             if operation is not None
             else []
         )
@@ -289,7 +285,7 @@ class InvestigationMiddleware(AgentMiddleware):
             if operation is not None and operation.operation_kind is OperationKind.COMMAND:
                 try:
                     artifact_references.append(
-                        self.receipts.save_result_artifact_reference(
+                        self.artifacts.save_result_artifact_reference(
                             task_id,
                             call_id,
                             str(request.tool_call.get("name", "")),
@@ -306,7 +302,7 @@ class InvestigationMiddleware(AgentMiddleware):
                     ) from exc
             if operation is None:
                 try:
-                    self.receipts.save(receipt)
+                    self.execution.record_receipt(receipt)
                 except Exception as exc:
                     raise self._state_error(
                         task_id,
@@ -320,7 +316,7 @@ class InvestigationMiddleware(AgentMiddleware):
         if operation is not None:
             post_state = self._operation_snapshot(task_id, request, result=result)
             try:
-                operation = self.operation_journal.observe_with_receipt(
+                operation = self.execution.observe_with_receipt(
                     operation.operation_id,
                     post_state=post_state,
                     receipt=receipt,
@@ -336,7 +332,7 @@ class InvestigationMiddleware(AgentMiddleware):
                 ) from exc
         self.coordinator.record_tool_result(task_id, request.tool_call, result)
         if operation is not None:
-            self.operation_journal.commit(operation.operation_id)
+            self.execution.commit(operation.operation_id)
         return result
 
     def _load_operation(
@@ -345,9 +341,11 @@ class InvestigationMiddleware(AgentMiddleware):
         call_id: str,
         name: str,
     ) -> OperationJournalEntry | None:
-        if self.operation_journal is None or name not in _SIDE_EFFECT_KINDS:
+        if name not in _SIDE_EFFECT_KINDS:
             return None
-        return self.operation_journal.load(stable_investigation_id("operation", task_id, call_id))
+        return self.execution.load_operation(
+            stable_investigation_id("operation", task_id, call_id)
+        )
 
     def _prepare_operation(
         self,
@@ -355,10 +353,10 @@ class InvestigationMiddleware(AgentMiddleware):
         request: ToolCallRequest,
     ) -> OperationJournalEntry | None:
         name = str(request.tool_call.get("name", "")).strip()
-        if self.operation_journal is None or name not in _SIDE_EFFECT_KINDS:
+        if name not in _SIDE_EFFECT_KINDS:
             return None
         call_id = str(request.tool_call.get("id", "")).strip()
-        task = self.coordinator.tasks.get(task_id)
+        task = self.coordinator.tasks.get_definition(task_id)
         if not task.workspace_root or not task.workspace_baseline_id:
             raise self._state_error(
                 task_id,
@@ -367,7 +365,7 @@ class InvestigationMiddleware(AgentMiddleware):
                 "pause_and_restore_workspace_identity",
             )
         pre_state = self._operation_snapshot(task_id, request)
-        return self.operation_journal.prepare(
+        return self.execution.prepare(
             NewOperationEntry(
                 operation_id=stable_investigation_id("operation", task_id, call_id),
                 task_id=task_id,

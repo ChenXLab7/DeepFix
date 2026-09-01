@@ -5,15 +5,12 @@ import json
 import re
 import shlex
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from pydantic import Field
 
 from deepfix.compaction.models import StrictModel, SystemTestEvidence
 from deepfix.workspace import TaskWorkspace
-
-if TYPE_CHECKING:
-    from deepfix.task_domain.repository import TaskRepository
 
 _PYTEST_COMMAND = re.compile(
     r"(?i)(?:python(?:\.exe)?\s+-m\s+pytest|pytest)(?:\s+[^\r\n，。；;]+)?"
@@ -107,26 +104,6 @@ class VerificationPolicyBuilder:
                 )
             ],
         )
-
-
-class VerificationPolicyStore:
-    def __init__(
-        self,
-        database_path: str | Path | None = None,
-        *,
-        tasks: TaskRepository | None = None,
-    ) -> None:
-        from deepfix.task_domain.repository import TaskRepository
-
-        if tasks is None and database_path is None:
-            raise ValueError("database_path or tasks is required")
-        self.tasks = tasks or TaskRepository(database_path)
-
-    def save(self, policy: VerificationPolicy) -> None:
-        self.tasks.save_verification_policy(policy)
-
-    def load(self, task_id: str, version: int | None = None) -> VerificationPolicy | None:
-        return self.tasks.load_verification_policy(task_id, version)
 
 
 def evaluate_required_oracles(

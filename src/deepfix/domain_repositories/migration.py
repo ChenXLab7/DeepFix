@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 from uuid import uuid4
@@ -59,8 +59,6 @@ from deepfix.investigation.models import (
 )
 from deepfix.investigation.receipts import (
     ToolExecutionReceipt,
-    disable_legacy_receipt_writes,
-    legacy_receipt_task_guard,
     receipt_task_segment,
 )
 from deepfix.operations import OperationJournalEntry
@@ -89,17 +87,7 @@ def _fenced_migration(domain: str):
         @wraps(method)
         def wrapped(self, task_id: str):
             with self._migration_fence(domain, task_id):
-                result = method(self, task_id)
-                if (
-                    domain == "execution"
-                    and result.ready_to_switch
-                    and self.artifact_root is not None
-                ):
-                    disable_legacy_receipt_writes(
-                        self.artifact_root / "investigation_receipts",
-                        task_id,
-                    )
-                return result
+                return method(self, task_id)
 
         return wrapped
 
@@ -986,14 +974,14 @@ class DomainMigrator:
             table = connection.execute(
                 """
                 SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'legacy_task_projection'
+                WHERE type = 'table' AND name = 'tasks'
                 """
             ).fetchone()
             row = (
                 None
                 if table is None
                 else connection.execute(
-                    "SELECT payload FROM legacy_task_projection WHERE task_id = ?",
+                    "SELECT payload FROM tasks WHERE task_id = ?",
                     (task_id,),
                 ).fetchone()
             )
@@ -1193,72 +1181,63 @@ class DomainMigrator:
     def _migration_fence(self, domain: str, task_id: str):
         normalized_task_id = _required(task_id, "task_id")
         owner_id = uuid4().hex
-        receipt_root = (
-            None
-            if self.artifact_root is None or domain != "execution"
-            else self.artifact_root / "investigation_receipts"
-        )
-        with ExitStack() as stack:
-            if receipt_root is not None:
-                stack.enter_context(legacy_receipt_task_guard(receipt_root, normalized_task_id))
-            try:
-                with self.database.unit_of_work(immediate=True) as connection:
-                    existing = connection.execute(
+        try:
+            with self.database.unit_of_work(immediate=True) as connection:
+                existing = connection.execute(
+                    """
+                    SELECT owner_id, started_at
+                    FROM domain_migration_fences
+                    WHERE domain = ? AND task_id = ?
+                    """,
+                    (domain, normalized_task_id),
+                ).fetchone()
+                if existing is not None:
+                    marker = connection.execute(
                         """
-                        SELECT owner_id, started_at
-                        FROM domain_migration_fences
+                        SELECT 1 FROM domain_migrations
                         WHERE domain = ? AND task_id = ?
                         """,
                         (domain, normalized_task_id),
                     ).fetchone()
-                    if existing is not None:
-                        marker = connection.execute(
-                            """
-                            SELECT 1 FROM domain_migrations
-                            WHERE domain = ? AND task_id = ?
-                            """,
-                            (domain, normalized_task_id),
-                        ).fetchone()
-                        stale = connection.execute(
-                            "SELECT ? < datetime('now', '-15 minutes')",
-                            (str(existing[1]),),
-                        ).fetchone()[0]
-                        if marker is None and not bool(stale):
-                            raise DomainMigrationInProgress(
-                                "domain migration already in progress: "
-                                f"{domain}:{normalized_task_id}"
-                            )
-                        connection.execute(
-                            """
-                            DELETE FROM domain_migration_fences
-                            WHERE domain = ? AND task_id = ? AND owner_id = ?
-                            """,
-                            (domain, normalized_task_id, str(existing[0])),
+                    stale = connection.execute(
+                        "SELECT ? < datetime('now', '-15 minutes')",
+                        (str(existing[1]),),
+                    ).fetchone()[0]
+                    if marker is None and not bool(stale):
+                        raise DomainMigrationInProgress(
+                            "domain migration already in progress: "
+                            f"{domain}:{normalized_task_id}"
                         )
-                    connection.execute(
-                        """
-                        INSERT INTO domain_migration_fences(
-                            domain, task_id, owner_id, started_at
-                        )
-                        VALUES (?, ?, ?, datetime('now'))
-                        """,
-                        (domain, normalized_task_id, owner_id),
-                    )
-            except sqlite3.IntegrityError as error:
-                raise DomainMigrationInProgress(
-                    f"domain migration already in progress: {domain}:{normalized_task_id}"
-                ) from error
-            try:
-                yield
-            finally:
-                with self.database.unit_of_work(immediate=True) as connection:
                     connection.execute(
                         """
                         DELETE FROM domain_migration_fences
                         WHERE domain = ? AND task_id = ? AND owner_id = ?
                         """,
-                        (domain, normalized_task_id, owner_id),
+                        (domain, normalized_task_id, str(existing[0])),
                     )
+                connection.execute(
+                    """
+                    INSERT INTO domain_migration_fences(
+                        domain, task_id, owner_id, started_at
+                    ) VALUES (?, ?, ?, datetime('now'))
+                    """,
+                    (domain, normalized_task_id, owner_id),
+                )
+        except sqlite3.IntegrityError as error:
+            raise DomainMigrationInProgress(
+                f"domain migration already in progress: {domain}:{normalized_task_id}"
+            ) from error
+        try:
+            yield
+        finally:
+            with self.database.unit_of_work(immediate=True) as connection:
+                connection.execute(
+                    """
+                    DELETE FROM domain_migration_fences
+                    WHERE domain = ? AND task_id = ? AND owner_id = ?
+                    """,
+                    (domain, normalized_task_id, owner_id),
+                )
 
     def _initialize_schema(self) -> None:
         with self.database.unit_of_work() as connection:

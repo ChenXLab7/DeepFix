@@ -11,7 +11,7 @@ from __future__ import annotations
 # - 不要提交或推送 Git 变更，不要访问目标项目以外的路径。
 # - 只有存在真实通过的测试结果时，才能返回 status="completed"。
 
-# 最终必须返回 RepairOutcome：缺少关键信息时使用 needs_input；证据不足或受限时使用
+# 最终必须返回 RepairOutcomeCandidate：缺少关键信息时使用 needs_input；证据不足或受限时使用
 # blocked；只有修复经过测试验证时使用 completed。
 # """.strip()
 
@@ -64,7 +64,7 @@ CORE_REPAIR_PROMPT = """
 - 检索后必须用证据支持、推翻或更新当前假设；检索结果不能替代真实 pytest exit_code、
   文件操作记录或审批记录等系统确定性证据。
 
-最终必须返回 RepairOutcome：缺少关键信息时使用 needs_input；证据不足或受限时使用
+最终必须返回 RepairOutcomeCandidate：缺少关键信息时使用 needs_input；证据不足或受限时使用
 blocked；完成时必须设置 resolution="fixed" 或 resolution="not_reproduced"，且必须有
 真实通过的测试证据。
 """.strip()
