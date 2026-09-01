@@ -548,11 +548,11 @@ git commit -m "refactor: retire working memory authority"
 - Modify: `src/deepfix/task_domain/models.py`
 - Modify: service/CLI/artifact/workflow tests
 
-- [ ] **Step 1: Write the minimal runtime boundary test.**
+- [x] **Step 1: Write the minimal runtime boundary test.**
 
 Assert `TaskRuntime` exposes task identity, lifecycle, optional pending interrupt actions, pause reason, and decision reference only. Explicitly reject fields named `conversation`, `evidence`, `hypotheses`, `changed_files`, `test_results`, `approvals`, `context_metrics`, `recovery`, `repair_plan`, or `final_summary`.
 
-- [ ] **Step 2: Write service behavior tests against repositories and Graph state.**
+- [x] **Step 2: Write service behavior tests against repositories and Graph state.**
 
 Cover start, continue, pause, approval interrupt/resume, operation recovery, context/investigation recovery exceptions, recursion pause, structured response, required-oracle decision, and report generation. Verify:
 
@@ -562,26 +562,26 @@ Cover start, continue, pause, approval interrupt/resume, operation recovery, con
 - tool results flow to Receipt/Evidence/Investigation repositories;
 - final decision is produced by OutcomeAdjudicator and stored by ID only.
 
-- [ ] **Step 3: Refactor `BugfixService` around `task_id`.**
+- [x] **Step 3: Refactor `BugfixService` around `task_id`.**
 
 Replace `_sync_context`, `_save(TaskState)`, `save_legacy_projection`, mutable phase/status transitions, and copied counters with direct bounded repository operations. Request-local variables may organize one method call but must not be persisted as a second aggregate.
 
-- [ ] **Step 4: Keep infrastructure error propagation typed.**
+- [x] **Step 4: Keep infrastructure error propagation typed.**
 
 Middleware/coordinator continue to throw typed exceptions with sanitized recovery metadata. Service catches them and transitions TaskLifecycle to `PAUSED`; middleware never changes business lifecycle. Persist recovery as History/debug event plus Artifact reference where appropriate, not as a TaskState field.
 
-- [ ] **Step 5: Switch Workspace and Artifact Retrieval inputs.**
+- [x] **Step 5: Switch Workspace and Artifact Retrieval inputs.**
 
 Pass immutable `TaskDefinition`/task ID and bounded views, never a giant mutable task object. Preserve canonical path, symlink/junction, shell confinement, and task-owned Artifact isolation checks.
 
-- [ ] **Step 6: Verify.**
+- [x] **Step 6: Verify.**
 
 ```powershell
 python -m pytest tests/task_domain/test_runtime_boundary.py tests/test_service.py tests/test_cli.py tests/artifact_retrieval tests/research/test_workflow.py tests/task_domain/test_service_integration.py tests/domain_repositories/test_service_integration.py -q
 python -m ruff check src/deepfix/service.py src/deepfix/cli.py src/deepfix/task_domain src/deepfix/artifact_retrieval src/deepfix/workspace.py
 ```
 
-- [ ] **Step 7: Commit.**
+- [x] **Step 7: Commit.**
 
 ```powershell
 git add src/deepfix/service.py src/deepfix/cli.py src/deepfix/task_domain src/deepfix/artifact_retrieval src/deepfix/workspace.py tests

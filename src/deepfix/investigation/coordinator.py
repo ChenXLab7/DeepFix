@@ -108,7 +108,7 @@ class InvestigationCoordinator:
         return self.state(task_id)
 
     def project_python(self, task_id: str) -> str:
-        return self.tasks.get(task_id).project_python
+        return self.tasks.get_definition(task_id).project_python
 
     def allowed_tool_names(
         self,
@@ -120,7 +120,7 @@ class InvestigationCoordinator:
 
     def state(self, task_id: str) -> InvestigationState:
         try:
-            self.tasks.get(task_id)
+            self.tasks.get_definition(task_id)
             return self.store.load(task_id) or self.store.ensure_started(task_id)
         except InvestigationCoordinationError:
             raise
@@ -140,7 +140,7 @@ class InvestigationCoordinator:
         call: Mapping[str, object],
         result: ToolMessage,
     ) -> InvestigationState:
-        task = self.tasks.get(task_id)
+        task = self.tasks.get_definition(task_id)
         name = str(call.get("name", "")).strip()
         call_id = str(call.get("id", "")).strip()
         args_value = call.get("args", {})

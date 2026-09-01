@@ -5,7 +5,7 @@ import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 
@@ -18,7 +18,6 @@ from deepfix.compaction.models import (
     SystemTestEvidence,
 )
 from deepfix.compaction.store import CompactionStore, DeterministicEvidence
-from deepfix.models import TaskState
 from deepfix.research.store import ResearchEvidenceStore
 from deepfix.verification import (
     classify_pytest_scope,
@@ -34,6 +33,10 @@ _FILE_TO_OPERATION = {
 }
 
 
+class TaskEvidenceContext(Protocol):
+    task_id: str
+
+
 class EvidenceCollector:
     def __init__(
         self,
@@ -47,11 +50,11 @@ class EvidenceCollector:
         self,
         task_id: str,
         messages: Sequence[AnyMessage],
-        task_state: TaskState,
+        task_context: TaskEvidenceContext,
     ) -> DeterministicEvidenceBlock:
         task_id = task_id.strip()
-        if not task_id or task_state.task_id != task_id:
-            raise ValueError("EvidenceCollector task_id 与 TaskState 不匹配")
+        if not task_id or task_context.task_id != task_id:
+            raise ValueError("EvidenceCollector task_id 与任务上下文不匹配")
         identified = ensure_message_ids(task_id, messages).messages
         calls = _unique_pairs(identified)
 
@@ -67,7 +70,10 @@ class EvidenceCollector:
                     call_id,
                     args,
                     result,
-                    task_state,
+                    task_context,
+                    has_successful_change=_has_successful_change(
+                        self.store.list_evidence(task_id)
+                    ),
                 )
                 if test is not None:
                     collected.append(test)
@@ -77,7 +83,7 @@ class EvidenceCollector:
                 collected.append(file_change)
                 actual_paths.add(file_change.path)
 
-        for path in dict.fromkeys(task_state.changed_files):
+        for path in dict.fromkeys(getattr(task_context, "changed_files", [])):
             if path in actual_paths:
                 continue
             collected.append(
@@ -91,7 +97,7 @@ class EvidenceCollector:
                 )
             )
 
-        for index, approval in enumerate(task_state.approvals):
+        for index, approval in enumerate(getattr(task_context, "approvals", [])):
             collected.append(
                 ApprovalEvidence(
                     evidence_id=_evidence_id(
@@ -136,12 +142,12 @@ class EvidenceCollector:
         task_id: str,
         call: Mapping[str, object],
         result: ToolMessage,
-        task_state: TaskState,
+        task_context: TaskEvidenceContext,
     ) -> DeterministicEvidence | None:
         block = self.collect(
             task_id,
             [AIMessage(content="", tool_calls=[dict(call)]), result],
-            task_state,
+            task_context,
         )
         call_id = str(call.get("id", ""))
         return next(
@@ -178,7 +184,9 @@ def _test_evidence(
     call_id: str,
     args: Mapping[str, object],
     result: ToolMessage,
-    task_state: TaskState,
+    task_context: TaskEvidenceContext,
+    *,
+    has_successful_change: bool,
 ) -> SystemTestEvidence | None:
     command = str(args.get("command", "")).strip()
     artifact = result.artifact
@@ -201,19 +209,34 @@ def _test_evidence(
         summary=_message_text(result),
         tool_call_id=call_id,
         source_message_id=str(result.id),
-        **_test_metadata(command, task_state),
+        **_test_metadata(
+            command,
+            task_context,
+            has_successful_change=has_successful_change,
+        ),
     )
 
 
-def _test_metadata(command: str, task: TaskState) -> dict[str, object]:
-    root = Path(task.workspace_root or task.project_root).resolve()
+def _test_metadata(
+    command: str,
+    task: TaskEvidenceContext,
+    *,
+    has_successful_change: bool,
+) -> dict[str, object]:
+    workspace_root = getattr(task, "workspace_root", "")
+    source_root = getattr(task, "source_project_root", "") or getattr(
+        task, "project_root", ""
+    )
+    root = Path(workspace_root or source_root).resolve()
     targets = pytest_target_paths(command)
     baseline = _workspace_baseline(root)
     baseline_hashes = baseline.managed_file_hashes if baseline else {}
     normalized = _normalize_command(command)
     user_commands = {
         _normalize_command(item)
-        for item in extract_user_pytest_commands(task.user_problem)
+        for item in extract_user_pytest_commands(
+            getattr(task, "original_problem", "") or getattr(task, "user_problem", "")
+        )
     }
     content_hashes: dict[str, str] = {}
     for relative in targets:
@@ -240,11 +263,9 @@ def _test_metadata(command: str, task: TaskState) -> dict[str, object]:
     else:
         origin = "repository_existing"
     current_hash = compute_code_state_hash(root)
-    if task.investigation_recovery is not None:
-        timing = "post_recovery"
-    elif (
-        baseline is not None and current_hash != baseline.code_state_hash
-    ) or task.changed_files:
+    if (baseline is not None and current_hash != baseline.code_state_hash) or (
+        has_successful_change
+    ):
         timing = "post_change"
     else:
         timing = "baseline"
@@ -253,13 +274,20 @@ def _test_metadata(command: str, task: TaskState) -> dict[str, object]:
         "scope": classify_pytest_scope(command),
         "timing": timing,
         "workspace_baseline_id": (
-            task.workspace_baseline_id
+            getattr(task, "workspace_baseline_id", None)
             or (baseline.baseline_id if baseline else "legacy-untracked")
         ),
         "code_state_hash": current_hash,
         "test_target_paths": targets,
         "test_content_hashes": content_hashes,
     }
+
+
+def _has_successful_change(evidence: Sequence[DeterministicEvidence]) -> bool:
+    return any(
+        isinstance(item, FileChangeEvidence) and item.status == "succeeded"
+        for item in evidence
+    )
 
 
 def _workspace_baseline(root: Path) -> WorkspaceBaseline | None:

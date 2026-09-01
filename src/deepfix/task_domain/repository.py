@@ -520,6 +520,22 @@ class TaskRepository:
             ).fetchall()
         return [self.get(str(row[0])) for row in rows]
 
+    def list_recent_definitions(self, limit: int = 20) -> list[TaskDefinition]:
+        """Return immutable task definitions without loading legacy projections."""
+        self._backfill_all_historical_tasks()
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT definition.task_id
+                FROM task_definitions AS definition
+                JOIN task_lifecycle AS lifecycle USING (task_id)
+                ORDER BY lifecycle.updated_at DESC, definition.rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self.get_definition(str(row[0])) for row in rows]
+
     def _initialize_schema(self) -> None:
         with self.database.unit_of_work() as connection:
             connection.execute(
@@ -720,7 +736,12 @@ class TaskRepository:
             return current
         validate_lifecycle_transition(current.status, next_status)
         paused_from = current.status if next_status is TaskLifecycleStatus.PAUSED else None
-        next_reason = reason if next_status is TaskLifecycleStatus.PAUSED else None
+        next_reason = (
+            reason
+            if next_status
+            in {TaskLifecycleStatus.PAUSED, TaskLifecycleStatus.FAILED}
+            else None
+        )
         updated_at = _now()
         cursor = connection.execute(
             """

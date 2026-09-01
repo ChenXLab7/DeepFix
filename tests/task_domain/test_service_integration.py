@@ -8,8 +8,7 @@ from langgraph.types import Interrupt
 from deepfix.approval import ApprovalPolicy
 from deepfix.compaction.models import SystemTestEvidence
 from deepfix.config import ApprovalMode, load_config
-from deepfix.models import RepairOutcome, TaskStatus
-from deepfix.models import TestResult as RepairTestResult
+from deepfix.models import RepairOutcome
 from deepfix.research.store import ResearchEvidenceStore
 from deepfix.service import BugfixService
 from deepfix.task_domain.models import TaskLifecycleStatus
@@ -109,15 +108,19 @@ def test_service_creates_canonical_state_in_dependency_order(config) -> None:
 
     task = service.start("原始修复问题")
 
-    assert repository.events[:4] == [
+    assert repository.events[:3] == [
         "create_definition",
         "save_verification_policy",
         "transition_lifecycle:running",
-        "save_legacy_projection",
     ]
     definition = repository.get_definition(task.task_id)
     assert definition.original_problem == "原始修复问题"
-    assert definition.original_message_id == task.conversation[0]["id"]
+    assert definition.original_message_id
+    with repository.database.connection() as connection:
+        assert connection.execute(
+            "SELECT 1 FROM legacy_task_projection WHERE task_id = ?",
+            (task.task_id,),
+        ).fetchone() is None
 
 
 def test_later_user_message_does_not_rewrite_definition(config) -> None:
@@ -157,24 +160,21 @@ def test_service_boundaries_update_business_lifecycle(config) -> None:
     )
 
 
-def test_legacy_phase_change_does_not_increment_business_lifecycle(config) -> None:
+def test_runtime_does_not_expose_mutable_legacy_phase(config) -> None:
     service = service_for(config, FakeAgent(no_response()))
     task = service.start("修复失败测试")
     before = service.repository.get_lifecycle(task.task_id)
-    task.status = TaskStatus.EDITING
-
-    service.repository.save_legacy_projection(task)
+    runtime = service.get_runtime(task.task_id)
 
     after = service.repository.get_lifecycle(task.task_id)
+    assert "status" not in type(runtime).model_fields
     assert after.status is TaskLifecycleStatus.RUNNING
     assert after.version == before.version
-    assert service.repository.get(task.task_id).status is TaskStatus.EDITING
 
 
 def test_completed_outcome_records_adjudication_with_evidence_ids(config) -> None:
     service = service_for(config, FakeAgent(no_response()), workspace=True)
     task = service.start("验证当前实现，运行 python -m pytest -q")
-    task.test_results = [RepairTestResult("python -m pytest -q", 0, "1 passed")]
     service.compaction_store.save_evidence(
         task.task_id,
         SystemTestEvidence(
@@ -191,14 +191,19 @@ def test_completed_outcome_records_adjudication_with_evidence_ids(config) -> Non
             code_state_hash="code-state-1",
         ),
     )
-
-    completed = service._apply_outcome(
-        task,
-        RepairOutcome(status="completed", summary="当前实现测试通过"),
+    service.agent = FakeAgent(
+        {
+            "structured_response": RepairOutcome(
+                status="completed",
+                summary="当前实现测试通过",
+            ),
+            "messages": [],
+        }
     )
+    completed = service.continue_task(task.task_id, "请根据已有证据裁决")
 
     decision = service.repository.latest_adjudication(task.task_id)
-    assert completed.resolution == "not_reproduced"
+    assert completed.lifecycle is TaskLifecycleStatus.COMPLETED
     assert decision is not None
     assert decision.outcome == "not_reproduced"
     assert decision.evidence_ids == ["test-pass"]

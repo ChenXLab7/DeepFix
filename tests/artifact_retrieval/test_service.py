@@ -105,6 +105,22 @@ def test_search_uses_literal_casefolded_and_with_five_line_window(tmp_path):
     assert collector.calls[0][2] is True
 
 
+def test_artifact_authorization_reads_immutable_definition_not_legacy_task(
+    tmp_path, monkeypatch
+):
+    path = "/.deepfix-artifacts/large_tool_results/call_1"
+    service, _, _ = service_fixture(tmp_path, {path: b"failure detail"})
+    monkeypatch.setattr(
+        service.tasks,
+        "get",
+        lambda *args, **kwargs: pytest.fail("legacy TaskState must not be loaded"),
+    )
+
+    result = service.search("task-a", messages(), "failure", None, 10)
+
+    assert result.matches[0].artifact_id == descriptor(path).artifact_id
+
+
 def test_overlapping_windows_merge_and_artifacts_keep_catalog_order(tmp_path):
     first_path = "/.deepfix-artifacts/large_tool_results/a"
     second_path = "/.deepfix-artifacts/large_tool_results/b"

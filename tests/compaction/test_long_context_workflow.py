@@ -60,6 +60,7 @@ from deepfix.protected_context import (
 )
 from deepfix.research.store import ResearchEvidenceStore
 from deepfix.service import BugfixService
+from deepfix.task_domain.models import TaskLifecycleStatus
 
 
 def _empty_delta() -> CompactionDelta:
@@ -596,9 +597,8 @@ def test_artifact_failure_at_091_pauses_service_with_recovery_metadata(tmp_path)
 
     task = service.start("修复错误")
 
-    assert task.status is TaskStatus.PAUSED
-    assert task.context_recovery is not None
-    assert task.context_recovery.original_messages_preserved is True
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
+    assert "artifact_write_failed" in (task.pause_reason or "")
     assert adapter.calls == 1
 
 
@@ -669,5 +669,5 @@ def test_two_overflows_call_handler_twice_then_pause_service(tmp_path):
     task = service.start("修复超长任务")
 
     assert agent.handler_calls == 2
-    assert task.status is TaskStatus.PAUSED
-    assert task.context_recovery.error_code == "context_overflow_after_single_retry"
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
+    assert "context_overflow_after_single_retry" in (task.pause_reason or "")

@@ -6,6 +6,7 @@ from deepagents.backends import CompositeBackend, LocalShellBackend
 from deepfix.backend import build_backend
 from deepfix.compaction.adapter import DeepAgentsArtifactAdapter
 from deepfix.config import ApprovalMode, load_config
+from deepfix.task_domain.models import TaskDefinition
 from deepfix.workspace import WorkspaceFactory
 
 
@@ -44,6 +45,35 @@ def test_task_workspace_backend_is_confined_and_uses_workspace_root(
     assert denied.exit_code == 126
     assert denied.output.startswith("Denied:")
     assert "VALUE = 1" in backend.read("/value.py").file_data["content"]
+
+
+def test_backend_activates_workspace_from_immutable_task_definition(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    config = load_config(project, ApprovalMode.MANUAL)
+    workspace = WorkspaceFactory(tmp_path / "workspaces").create("task-a", project)
+    definition = TaskDefinition(
+        task_id="task-a",
+        original_message_id="message-a",
+        original_problem="fix value",
+        approval_mode="manual",
+        source_project_root=str(project),
+        workspace_root=str(workspace.root),
+        workspace_baseline_id=workspace.baseline.baseline_id,
+        project_python=sys.executable,
+        confinement_level="guarded_local",
+        created_at="2026-08-31T00:00:00+00:00",
+    )
+    backend = build_backend(config)
+
+    backend.activate_workspace(definition)
+
+    assert backend.default.cwd == workspace.root
 
 
 def test_task_workspace_backend_runs_scoped_pytest_with_project_python(

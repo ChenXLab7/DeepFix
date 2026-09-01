@@ -20,7 +20,6 @@ from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.receipts import ToolExecutionReceiptStore
 from deepfix.investigation.store import InvestigationStore
 from deepfix.investigation.token_budget import TokenBudgetStore
-from deepfix.models import TaskState, TaskStatus
 from deepfix.operations import OperationJournalStore, OperationReconciler
 from deepfix.persistence import TaskRepository
 from deepfix.reporting import build_task_report_view, render_report
@@ -41,6 +40,8 @@ from deepfix.research.tools import (
     build_search_technical_sources_tool,
 )
 from deepfix.service import BugfixService
+from deepfix.task_domain.models import TaskLifecycleStatus
+from deepfix.task_domain.runtime import TaskRuntime
 from deepfix.verification import VerificationPolicyStore
 from deepfix.workspace import WorkspaceFactory
 
@@ -73,13 +74,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_interaction(
     service,
-    task: TaskState,
+    task: TaskRuntime,
     *,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
     research_evidence_store: ResearchEvidenceStore | None = None,
-) -> TaskState:
-    while task.status is TaskStatus.WAITING_APPROVAL and task.pending_actions:
+) -> TaskRuntime:
+    while (
+        task.lifecycle is TaskLifecycleStatus.WAITING_APPROVAL
+        and task.pending_actions
+    ):
         decisions: list[str] = []
         for action in task.pending_actions:
             risk = str(action.get("risk", "L2"))
@@ -112,19 +116,11 @@ def run_interaction(
         task = service.decide(task.task_id, decisions)
 
     output_fn(f"任务 ID: {task.task_id}")
-    if task.status is TaskStatus.CLARIFYING:
-        output_fn(f"需要补充信息: {task.pending_question or '请提供更多信息'}")
-    else:
-        repositories = getattr(service, "repositories", None)
-        if isinstance(repositories, DomainRepositories):
-            output_fn(render_report(build_task_report_view(repositories, task.task_id)))
-        else:
-            external_evidence = (
-                research_evidence_store.list_evidence(task.task_id)
-                if research_evidence_store is not None
-                else []
-            )
-            output_fn(render_report(task, external_evidence))
+    repositories = getattr(service, "repositories", None)
+    if isinstance(repositories, DomainRepositories):
+        output_fn(render_report(build_task_report_view(repositories, task.task_id)))
+    elif task.lifecycle is TaskLifecycleStatus.PAUSED:
+        output_fn(f"任务已暂停: {task.pause_reason or '请提供更多信息'}")
     return task
 
 
@@ -133,14 +129,15 @@ def print_task_list(
     *,
     output_fn: Callable[[str], None] = print,
 ) -> None:
-    tasks = repository.list_recent()
-    if not tasks:
+    definitions = repository.list_recent_definitions()
+    if not definitions:
         output_fn("暂无任务")
         return
-    for task in tasks:
+    for definition in definitions:
+        lifecycle = repository.get_lifecycle(definition.task_id)
         output_fn(
-            f"{task.task_id}\t{task.status.value}\t"
-            f"{task.source_project_root or task.project_root}\t{task.user_problem}"
+            f"{definition.task_id}\t{lifecycle.status.value}\t"
+            f"{definition.source_project_root}\t{definition.original_problem}"
         )
 
 
@@ -170,14 +167,14 @@ def main(
         stored_task = None
     else:
         try:
-            stored_task = repository.get(args.task_id)
+            stored_task = repository.get_definition(args.task_id)
         except KeyError:
             write_output(f"任务不存在: {args.task_id}")
             return 2
         config = load_config(
-            stored_task.source_project_root or stored_task.project_root,
+            stored_task.source_project_root,
             ApprovalMode(stored_task.approval_mode),
-            project_python=stored_task.project_python or None,
+            project_python=stored_task.project_python,
         )
 
     compaction_store = CompactionStore(
@@ -253,7 +250,8 @@ def main(
                 task = service.start(args.problem)
             else:
                 assert stored_task is not None
-                task = _resume_from_cli(service, stored_task, args.message, write_output)
+                runtime = service.get_runtime(stored_task.task_id)
+                task = _resume_from_cli(service, runtime, args.message, write_output)
                 if task is None:
                     return 2
             run_interaction(
@@ -310,21 +308,23 @@ def build_cli_research_extensions(
 
 def _resume_from_cli(
     service: BugfixService,
-    task: TaskState,
+    task: TaskRuntime,
     message: str | None,
     output_fn: Callable[[str], None],
-) -> TaskState | None:
-    if task.status is TaskStatus.CLARIFYING and not message:
-        return task
-    if task.status is TaskStatus.WAITING_APPROVAL and task.pending_actions:
+) -> TaskRuntime | None:
+    if (
+        task.lifecycle is TaskLifecycleStatus.WAITING_APPROVAL
+        and task.pending_actions
+    ):
         return task
     if (
-        task.status is TaskStatus.PAUSED
-        and task.paused_from is TaskStatus.WAITING_APPROVAL
+        task.lifecycle is TaskLifecycleStatus.PAUSED
         and task.pending_actions
         and not message
     ):
         return service.continue_task(task.task_id)
+    if task.lifecycle is TaskLifecycleStatus.PAUSED and not message:
+        return task
     if not message or not message.strip():
         output_fn("恢复该任务需要提供 MESSAGE。")
         return None

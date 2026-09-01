@@ -178,7 +178,7 @@ class DiagnosticArtifactService:
 
     def _require_task(self, task_id: str) -> None:
         try:
-            task = self.tasks.get(task_id)
+            task = self.tasks.get_definition(task_id)
         except Exception as exc:
             raise DiagnosticArtifactSystemError(
                 "diagnostic_artifact_reference_load_failed",

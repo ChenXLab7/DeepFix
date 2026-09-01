@@ -1,6 +1,7 @@
 import json
 from collections import deque
-from dataclasses import asdict, replace
+from dataclasses import replace
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -24,6 +25,7 @@ from deepfix.compaction.models import (
 )
 from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config
+from deepfix.domain_repositories.evidence import EvidenceKind
 from deepfix.domain_repositories.migration import domain_is_switched
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import (
@@ -36,7 +38,6 @@ from deepfix.investigation.models import (
 )
 from deepfix.investigation.receipts import (
     ToolExecutionReceiptStore,
-    receipt_from_result,
 )
 from deepfix.investigation.store import InvestigationStore
 from deepfix.models import (
@@ -54,10 +55,12 @@ from deepfix.operations import (
     OperationStateSnapshot,
 )
 from deepfix.persistence import TaskRepository
-from deepfix.reporting import render_report
+from deepfix.reporting import build_task_report_view, render_report
 from deepfix.research.models import ExternalEvidence, SearchCandidate
 from deepfix.research.store import ResearchEvidenceStore
 from deepfix.service import BugfixService
+from deepfix.task_domain.migration import task_definition_from_legacy
+from deepfix.task_domain.models import TaskLifecycleStatus
 from deepfix.verification import VerificationPolicyBuilder, VerificationPolicyStore
 from deepfix.workspace import WorkspaceFactory
 
@@ -66,13 +69,20 @@ class FakeAgent:
     def __init__(self, *results):
         self.results = deque(results)
         self.invoke_calls = []
+        self.interrupts = ()
 
     def invoke(self, value, config):
         self.invoke_calls.append((value, config))
         result = self.results.popleft()
         if isinstance(result, Exception):
             raise result
+        self.interrupts = result.get("__interrupt__", ())
         return result
+
+    def get_state(self, config):
+        return SimpleNamespace(
+            tasks=[SimpleNamespace(interrupts=self.interrupts)]
+        )
 
 
 def test_service_passes_single_run_graph_step_limit(app_config):
@@ -93,9 +103,9 @@ def test_graph_step_limit_pauses_instead_of_failing(app_config):
 
     task = service.start("prevent internal tool loops")
 
-    assert task.status is TaskStatus.PAUSED
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
     assert "单次 Agent 执行步骤上限" in task.pause_reason
-    assert repository.get(task.task_id).status is TaskStatus.PAUSED
+    assert repository.get_lifecycle(task.task_id).status is TaskLifecycleStatus.PAUSED
 
 
 def make_interrupt(name: str, args: dict[str, object]):
@@ -163,6 +173,7 @@ def passing_outcome(command="pytest -q"):
 def test_recorded_test_result_keeps_tool_and_message_provenance(app_config):
     service, _ = make_service(app_config, FakeAgent())
     task = TaskState.create(app_config.project_root, "修复错误", ApprovalMode.MANUAL)
+    register_transitional_task(service, task)
 
     service._record_tool_results(task, passing_outcome())
     service._record_tool_results(task, passing_outcome())
@@ -175,6 +186,7 @@ def test_recorded_test_result_keeps_tool_and_message_provenance(app_config):
 def test_pre_edit_pytest_failure_does_not_consume_repair_failure_budget(app_config):
     service, _ = make_service(app_config, FakeAgent())
     task = TaskState.create(app_config.project_root, "复现错误", ApprovalMode.MANUAL)
+    register_transitional_task(service, task)
     failed = passing_outcome()
     failed["messages"][-1].artifact = {"exit_code": 1}
     failed["messages"][-1].content = "1 failed"
@@ -189,6 +201,7 @@ def test_pause_syncs_successful_change_as_pending_verification(app_config):
     service, _ = make_service(app_config, FakeAgent())
     task = TaskState.create(app_config.project_root, "修复查找错误", ApprovalMode.MANUAL)
     task.transition_to(TaskStatus.INVESTIGATING)
+    register_transitional_task(service, task)
     service.compaction_store.save_evidence(
         task.task_id,
         FileChangeEvidence(
@@ -248,7 +261,7 @@ def test_service_creates_workspace_and_policy_before_agent_invocation(app_config
     fake_agent = FakeAgent(outcome())
     workspace_factory = WorkspaceFactory(app_config.database_path.parent / "workspaces")
     policy_store = VerificationPolicyStore(app_config.database_path)
-    service, _ = make_service(
+    service, repository = make_service(
         app_config,
         fake_agent,
         workspace_factory=workspace_factory,
@@ -256,16 +269,16 @@ def test_service_creates_workspace_and_policy_before_agent_invocation(app_config
     )
 
     task = service.start("运行 python -m pytest -q 并修复失败")
+    definition = repository.get_definition(task.task_id)
 
-    assert task.source_project_root == str(app_config.project_root)
-    assert task.workspace_root != str(app_config.project_root)
-    assert task.project_root == task.workspace_root
-    assert task.workspace_baseline_id
-    assert task.verification_policy_id
-    assert task.verification_policy_version == 1
+    assert definition.source_project_root == str(app_config.project_root)
+    assert definition.workspace_root != str(app_config.project_root)
+    assert definition.workspace_baseline_id
     _, graph_config = fake_agent.invoke_calls[0]
-    assert graph_config["configurable"]["workspace_root"] == task.workspace_root
-    assert policy_store.load(task.task_id).policy_id == task.verification_policy_id
+    assert graph_config["configurable"]["workspace_root"] == definition.workspace_root
+    policy = policy_store.load(task.task_id)
+    assert policy is not None
+    assert policy.version == 1
 
 
 def test_repository_suite_failure_blocks_fixed_at_service_boundary(app_config):
@@ -333,13 +346,13 @@ def test_repository_suite_failure_blocks_fixed_at_service_boundary(app_config):
         ),
     ):
         compaction.save_evidence(task.task_id, evidence)
-    service, repository = make_service(
+    service, _ = make_service(
         app_config,
         FakeAgent(passing_outcome()),
         verification_policy_store=policy_store,
     )
     service.compaction_store = compaction
-    repository.save(task)
+    register_transitional_task(service, task)
 
     result = service._invoke(task, {"messages": []})
 
@@ -352,7 +365,7 @@ def test_unresolved_operation_pauses_before_agent_invocation(app_config):
     journal = OperationJournalStore(app_config.database_path)
     receipts = ToolExecutionReceiptStore(app_config.artifacts_path / "investigation_receipts")
     reconciler = OperationReconciler(journal, receipts)
-    service, repository = make_service(
+    service, _ = make_service(
         app_config,
         fake_agent,
         operation_reconciler=reconciler,
@@ -364,7 +377,7 @@ def test_unresolved_operation_pauses_before_agent_invocation(app_config):
         workspace_baseline_id="baseline-1",
     )
     task.transition_to(TaskStatus.INVESTIGATING)
-    repository.save(task)
+    register_transitional_task(service, task)
     target = app_config.project_root / "value.py"
     target.write_text("third-party\n", encoding="utf-8")
     entry = NewOperationEntry(
@@ -450,20 +463,16 @@ def test_start_passes_problem_and_stable_thread_id(app_config):
     service, _ = make_service(app_config, fake_agent)
 
     task = service.start("除法结果错误")
+    definition = service.repository.get_definition(task.task_id)
 
     value, config = fake_agent.invoke_calls[0]
     graph_message = value["messages"][0]
     assert isinstance(graph_message, HumanMessage)
     assert graph_message.content == "除法结果错误"
-    assert graph_message.id == task.conversation[0]["id"]
-    assert task.conversation[0] == {
-        "id": graph_message.id,
-        "role": "user",
-        "content": "除法结果错误",
-    }
+    assert graph_message.id == definition.original_message_id
     assert config["configurable"]["thread_id"] == task.task_id
-    assert task.agent_invocations == 1
-    assert task.project_python == str(app_config.project_python)
+    assert len(fake_agent.invoke_calls) == 1
+    assert definition.project_python == str(app_config.project_python)
 
 
 def test_service_syncs_only_current_task_research_summary_on_every_save(app_config):
@@ -485,15 +494,29 @@ def test_service_syncs_only_current_task_research_summary_on_every_save(app_conf
             [f"provider-{index}-" + "x" * 400],
         )
 
-    continued = service.continue_task(task.task_id, "继续")
-    persisted = service._load_current_task(task.task_id)
+    service.continue_task(task.task_id, "继续")
+    evidence_ids = [
+        item.evidence_id
+        for item in service.repositories.evidence.list_for_task(task.task_id)
+        if item.kind is EvidenceKind.EXTERNAL_RESEARCH
+    ]
+    query_count, provider_errors = service.repositories.evidence.research_summary(
+        task.task_id
+    )
+    assert evidence_ids == [current.evidence_id]
+    assert query_count == 12
+    assert len(provider_errors) == 12
+    assert all(len(error) <= 500 for error in provider_errors)
+    assert all("OTHER TASK SECRET" not in error for error in provider_errors)
 
-    assert continued.external_evidence_ids == [current.evidence_id]
-    assert persisted.external_evidence_ids == [current.evidence_id]
-    assert continued.research_query_count == 12
-    assert len(continued.research_provider_errors) == 10
-    assert all(len(error) <= 300 for error in continued.research_provider_errors)
-    assert all("OTHER TASK SECRET" not in error for error in continued.research_provider_errors)
+
+def register_transitional_task(service: BugfixService, task: TaskState) -> None:
+    service.repository.create_definition(task_definition_from_legacy(task))
+    service.repository.transition_lifecycle(
+        task.task_id,
+        TaskLifecycleStatus.RUNNING,
+        expected_version=1,
+    )
 
 
 def test_external_excerpt_never_enters_local_task_evidence(app_config):
@@ -511,10 +534,12 @@ def test_external_excerpt_never_enters_local_task_evidence(app_config):
         excerpt="EXTERNAL EXCERPT MUST STAY OUT",
     )
 
-    continued = service.continue_task(task.task_id, "继续")
+    service.continue_task(task.task_id, "继续")
 
     assert all(
-        "EXTERNAL EXCERPT MUST STAY OUT" not in item.observation for item in continued.evidence
+        "EXTERNAL EXCERPT MUST STAY OUT" not in str(item.payload)
+        for item in service.repositories.evidence.list_for_task(task.task_id)
+        if item.kind is not EvidenceKind.EXTERNAL_RESEARCH
     )
 
 
@@ -535,9 +560,10 @@ def test_provider_failure_is_synchronized_without_failing_task(app_config):
     )
 
     continued = service.continue_task(task.task_id, "继续")
+    _, provider_errors = service.repositories.evidence.research_summary(task.task_id)
 
-    assert continued.status is TaskStatus.CLARIFYING
-    assert continued.research_provider_errors == ["github: rate limited"]
+    assert continued.lifecycle is TaskLifecycleStatus.PAUSED
+    assert provider_errors == ["github: rate limited"]
 
 
 def test_interrupt_is_persisted_as_waiting_approval(app_config):
@@ -546,10 +572,9 @@ def test_interrupt_is_persisted_as_waiting_approval(app_config):
 
     task = service.start("测试失败")
 
-    assert task.status is TaskStatus.WAITING_APPROVAL
-    assert task.shell_calls == 1
+    assert task.lifecycle is TaskLifecycleStatus.WAITING_APPROVAL
     assert service.pending_actions(task.task_id)[0]["name"] == "execute"
-    assert repository.get(task.task_id).pending_actions == task.pending_actions
+    assert repository.get_lifecycle(task.task_id).status is TaskLifecycleStatus.WAITING_APPROVAL
 
 
 def test_user_can_pause_and_resume_same_pending_approval(app_config):
@@ -561,11 +586,14 @@ def test_user_can_pause_and_resume_same_pending_approval(app_config):
     resumed = service.continue_task(task.task_id)
 
     assert paused.task_id == task.task_id
-    assert paused.status is TaskStatus.PAUSED
+    assert paused.lifecycle is TaskLifecycleStatus.PAUSED
     assert paused.pending_actions == task.pending_actions
-    assert resumed.status is TaskStatus.WAITING_APPROVAL
+    assert resumed.lifecycle is TaskLifecycleStatus.WAITING_APPROVAL
     assert resumed.pending_actions == task.pending_actions
-    assert repository.get(task.task_id).status is TaskStatus.WAITING_APPROVAL
+    assert (
+        repository.get_lifecycle(task.task_id).status
+        is TaskLifecycleStatus.WAITING_APPROVAL
+    )
 
 
 def test_l3_operation_is_rejected_even_when_user_requests_approval(app_config):
@@ -576,12 +604,14 @@ def test_l3_operation_is_rejected_even_when_user_requests_approval(app_config):
     service, _ = make_service(app_config, fake_agent)
     task = service.start("清理项目")
 
-    resumed = service.decide(task.task_id, ["approve"])
+    service.decide(task.task_id, ["approve"])
 
     resume_value, _ = fake_agent.invoke_calls[-1]
     assert isinstance(resume_value, Command)
     assert resume_value.resume["decisions"][0]["type"] == "reject"
-    assert resumed.approvals[-1].decision == "reject"
+    assert service.repositories.execution.list_approvals(task.task_id)[-1].decision == (
+        "reject"
+    )
 
 
 def test_guarded_l1_operation_is_automatically_approved(app_config):
@@ -590,13 +620,18 @@ def test_guarded_l1_operation_is_automatically_approved(app_config):
         make_interrupt("execute", {"command": "pytest -q"}),
         passing_outcome(),
     )
-    service, _ = make_service(guarded, fake_agent)
+    service, _ = make_service(
+        guarded,
+        fake_agent,
+        workspace_factory=WorkspaceFactory(app_config.database_path.parent / "workspaces"),
+        verification_policy_store=VerificationPolicyStore(app_config.database_path),
+    )
 
-    task = service.start("测试失败")
+    task = service.start("运行 pytest -q 验证当前问题")
 
     resume_value, _ = fake_agent.invoke_calls[1]
     assert resume_value.resume["decisions"] == [{"type": "approve"}]
-    assert task.status is TaskStatus.COMPLETED
+    assert task.lifecycle is TaskLifecycleStatus.COMPLETED
 
 
 def test_agent_exception_is_saved_as_failed(app_config):
@@ -605,9 +640,9 @@ def test_agent_exception_is_saved_as_failed(app_config):
 
     task = service.start("测试失败")
 
-    assert task.status is TaskStatus.FAILED
-    assert "model unavailable" in task.final_summary
-    assert repository.get(task.task_id).status is TaskStatus.FAILED
+    assert task.lifecycle is TaskLifecycleStatus.FAILED
+    assert "model unavailable" in (task.pause_reason or "")
+    assert repository.get_lifecycle(task.task_id).status is TaskLifecycleStatus.FAILED
 
 
 def test_agent_failure_redacts_both_model_role_keys(tmp_path, monkeypatch):
@@ -625,12 +660,12 @@ def test_agent_failure_redacts_both_model_role_keys(tmp_path, monkeypatch):
     )
 
     task = service.start("修复错误")
-    persisted = repository.get(task.task_id)
+    persisted = repository.get_lifecycle(task.task_id)
 
-    assert task.status is TaskStatus.FAILED
-    assert "main-secret-value" not in persisted.final_summary
-    assert "compact-secret-value" not in persisted.final_summary
-    assert persisted.final_summary == "Agent 执行失败: auth failed [REDACTED] [REDACTED]"
+    assert task.lifecycle is TaskLifecycleStatus.FAILED
+    assert "main-secret-value" not in (persisted.reason or "")
+    assert "compact-secret-value" not in (persisted.reason or "")
+    assert persisted.reason == "Agent 执行失败: auth failed [REDACTED] [REDACTED]"
 
 
 def test_shell_budget_pauses_before_command_is_resumed(app_config):
@@ -640,7 +675,7 @@ def test_shell_budget_pauses_before_command_is_resumed(app_config):
 
     task = service.start("测试失败")
 
-    assert task.status is TaskStatus.PAUSED
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
     assert len(fake_agent.invoke_calls) == 1
     assert task.pending_actions
 
@@ -652,7 +687,7 @@ def test_agent_invocation_budget_pauses_before_calling_agent(app_config):
 
     task = service.start("测试失败")
 
-    assert task.status is TaskStatus.PAUSED
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
     assert fake_agent.invoke_calls == []
 
 
@@ -669,7 +704,7 @@ def test_changed_file_budget_pauses_before_approved_edit_is_resumed(app_config):
 
     paused = service.decide(task.task_id, ["approve"])
 
-    assert paused.status is TaskStatus.PAUSED
+    assert paused.lifecycle is TaskLifecycleStatus.PAUSED
     assert len(fake_agent.invoke_calls) == 1
     assert paused.pending_actions
 
@@ -698,9 +733,9 @@ def test_changed_file_budget_counts_current_evidence_after_domain_switch(app_con
 
     paused = service.decide(task.task_id, ["approve"])
 
-    assert paused.status is TaskStatus.PAUSED
+    assert paused.lifecycle is TaskLifecycleStatus.PAUSED
     assert len(fake_agent.invoke_calls) == 1
-    assert "最大修改文件数" in paused.final_summary
+    assert "最大修改文件数" in (paused.pause_reason or "")
 
 
 def test_consecutive_test_failure_budget_pauses_task(app_config):
@@ -732,9 +767,8 @@ def test_consecutive_test_failure_budget_pauses_task(app_config):
     )
     task = service.decide(awaiting_approval.task_id, ["approve"])
 
-    assert task.status is TaskStatus.PAUSED
-    assert task.consecutive_test_failures == 1
-    assert "连续测试失败" in task.final_summary
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
+    assert "连续测试失败" in (task.pause_reason or "")
 
 
 def test_new_task_switches_empty_legacy_domains_after_validated_migration(app_config):
@@ -780,14 +814,17 @@ def test_existing_task_is_migrated_and_hydrated_before_service_decisions(app_con
             (task.task_id, legacy.evidence_id, legacy.model_dump_json()),
         )
 
-    paused = service.pause_task(task.task_id)
+    service.pause_task(task.task_id)
 
     assert domain_is_switched(
         service.repositories.database,
         "evidence",
         task.task_id,
     )
-    assert paused.changed_files == ["/src/calc.py"]
+    assert service.repositories.evidence.get(
+        task.task_id,
+        legacy.evidence_id,
+    ).payload["path"] == "/src/calc.py"
     assert service.repositories.evidence.get(
         task.task_id,
         legacy.evidence_id,
@@ -810,11 +847,11 @@ def test_rejected_action_records_approval_and_resumes_agent(app_config):
     service, _ = make_service(app_config, fake_agent)
     task = service.start("计算错误")
 
-    result = service.decide(task.task_id, ["reject"])
+    service.decide(task.task_id, ["reject"])
 
-    assert result.approvals[-1].operation == "write_file"
-    assert result.approvals[-1].decision == "reject"
-    assert service._load_current_task(task.task_id).approvals[-1].decision == "reject"
+    approval = service.repositories.execution.list_approvals(task.task_id)[-1]
+    assert approval.operation == "write_file"
+    assert approval.decision == "reject"
 
 
 def test_continue_clarifying_task_appends_message_without_new_task(app_config):
@@ -829,23 +866,36 @@ def test_continue_clarifying_task_appends_message_without_new_task(app_config):
     graph_message = value["messages"][0]
     assert isinstance(graph_message, HumanMessage)
     assert graph_message.content == "Python 3.12"
-    assert graph_message.id == continued.conversation[-1]["id"]
+    assert graph_message.id
     assert config["configurable"]["thread_id"] == task.task_id
-    assert continued.conversation[-1]["content"] == "Python 3.12"
+    with service.repository.database.connection() as connection:
+        assert connection.execute(
+            "SELECT 1 FROM legacy_task_projection WHERE task_id = ?",
+            (task.task_id,),
+        ).fetchone() is None
 
 
 def test_completed_outcome_requires_and_records_passing_test(app_config):
     fake_agent = FakeAgent(passing_outcome())
-    service, _ = make_service(app_config, fake_agent)
+    service, _ = make_service(
+        app_config,
+        fake_agent,
+        workspace_factory=WorkspaceFactory(app_config.database_path.parent / "workspaces"),
+        verification_policy_store=VerificationPolicyStore(app_config.database_path),
+    )
 
-    task = service.start("测试失败")
+    task = service.start("运行 pytest -q 验证当前问题")
+    tests = service.repositories.evidence.verification_view(task.task_id).test_evidence
 
-    assert task.status is TaskStatus.COMPLETED
-    assert task.test_results[0].command == "pytest -q"
-    assert task.test_results[0].exit_code == 0
-    assert task.resolution == "not_reproduced"
-    assert task.final_summary == (
-        "未复现用户描述的问题：当前环境中所运行的 pytest 测试通过，且未修改代码。"
+    assert task.lifecycle is TaskLifecycleStatus.COMPLETED
+    assert tests[0].command == "pytest -q"
+    assert tests[0].exit_code == 0
+    assert task.latest_decision_id is not None
+    decision = service.repository.latest_adjudication(task.task_id)
+    assert decision is not None
+    assert decision.outcome == "not_reproduced"
+    assert "未复现用户描述的问题" in render_report(
+        build_task_report_view(service.repositories, task.task_id)
     )
 
 
@@ -885,16 +935,15 @@ def test_offline_report_path_keeps_todo_navigation_in_graph_state_only(app_confi
     service, _ = make_service(app_config, FakeAgent(graph_result))
 
     task = service.start("测试失败")
-    deterministic_evidence = EvidenceCollector(
-        service.compaction_store,
-        service.research_evidence_store,
-    ).collect(task.task_id, graph_result["messages"], task)
-    task_payload = task.to_dict()
+    deterministic_evidence = service.repositories.evidence.verification_view(
+        task.task_id
+    )
+    task_payload = task.model_dump(mode="json")
     boundary_texts = [
         json.dumps(task_payload, ensure_ascii=False, default=str),
         deterministic_evidence.model_dump_json(),
-        json.dumps(asdict(task.context_metrics), ensure_ascii=False),
-        render_report(task),
+        service.repositories.history.context_telemetry(task.task_id).model_dump_json(),
+        render_report(build_task_report_view(service.repositories, task.task_id)),
     ]
 
     assert graph_result["todos"] == todos
@@ -918,6 +967,7 @@ def test_not_reproduced_is_rejected_when_current_task_has_failed_test(app_config
             RepairTestResult("pytest -q", 0, "1 passed"),
         ]
     )
+    register_transitional_task(service, task)
 
     result = service._apply_outcome(
         task,
@@ -949,6 +999,7 @@ def test_not_reproduced_is_rejected_after_successful_file_change(app_config):
             source_message_id="edit-message-1",
         ),
     )
+    register_transitional_task(service, task)
 
     result = service._apply_outcome(
         task,
@@ -980,6 +1031,7 @@ def test_fixed_is_rejected_without_reproduced_failure(app_config):
             source_message_id="edit-message-1",
         ),
     )
+    register_transitional_task(service, task)
 
     result = service._apply_outcome(
         task,
@@ -1001,8 +1053,8 @@ def test_completed_outcome_without_passing_test_is_paused(app_config):
 
     task = service.start("测试失败")
 
-    assert task.status is TaskStatus.PAUSED
-    assert "通过的测试证据" in task.final_summary
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
+    assert "通过的测试证据" in (task.pause_reason or "")
 
 
 def test_repeated_graph_message_history_does_not_duplicate_test_result(app_config):
@@ -1016,7 +1068,11 @@ def test_repeated_graph_message_history_does_not_duplicate_test_result(app_confi
 
     continued = service.continue_task(task.task_id, "Python 3.12")
 
-    assert len(continued.test_results) == 1
+    assert len(
+        service.repositories.evidence.verification_view(
+            continued.task_id
+        ).test_evidence
+    ) == 1
 
 
 def test_tool_message_wording_cannot_increment_compaction_metric(
@@ -1049,9 +1105,8 @@ def test_tool_message_wording_cannot_increment_compaction_metric(
     )
     task = service.start("超长测试失败")
 
-    continued = service.continue_task(task.task_id, "继续")
+    service.continue_task(task.task_id, "继续")
 
-    assert continued.context_metrics.active_compaction_count == 0
     assert service.repositories.history.context_telemetry(task.task_id).active_compaction_count == 0
 
 
@@ -1083,7 +1138,6 @@ def test_nothing_to_compact_does_not_increment_success_metric(
 
     task = service.start("短任务")
 
-    assert task.context_metrics.active_compaction_count == 0
     assert service.repositories.history.context_telemetry(task.task_id).active_compaction_count == 0
 
 
@@ -1095,9 +1149,12 @@ def test_uncoordinated_context_overflow_is_an_ordinary_agent_failure(app_config)
 
     task = service.start("超长任务")
 
-    assert task.status is TaskStatus.FAILED
-    assert task.context_metrics.context_overflow_count == 0
-    assert repository.get(task.task_id).status is TaskStatus.FAILED
+    assert task.lifecycle is TaskLifecycleStatus.FAILED
+    assert (
+        service.repositories.history.context_telemetry(task.task_id).context_overflow_count
+        == 0
+    )
+    assert repository.get_lifecycle(task.task_id).status is TaskLifecycleStatus.FAILED
 
 
 class RecoveryAgent:
@@ -1169,7 +1226,7 @@ class DetailedInvestigationErrorAgent:
 
 def test_investigation_error_pauses_and_persists_metadata(app_config):
     coordinator = service_coordinator(app_config)
-    service, repository = make_service(
+    service, _ = make_service(
         app_config,
         InvestigationErrorAgent(),
         investigation=coordinator,
@@ -1177,23 +1234,20 @@ def test_investigation_error_pauses_and_persists_metadata(app_config):
 
     task = service.start("repository scan loops")
 
-    assert task.status is TaskStatus.PAUSED
-    assert task.investigation_recovery.error_code == "investigation_stagnated"
-    assert repository.get(task.task_id).investigation_recovery == task.investigation_recovery
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
+    assert "investigation_stagnated" in (task.pause_reason or "")
 
 
 def test_investigation_recovery_redacts_detail_and_writes_debug_event(app_config):
-    service, repository = make_service(
+    service, _ = make_service(
         app_config,
         DetailedInvestigationErrorAgent(),
     )
 
     task = service.start("receipt persistence fails")
-    persisted = repository.get(task.task_id)
     log_path = app_config.artifacts_path / "debug" / "llm_calls.jsonl"
     records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
 
-    assert persisted.investigation_recovery.error_detail == ("disk rejected [REDACTED]")
     assert all("secret" not in line for line in log_path.read_text(encoding="utf-8").splitlines())
     assert records[-1] == {
         "event": "investigation_recovery",
@@ -1211,8 +1265,8 @@ def test_foreign_investigation_recovery_task_id_fails_closed(app_config):
 
     task = service.start("bug")
 
-    assert task.status is TaskStatus.FAILED
-    assert "其他任务" in task.final_summary
+    assert task.lifecycle is TaskLifecycleStatus.FAILED
+    assert "其他任务" in (task.pause_reason or "")
 
 
 def test_diagnostic_artifact_system_error_pauses_only_at_service_boundary(
@@ -1225,9 +1279,9 @@ def test_diagnostic_artifact_system_error_pauses_only_at_service_boundary(
 
     task = service.start("recover archived traceback")
 
-    assert task.status is TaskStatus.PAUSED
-    assert task.investigation_recovery.error_code == ("diagnostic_artifact_backend_read_failed")
-    assert repository.get(task.task_id).status is TaskStatus.PAUSED
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
+    assert "diagnostic_artifact_backend_read_failed" in (task.pause_reason or "")
+    assert repository.get_lifecycle(task.task_id).status is TaskLifecycleStatus.PAUSED
 
 
 def test_foreign_diagnostic_artifact_recovery_fails_closed(app_config):
@@ -1238,10 +1292,9 @@ def test_foreign_diagnostic_artifact_recovery_fails_closed(app_config):
 
     task = service.start("recover archived traceback")
 
-    assert task.status is TaskStatus.FAILED
-    assert task.investigation_recovery is None
-    assert "其他任务" in task.final_summary
-    assert repository.get(task.task_id).status is TaskStatus.FAILED
+    assert task.lifecycle is TaskLifecycleStatus.FAILED
+    assert "其他任务" in (task.pause_reason or "")
+    assert repository.get_lifecycle(task.task_id).status is TaskLifecycleStatus.FAILED
 
 
 def test_user_information_records_lifecycle_and_clears_recovery(app_config):
@@ -1266,10 +1319,9 @@ def test_user_information_records_lifecycle_and_clears_recovery(app_config):
     coordinator.ensure_started(task.task_id)
     service.agent = FakeAgent(outcome(question="continue"))
 
-    resumed = service.continue_task(task.task_id, "Python 3.12")
+    service.continue_task(task.task_id, "Python 3.12")
     event_types = [event.event_type for event in coordinator.store.list_events(task.task_id)]
 
-    assert resumed.investigation_recovery is None
     assert "user_information_received" in event_types
 
 
@@ -1278,13 +1330,16 @@ def test_context_recovery_error_pauses_and_persists_metadata(
     app_config,
     error_type,
 ):
-    service, repository = make_service(app_config, RecoveryAgent(error_type))
+    service, _ = make_service(app_config, RecoveryAgent(error_type))
 
     task = service.start("long bug")
 
-    assert task.status is TaskStatus.PAUSED
-    assert task.context_recovery.error_code == "protected_context_read_failed"
-    assert repository.get(task.task_id).context_recovery == task.context_recovery
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
+    assert "protected_context_read_failed" in (task.pause_reason or "")
+    log_path = app_config.artifacts_path / "debug" / "llm_calls.jsonl"
+    records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["event"] == "context_recovery"
+    assert records[-1]["error_code"] == "protected_context_read_failed"
 
 
 def test_preparation_error_leak_remains_an_ordinary_failure(app_config):
@@ -1304,7 +1359,7 @@ def test_preparation_error_leak_remains_an_ordinary_failure(app_config):
         FakeAgent(ArtifactPersistenceError(failure)),
     )
 
-    assert service.start("bug").status is TaskStatus.FAILED
+    assert service.start("bug").lifecycle is TaskLifecycleStatus.FAILED
 
 
 def test_recovery_metadata_clears_only_after_successful_resumed_invoke(app_config):
@@ -1313,77 +1368,23 @@ def test_recovery_metadata_clears_only_after_successful_resumed_invoke(app_confi
         RecoveryAgent(ContextRecoveryRequired),
     )
     paused = service.start("long bug")
-    assert paused.context_recovery is not None
+    assert "protected_context_read_failed" in (paused.pause_reason or "")
     service.agent = FakeAgent(outcome(question="continue"))
 
     resumed = service.continue_task(paused.task_id, "more detail")
 
-    assert resumed.context_recovery is None
+    assert resumed.pause_reason == "continue"
 
 
 def test_service_records_only_current_task_artifacts(app_config):
-    service, _ = make_service(app_config, FakeAgent())
-    task = TaskState.create(app_config.project_root, "测试失败", ApprovalMode.MANUAL)
-    current_history = app_config.artifacts_path / "conversation_history" / f"{task.task_id}.md"
-    foreign_history = app_config.artifacts_path / "conversation_history" / "other-task.md"
-    current_research = app_config.artifacts_path / "research" / task.task_id / "evidence.md"
-    foreign_research = app_config.artifacts_path / "research" / "other-task" / "evidence.md"
-    for path in (
-        current_history,
-        foreign_history,
-        current_research,
-        foreign_research,
-    ):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("artifact", encoding="utf-8")
-    receipt_store = ToolExecutionReceiptStore(app_config.artifacts_path / "investigation_receipts")
-    current_receipt = receipt_from_result(
-        task.task_id,
-        {
-            "name": "read_file",
-            "id": "current-read",
-            "args": {"file_path": "src/current.py"},
-        },
-        ToolMessage(
-            id="current-result",
-            content="current",
-            name="read_file",
-            tool_call_id="current-read",
-        ),
-    )
-    foreign_receipt = receipt_from_result(
-        "other-task",
-        {
-            "name": "read_file",
-            "id": "foreign-read",
-            "args": {"file_path": "src/foreign.py"},
-        },
-        ToolMessage(
-            id="foreign-result",
-            content="foreign",
-            name="read_file",
-            tool_call_id="foreign-read",
-        ),
-    )
-    receipt_store.save(current_receipt)
-    receipt_store.save(foreign_receipt)
-    current_receipt_path = (
-        next(
-            path
-            for path in (app_config.artifacts_path / "investigation_receipts").rglob("*.json")
-            if task.task_id in path.read_text(encoding="utf-8")
-        )
-        .relative_to(app_config.artifacts_path)
-        .as_posix()
-    )
+    service, _ = make_service(app_config, FakeAgent(outcome()))
+    task = service.start("测试失败")
+    foreign = app_config.artifacts_path / "conversation_history" / "other-task.md"
+    foreign.parent.mkdir(parents=True, exist_ok=True)
+    foreign.write_text("foreign artifact", encoding="utf-8")
 
-    service._save(task)
-
-    assert task.offloaded_artifacts == [
-        f"conversation_history/{task.task_id}.md",
-        current_receipt_path,
-        f"research/{task.task_id}/evidence.md",
-    ]
+    assert "offloaded_artifacts" not in type(task).model_fields
+    assert service.repositories.history.list_for_task(task.task_id) == []
 
 
 def test_service_restores_switched_fields_from_domain_authorities(app_config):

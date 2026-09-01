@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import Field
 
 from deepfix.compaction.models import StrictModel, SystemTestEvidence
-from deepfix.models import TaskState
 from deepfix.workspace import TaskWorkspace
 
 if TYPE_CHECKING:
@@ -63,14 +62,17 @@ class OracleEvaluation(StrictModel):
 class VerificationPolicyBuilder:
     def build(
         self,
-        task: TaskState,
+        task,
         workspace: TaskWorkspace,
     ) -> VerificationPolicy:
         if workspace.task_id != task.task_id:
             raise ValueError("VerificationPolicy task/workspace 不匹配")
         required = [
             _oracle(command, "user_specified", "required")
-            for command in extract_user_pytest_commands(task.user_problem)
+            for command in extract_user_pytest_commands(
+                getattr(task, "original_problem", "")
+                or getattr(task, "user_problem", "")
+            )
         ]
         supplemental: list[VerificationOracle] = []
         if _has_repository_tests(workspace.baseline.managed_file_hashes):

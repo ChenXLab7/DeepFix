@@ -17,9 +17,9 @@ from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.store import InvestigationStore
-from deepfix.models import Evidence, RepairOutcome, TaskStatus
+from deepfix.models import Evidence, RepairOutcome
 from deepfix.persistence import TaskRepository
-from deepfix.reporting import render_report
+from deepfix.reporting import build_task_report_view, render_report
 from deepfix.research.dependency import DependencyInspector
 from deepfix.research.fetcher import SafeEvidenceFetcher
 from deepfix.research.providers import (
@@ -36,6 +36,7 @@ from deepfix.research.tools import (
     build_search_technical_sources_tool,
 )
 from deepfix.service import BugfixService
+from deepfix.task_domain.models import TaskLifecycleStatus
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PUBLIC_ADDRESS = "93.184.216.34"
@@ -150,7 +151,7 @@ def test_offline_research_evidence_workflow_is_task_local_and_cannot_bypass_test
         investigation,
     )
     task = service.start("验证 pydantic 版本相关问题")
-    assert task.status is TaskStatus.CLARIFYING
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
 
     requests: list[str] = []
 
@@ -315,13 +316,17 @@ def test_offline_research_evidence_workflow_is_task_local_and_cannot_bypass_test
     )
 
     continued = service.continue_task(task.task_id, "复现条件已经补充")
-    assert continued.status is TaskStatus.PAUSED
-    assert continued.final_summary == "缺少通过的测试证据，不能标记为完成"
-    assert set(continued.external_evidence_ids) == set(fetched_ids.values())
-    assert continued.research_query_count == 1
-    assert continued.research_provider_errors == ["github_discussions: GITHUB_TOKEN 未配置，已跳过"]
+    assert continued.lifecycle is TaskLifecycleStatus.PAUSED
+    assert continued.pause_reason == "缺少通过的测试证据，不能标记为完成"
+    assert {item.evidence_id for item in research_store.list_evidence(task.task_id)} == set(
+        fetched_ids.values()
+    )
+    assert research_store.query_summary(task.task_id) == (
+        1,
+        ["github_discussions: GITHUB_TOKEN 未配置，已跳过"],
+    )
 
-    report = render_report(continued, research_store.list_evidence(task.task_id))
+    report = render_report(build_task_report_view(service.repositories, task.task_id))
     assert "已通过真实测试关联" in report
     assert "外部结论已被本地证据推翻" in report
     assert "仅为外部线索" in report

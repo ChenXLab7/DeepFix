@@ -14,7 +14,7 @@ from deepagents.backends.protocol import ExecuteResponse
 
 from deepfix.config import AppConfig
 from deepfix.investigation.classification import is_pytest_verification
-from deepfix.models import TaskState
+from deepfix.task_domain.models import TaskDefinition
 from deepfix.workspace import TaskWorkspace, WorkspaceBaseline
 
 _SAFE_ENVIRONMENT_VARIABLES = (
@@ -345,7 +345,7 @@ class DeepFixBackend(CompositeBackend):
             artifacts_root="/.deepfix-artifacts",
         )
 
-    def activate_workspace(self, task: TaskState | TaskWorkspace) -> None:
+    def activate_workspace(self, task: TaskDefinition | TaskWorkspace) -> None:
         workspace = task if isinstance(task, TaskWorkspace) else _task_workspace(task)
         if self.active_workspace is not None and (
             self.active_workspace.task_id != workspace.task_id
@@ -355,8 +355,8 @@ class DeepFixBackend(CompositeBackend):
         self.default = _build_project_backend(self.config, workspace)
 
 
-def _task_workspace(task: TaskState) -> TaskWorkspace:
-    root = Path(task.workspace_root or task.project_root).resolve(strict=True)
+def _task_workspace(task: TaskDefinition) -> TaskWorkspace:
+    root = Path(task.workspace_root).resolve(strict=True)
     baseline_path = root / ".deepfix-baseline.json"
     baseline = WorkspaceBaseline.model_validate_json(
         baseline_path.read_text(encoding="utf-8")

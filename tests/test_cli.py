@@ -7,6 +7,8 @@ from deepfix.config import ApprovalMode
 from deepfix.models import TaskState, TaskStatus
 from deepfix.persistence import TaskRepository
 from deepfix.research.store import ResearchEvidenceStore
+from deepfix.task_domain.models import TaskLifecycleStatus
+from deepfix.task_domain.runtime import TaskRuntime
 
 
 class CliServiceStub:
@@ -16,30 +18,37 @@ class CliServiceStub:
 
     def decide(self, task_id, decisions):
         self.decisions.append((task_id, decisions))
-        task = self.task
-        task.status = TaskStatus.PAUSED
-        return task
+        self.task = self.task.model_copy(
+            update={"lifecycle": TaskLifecycleStatus.PAUSED}
+        )
+        return self.task
 
     def pause_task(self, task_id, reason):
         self.pause_calls.append((task_id, reason))
-        self.task.status = TaskStatus.PAUSED
+        self.task = self.task.model_copy(
+            update={
+                "lifecycle": TaskLifecycleStatus.PAUSED,
+                "pause_reason": reason,
+            }
+        )
         return self.task
 
 
-def waiting_task(tmp_path, policy_action: str, risk: str = "L1") -> TaskState:
-    task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
-    task.status = TaskStatus.WAITING_APPROVAL
-    task.pending_actions = [
-        {
-            "name": "execute",
-            "args": {"command": "pytest -q"},
-            "description": "运行测试",
-            "risk": risk,
-            "policy_action": policy_action,
-            "reason": "命令需要审批",
-        }
-    ]
-    return task
+def waiting_task(tmp_path, policy_action: str, risk: str = "L1") -> TaskRuntime:
+    return TaskRuntime(
+        task_id=f"task-{tmp_path.name}",
+        lifecycle=TaskLifecycleStatus.WAITING_APPROVAL,
+        pending_actions=[
+            {
+                "name": "execute",
+                "args": {"command": "pytest -q"},
+                "description": "运行测试",
+                "risk": risk,
+                "policy_action": policy_action,
+                "reason": "命令需要审批",
+            }
+        ],
+    )
 
 
 def test_new_command_parses_project_problem_and_mode():
@@ -101,7 +110,7 @@ def test_manual_action_prompts_and_approves(tmp_path):
 
     assert service.decisions == [(service.task.task_id, ["approve"])]
     assert any("[L1] execute: pytest -q" in line for line in output)
-    assert result.status is TaskStatus.PAUSED
+    assert result.lifecycle is TaskLifecycleStatus.PAUSED
 
 
 def test_denied_l3_action_never_offers_approval(tmp_path):
@@ -166,7 +175,7 @@ def test_main_list_does_not_require_model_api_key(tmp_path, monkeypatch):
     assert "测试失败" in output[0]
 
 
-def test_new_command_shares_one_memory_store_between_agent_and_service(
+def test_new_command_shares_bounded_repositories_between_agent_and_service(
     tmp_path,
     monkeypatch,
 ):
@@ -190,7 +199,6 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
     def fake_build_agent(
         config,
         checkpointer,
-        working_memory_store,
         task_repository=None,
         compaction_store=None,
         extensions=None,
@@ -200,7 +208,6 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
         backend=None,
         repositories=None,
     ):
-        captures["agent_store"] = working_memory_store
         captures["agent_research_store"] = research_evidence_store
         captures["extensions"] = extensions
         captures["agent_repository"] = task_repository
@@ -218,13 +225,11 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
             repository,
             policy,
             config,
-            working_memory_store,
             research_evidence_store,
             compaction_store,
             investigation,
             **kwargs,
         ):
-            captures["service_store"] = working_memory_store
             captures["service_research_store"] = research_evidence_store
             captures["service_compaction_store"] = compaction_store
             captures["service_repository"] = repository
@@ -237,14 +242,11 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
             self.config = config
 
         def start(self, problem):
-            task = TaskState.create(
-                self.config.project_root,
-                problem,
-                self.config.approval_mode,
+            return TaskRuntime(
+                task_id="task-new",
+                lifecycle=TaskLifecycleStatus.PAUSED,
+                pause_reason="请提供失败堆栈",
             )
-            task.status = TaskStatus.CLARIFYING
-            task.pending_question = "请提供失败堆栈"
-            return task
 
     monkeypatch.setattr(cli_module, "build_agent", fake_build_agent)
     monkeypatch.setattr(cli_module, "BugfixService", FakeService)
@@ -255,7 +257,6 @@ def test_new_command_shares_one_memory_store_between_agent_and_service(
     )
 
     assert exit_code == 0
-    assert captures["agent_store"] is captures["service_store"]
     assert captures["agent_research_store"] is captures["service_research_store"]
     assert isinstance(captures["agent_research_store"], ResearchEvidenceStore)
     assert captures["agent_repository"] is captures["service_repository"]
@@ -324,7 +325,7 @@ def test_new_persists_explicit_project_python(tmp_path, monkeypatch):
         ],
         output_fn=lambda line: None,
     )
-    stored = TaskRepository(database_path).list_recent()[0]
+    stored = TaskRepository(database_path).list_recent_definitions()[0]
 
     assert exit_code == 0
     assert stored.project_python == str(project_python.resolve())
@@ -357,6 +358,13 @@ def test_resume_reuses_persisted_project_python(tmp_path, monkeypatch):
     class FakeService:
         def __init__(self, *args, **kwargs):
             pass
+
+        def get_runtime(self, task_id):
+            return TaskRuntime(
+                task_id=task_id,
+                lifecycle=TaskLifecycleStatus.PAUSED,
+                pause_reason="请提供失败堆栈",
+            )
 
     monkeypatch.setattr(cli_module, "build_agent", fake_build_agent)
     monkeypatch.setattr(cli_module, "BugfixService", FakeService)
@@ -462,10 +470,13 @@ def test_research_factory_shares_client_store_and_fetcher_without_optional_keys(
     assert len(extensions.tools) == 4
 
 
-def test_run_interaction_queries_report_evidence_for_current_task_only(tmp_path):
+def test_run_interaction_does_not_rebuild_report_from_legacy_research_store(tmp_path):
     service = CliServiceStub()
-    task = TaskState.create(tmp_path, "测试失败", ApprovalMode.MANUAL)
-    task.status = TaskStatus.PAUSED
+    task = TaskRuntime(
+        task_id="task-report",
+        lifecycle=TaskLifecycleStatus.PAUSED,
+        pause_reason="waiting",
+    )
     service.task = task
 
     class Store:
@@ -485,7 +496,7 @@ def test_run_interaction_queries_report_evidence_for_current_task_only(tmp_path)
         output_fn=lambda line: None,
     )
 
-    assert store.calls == [task.task_id]
+    assert store.calls == []
 
 
 def test_config_loads_package_env_independent_of_current_directory(
