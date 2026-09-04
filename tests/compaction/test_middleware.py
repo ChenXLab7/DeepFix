@@ -21,7 +21,7 @@ from deepfix.compaction.models import (
     TaskAnchor,
 )
 from deepfix.compaction.snapshot import CompactionSnapshotBuilder
-from deepfix.compaction.store import CompactionStore
+from deepfix.domain_repositories import DomainRepositories
 from deepfix.domain_repositories.execution import ExecutionIntegrity
 from deepfix.domain_repositories.history import HistoryRepository
 from deepfix.protected_context import ProtectedContext
@@ -202,14 +202,16 @@ class _EmptyDelta:
 
 def test_committed_event_reconstructs_effective_view_without_deleting_checkpoint(tmp_path):
     database = tmp_path / "deepfix.sqlite3"
-    store = CompactionStore(database)
+    repositories = DomainRepositories.create(database)
     coordinator = CompactionCoordinator(
         adapter=DeepAgentsArtifactAdapter(
             FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True)
         ),
         delta_generator=_EmptyDelta(),
         snapshot_builder=CompactionSnapshotBuilder(),
-        snapshot_store=store,
+        history_repository=repositories.history,
+        evidence_repository=repositories.evidence,
+        investigation_repository=repositories.investigation,
     )
     messages = [
         HumanMessage(id="m1", content="old question"),
@@ -248,5 +250,5 @@ def test_committed_event_reconstructs_effective_view_without_deleting_checkpoint
     assert "m1" not in effective_ids
     assert {"m3", "m4"} <= set(effective_ids)
     assert request.state["messages"] == messages
-    assert store.get_snapshot("task-a", 1).lifecycle == "active"
+    assert repositories.history.get("task-a", 1).lifecycle == "active"
     assert coordinator.history_repository.context_telemetry("task-a").active_snapshot_version == 1

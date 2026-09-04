@@ -6,17 +6,17 @@ from deepagents.backends.protocol import ReadResult, WriteResult
 from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage, ToolMessage
 
-from deepfix.models import Evidence
+from deepfix.domain_repositories.evidence import EvidenceRepository
 from deepfix.research.fetcher import FetchedEvidenceBody
 from deepfix.research.models import (
     DependencyContext,
     DependencyFinding,
     ExternalEvidence,
+    LocalEvidenceReference,
     SearchCandidate,
 )
 from deepfix.research.providers import SearchCandidateDraft, TechnicalSearchResult
 from deepfix.research.sanitizer import QuerySanitizer
-from deepfix.research.store import ResearchEvidenceStore
 from deepfix.research.tools import (
     build_fetch_external_evidence_tool,
     build_inspect_dependency_tool,
@@ -108,7 +108,7 @@ class StubFetcher:
 class RecordingBackend:
     def __init__(
         self,
-        store: ResearchEvidenceStore,
+        store: EvidenceRepository,
         *,
         error: str | None = None,
         corrupt_readback: bool = False,
@@ -121,7 +121,7 @@ class RecordingBackend:
         self.evidence_count_during_write: int | None = None
 
     def write(self, file_path: str, content: str) -> WriteResult:
-        self.evidence_count_during_write = len(self.store.list_evidence("task-a"))
+        self.evidence_count_during_write = len(self.store.list_external_evidence("task-a"))
         self.calls.append((file_path, content))
         if self.error is None:
             self.contents[file_path] = content
@@ -137,8 +137,8 @@ class RecordingBackend:
         return ReadResult(file_data={"content": content, "encoding": "utf-8"})
 
 
-def _save_candidate(store: ResearchEvidenceStore, task_id: str = "task-a") -> SearchCandidate:
-    return store.save_candidates(
+def _save_candidate(store: EvidenceRepository, task_id: str = "task-a") -> SearchCandidate:
+    return store.save_research_candidates(
         task_id,
         "pydantic model_copy update",
         [
@@ -158,7 +158,7 @@ def _save_candidate(store: ResearchEvidenceStore, task_id: str = "task-a") -> Se
 
 
 def _save_external_evidence(
-    store: ResearchEvidenceStore,
+    store: EvidenceRepository,
     task_id: str = "task-a",
 ) -> ExternalEvidence:
     candidate = _save_candidate(store, task_id)
@@ -185,7 +185,7 @@ def _save_external_evidence(
             "123e4567e89b42d3a456426614174000.md"
         ),
     )
-    store.save_evidence(evidence)
+    store.save_external_evidence(evidence)
     return evidence
 
 
@@ -218,7 +218,7 @@ def _execute_messages(
 
 
 def test_tool_schemas_expose_only_model_supplied_business_arguments(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     inspector = StubInspector()
     tools = [
         build_inspect_dependency_tool(inspector),
@@ -236,7 +236,7 @@ def test_tool_schemas_expose_only_model_supplied_business_arguments(tmp_path):
 
 
 def test_missing_runtime_task_id_returns_error_without_work(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     inspector = StubInspector()
     provider = StubProvider()
     tool = build_search_technical_sources_tool(
@@ -252,7 +252,7 @@ def test_missing_runtime_task_id_returns_error_without_work(tmp_path):
     assert message.status == "error"
     assert inspector.calls == []
     assert provider.calls == []
-    assert store.query_summary("task-a") == (0, [])
+    assert store.research_summary("task-a") == (0, [])
 
 
 def test_inspect_dependency_returns_declared_and_installed_versions():
@@ -269,7 +269,7 @@ def test_inspect_dependency_returns_declared_and_installed_versions():
 
 
 def test_rejected_search_sends_no_request_and_saves_nothing(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     inspector = StubInspector()
     provider = StubProvider()
     tool = build_search_technical_sources_tool(
@@ -285,11 +285,11 @@ def test_rejected_search_sends_no_request_and_saves_nothing(tmp_path):
     assert message.status == "error"
     assert inspector.calls == []
     assert provider.calls == []
-    assert store.query_summary("task-a") == (0, [])
+    assert store.research_summary("task-a") == (0, [])
 
 
 def test_valid_search_saves_audit_and_task_local_candidates(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     inspector = StubInspector()
     provider = StubProvider()
     tool = build_search_technical_sources_tool(
@@ -304,20 +304,22 @@ def test_valid_search_saves_audit_and_task_local_candidates(tmp_path):
     payload = json.loads(message.content)
 
     assert message.status == "success"
-    assert store.query_summary("task-a") == (
+    assert store.research_summary("task-a") == (
         1,
         ["github_discussions: GITHUB_TOKEN 未配置，已跳过"],
     )
     assert payload["query"] == "pydantic model_copy update"
     assert payload["providers"] == ["pypi", "github"]
     assert len(payload["candidates"]) == 1
-    candidate = store.get_candidate("task-a", payload["candidates"][0]["candidate_id"])
+    candidate = store.get_research_candidate(
+        "task-a", payload["candidates"][0]["candidate_id"]
+    )
     assert candidate.task_id == "task-a"
     assert candidate.query == "pydantic model_copy update"
 
 
 def test_fetch_requires_a_candidate_from_the_current_task(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     candidate = _save_candidate(store, "task-b")
     fetcher = StubFetcher()
     backend = RecordingBackend(store)
@@ -331,7 +333,7 @@ def test_fetch_requires_a_candidate_from_the_current_task(tmp_path):
 
 
 def test_fetch_writes_exact_artifact_before_persisting_evidence(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     candidate = _save_candidate(store)
     fetcher = StubFetcher()
     backend = RecordingBackend(store)
@@ -339,7 +341,7 @@ def test_fetch_writes_exact_artifact_before_persisting_evidence(tmp_path):
 
     message = tool.func(candidate_id=candidate.candidate_id, runtime=_runtime())
     payload = json.loads(message.content)
-    evidence = store.get_evidence("task-a", payload["evidence_id"])
+    evidence = store.get_external_evidence("task-a", payload["evidence_id"])
 
     assert message.status == "success"
     assert backend.evidence_count_during_write == 0
@@ -353,7 +355,7 @@ def test_fetch_writes_exact_artifact_before_persisting_evidence(tmp_path):
 
 
 def test_artifact_write_failure_creates_no_evidence_row(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     candidate = _save_candidate(store)
     fetcher = StubFetcher()
     backend = RecordingBackend(store, error="disk full")
@@ -363,11 +365,11 @@ def test_artifact_write_failure_creates_no_evidence_row(tmp_path):
 
     assert message.status == "error"
     assert backend.calls
-    assert store.list_evidence("task-a") == []
+    assert store.list_external_evidence("task-a") == []
 
 
 def test_artifact_readback_mismatch_creates_no_evidence_row(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     candidate = _save_candidate(store)
     backend = RecordingBackend(store, corrupt_readback=True)
     tool = build_fetch_external_evidence_tool(StubFetcher(), store, backend)
@@ -376,12 +378,12 @@ def test_artifact_readback_mismatch_creates_no_evidence_row(tmp_path):
 
     assert message.status == "error"
     assert "artifact 校验失败" in message.content
-    assert store.list_evidence("task-a") == []
+    assert store.list_external_evidence("task-a") == []
 
 
 def test_link_schema_exposes_evidence_claim_but_not_task_id(tmp_path):
     tool = build_link_external_evidence_tool(
-        ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+        EvidenceRepository(tmp_path / "deepfix.sqlite3")
     )
 
     assert set(tool.args) == {
@@ -395,7 +397,7 @@ def test_link_schema_exposes_evidence_claim_but_not_task_id(tmp_path):
 
 
 def test_link_rejects_evidence_owned_by_another_task(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     evidence = _save_external_evidence(store, "task-b")
     tool = build_link_external_evidence_tool(store)
 
@@ -409,13 +411,13 @@ def test_link_rejects_evidence_owned_by_another_task(tmp_path):
     )
 
     assert message.status == "error"
-    assert store.get_evidence("task-b", evidence.evidence_id).local_verification == (
+    assert store.get_external_evidence("task-b", evidence.evidence_id).local_verification == (
         "unverified"
     )
 
 
 def test_link_rejects_fabricated_tool_call_id(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     evidence = _save_external_evidence(store)
     tool = build_link_external_evidence_tool(store)
 
@@ -429,13 +431,13 @@ def test_link_rejects_fabricated_tool_call_id(tmp_path):
     )
 
     assert message.status == "error"
-    assert store.get_evidence("task-a", evidence.evidence_id).local_verification == (
+    assert store.get_external_evidence("task-a", evidence.evidence_id).local_verification == (
         "unverified"
     )
 
 
 def test_link_rejects_test_result_without_integer_exit_code(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     evidence = _save_external_evidence(store)
     tool = build_link_external_evidence_tool(store)
 
@@ -449,13 +451,13 @@ def test_link_rejects_test_result_without_integer_exit_code(tmp_path):
     )
 
     assert message.status == "error"
-    assert store.get_evidence("task-a", evidence.evidence_id).local_verification == (
+    assert store.get_external_evidence("task-a", evidence.evidence_id).local_verification == (
         "unverified"
     )
 
 
 def test_link_cannot_use_failing_pytest_to_mark_evidence_verified(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     evidence = _save_external_evidence(store)
     tool = build_link_external_evidence_tool(store)
 
@@ -469,13 +471,13 @@ def test_link_cannot_use_failing_pytest_to_mark_evidence_verified(tmp_path):
     )
 
     assert message.status == "error"
-    assert store.get_evidence("task-a", evidence.evidence_id).local_verification == (
+    assert store.get_external_evidence("task-a", evidence.evidence_id).local_verification == (
         "unverified"
     )
 
 
 def test_link_cannot_use_non_pytest_success_to_mark_evidence_verified(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     evidence = _save_external_evidence(store)
     tool = build_link_external_evidence_tool(store)
 
@@ -492,7 +494,7 @@ def test_link_cannot_use_non_pytest_success_to_mark_evidence_verified(tmp_path):
 
 
 def test_link_accepts_real_passing_pytest_for_verified_evidence(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     evidence = _save_external_evidence(store)
     tool = build_link_external_evidence_tool(store)
 
@@ -500,11 +502,15 @@ def test_link_accepts_real_passing_pytest_for_verified_evidence(tmp_path):
         evidence_id=evidence.evidence_id,
         status="verified",
         test_tool_call_ids=["pytest-call-1"],
-        local_evidence=[Evidence("tests/test_models.py:10", "回归测试覆盖该分支")],
+        local_evidence=[
+            LocalEvidenceReference(
+                source="tests/test_models.py:10", observation="回归测试覆盖该分支"
+            )
+        ],
         explanation="目标项目的回归测试通过",
         runtime=_runtime(messages=_execute_messages(exit_code=0)),
     )
-    updated = store.get_evidence("task-a", evidence.evidence_id)
+    updated = store.get_external_evidence("task-a", evidence.evidence_id)
 
     assert message.status == "success"
     assert message.artifact == {
@@ -514,13 +520,15 @@ def test_link_accepts_real_passing_pytest_for_verified_evidence(tmp_path):
     assert updated.local_verification == "verified"
     assert updated.linked_test_tool_call_ids == ["pytest-call-1"]
     assert updated.local_evidence == [
-        Evidence("tests/test_models.py:10", "回归测试覆盖该分支")
+        LocalEvidenceReference(
+            source="tests/test_models.py:10", observation="回归测试覆盖该分支"
+        )
     ]
     assert updated.verification_explanation == "目标项目的回归测试通过"
 
 
 def test_link_accepts_real_failed_pytest_for_contradicted_evidence(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     evidence = _save_external_evidence(store)
     tool = build_link_external_evidence_tool(store)
 
@@ -532,7 +540,7 @@ def test_link_accepts_real_failed_pytest_for_contradicted_evidence(tmp_path):
         explanation="官方示例在当前项目版本中复现失败",
         runtime=_runtime(messages=_execute_messages(exit_code=1)),
     )
-    updated = store.get_evidence("task-a", evidence.evidence_id)
+    updated = store.get_external_evidence("task-a", evidence.evidence_id)
 
     assert message.status == "success"
     assert updated.local_verification == "contradicted"
@@ -540,7 +548,7 @@ def test_link_accepts_real_failed_pytest_for_contradicted_evidence(tmp_path):
 
 
 def test_link_accepts_explicit_source_evidence_for_contradiction(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     evidence = _save_external_evidence(store)
     tool = build_link_external_evidence_tool(store)
 
@@ -549,9 +557,9 @@ def test_link_accepts_explicit_source_evidence_for_contradiction(tmp_path):
         status="contradicted",
         test_tool_call_ids=[],
         local_evidence=[
-            Evidence(
-                "src/models.py:42",
-                "当前项目覆盖了 model_copy，并忽略 update 参数",
+            LocalEvidenceReference(
+                source="src/models.py:42",
+                observation="当前项目覆盖了 model_copy，并忽略 update 参数",
             )
         ],
         explanation="本地覆盖实现与官方默认行为不同",
@@ -559,13 +567,13 @@ def test_link_accepts_explicit_source_evidence_for_contradiction(tmp_path):
     )
 
     assert message.status == "success"
-    assert store.get_evidence(
+    assert store.get_external_evidence(
         "task-a", evidence.evidence_id
     ).local_verification == "contradicted"
 
 
 def test_link_rejects_empty_contradiction(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     evidence = _save_external_evidence(store)
     tool = build_link_external_evidence_tool(store)
 
@@ -579,13 +587,13 @@ def test_link_rejects_empty_contradiction(tmp_path):
     )
 
     assert message.status == "error"
-    assert store.get_evidence("task-a", evidence.evidence_id).local_verification == (
+    assert store.get_external_evidence("task-a", evidence.evidence_id).local_verification == (
         "unverified"
     )
 
 
 def test_relink_updates_the_existing_evidence_instead_of_duplicating(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     evidence = _save_external_evidence(store)
     tool = build_link_external_evidence_tool(store)
     first_messages = _execute_messages(call_id="passing-call", exit_code=0)
@@ -607,11 +615,11 @@ def test_relink_updates_the_existing_evidence_instead_of_duplicating(tmp_path):
         explanation="新测试推翻了原结论",
         runtime=_runtime(messages=second_messages),
     )
-    updated = store.get_evidence("task-a", evidence.evidence_id)
+    updated = store.get_external_evidence("task-a", evidence.evidence_id)
 
     assert first.status == "success"
     assert second.status == "success"
-    assert len(store.list_evidence("task-a")) == 1
+    assert len(store.list_external_evidence("task-a")) == 1
     assert updated.local_verification == "contradicted"
     assert updated.linked_test_tool_call_ids == ["failing-call"]
     assert updated.verification_explanation == "新测试推翻了原结论"

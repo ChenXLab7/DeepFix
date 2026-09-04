@@ -19,8 +19,8 @@ from deepfix.artifact_retrieval.models import (
     stable_diagnostic_artifact_id,
 )
 from deepfix.artifact_retrieval.service import DiagnosticArtifactService
-from deepfix.models import TaskState, TaskStatus
 from deepfix.persistence import TaskRepository
+from deepfix.task_domain.models import TaskDefinition
 
 
 class CatalogCollectorStub:
@@ -49,14 +49,18 @@ def descriptor(
 
 def service_fixture(tmp_path, files: dict[str, bytes], artifacts=None):
     repository = TaskRepository(tmp_path / "deepfix.sqlite3")
-    repository.save(
-        TaskState(
+    repository.create_definition(
+        TaskDefinition(
             task_id="task-a",
-            project_root=str(tmp_path),
-            project_python=sys.executable,
-            user_problem="sign bug",
+            original_message_id="message-task-a",
+            original_problem="sign bug",
             approval_mode="manual",
-            status=TaskStatus.INVESTIGATING,
+            source_project_root=str(tmp_path),
+            workspace_root=str(tmp_path),
+            workspace_baseline_id="baseline-task-a",
+            project_python=sys.executable,
+            confinement_level="guarded_local",
+            created_at="2026-08-31T00:00:00+00:00",
         )
     )
     selected = list(
@@ -106,15 +110,11 @@ def test_search_uses_literal_casefolded_and_with_five_line_window(tmp_path):
 
 
 def test_artifact_authorization_reads_immutable_definition_not_legacy_task(
-    tmp_path, monkeypatch
+    tmp_path,
 ):
     path = "/.deepfix-artifacts/large_tool_results/call_1"
     service, _, _ = service_fixture(tmp_path, {path: b"failure detail"})
-    monkeypatch.setattr(
-        service.tasks,
-        "get",
-        lambda *args, **kwargs: pytest.fail("legacy TaskState must not be loaded"),
-    )
+    assert not hasattr(service.tasks, "get")
 
     result = service.search("task-a", messages(), "failure", None, 10)
 

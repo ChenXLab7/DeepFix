@@ -82,6 +82,24 @@ class DomainMigrationInProgress(RuntimeError):
     pass
 
 
+class DomainAuthorityMigrationError(RuntimeError):
+    """Typed boundary error raised when a domain cannot switch authorities safely."""
+
+    def __init__(
+        self,
+        *,
+        task_id: str,
+        domain: str,
+        error_code: str,
+        cause: Exception | None = None,
+    ) -> None:
+        super().__init__(f"{error_code}:{domain}")
+        self.task_id = task_id
+        self.domain = domain
+        self.error_code = error_code
+        self.cause = cause
+
+
 def _fenced_migration(domain: str):
     def decorate(method):
         @wraps(method)
@@ -970,23 +988,27 @@ class DomainMigrator:
         ]
 
     def _legacy_approvals(self, task_id: str) -> list[ExecutionApproval]:
+        records: list[dict[str, object]] = []
         with self.database.connection() as connection:
-            table = connection.execute(
-                """
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'tasks'
-                """
-            ).fetchone()
-            row = (
-                None
-                if table is None
-                else connection.execute(
-                    "SELECT payload FROM tasks WHERE task_id = ?",
+            for table_name in ("legacy_task_projection", "tasks"):
+                table = connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = ?
+                    """,
+                    (table_name,),
+                ).fetchone()
+                if table is None:
+                    continue
+                row = connection.execute(
+                    f"SELECT payload FROM {table_name} WHERE task_id = ?",
                     (task_id,),
                 ).fetchone()
-            )
-        payload = {} if row is None else json.loads(str(row[0]))
-        records = payload.get("approvals", [])
+                payload = {} if row is None else json.loads(str(row[0]))
+                candidates = payload.get("approvals", [])
+                if candidates:
+                    records = [dict(item) for item in candidates]
+                    break
         approvals: list[ExecutionApproval] = []
         for ordinal, record in enumerate(records):
             operation = str(record.get("operation", "")).strip()
@@ -1205,8 +1227,7 @@ class DomainMigrator:
                     ).fetchone()[0]
                     if marker is None and not bool(stale):
                         raise DomainMigrationInProgress(
-                            "domain migration already in progress: "
-                            f"{domain}:{normalized_task_id}"
+                            f"domain migration already in progress: {domain}:{normalized_task_id}"
                         )
                     connection.execute(
                         """

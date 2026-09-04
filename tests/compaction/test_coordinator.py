@@ -21,10 +21,11 @@ from deepfix.compaction.models import (
     TaskAnchor,
 )
 from deepfix.compaction.snapshot import CompactionSnapshotBuilder
-from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.work_units import partition_work_units
+from deepfix.domain_repositories.evidence import EvidenceRepository
 from deepfix.domain_repositories.execution import ExecutionIntegrity
 from deepfix.domain_repositories.history import HistoryRepository
+from deepfix.domain_repositories.investigation import InvestigationRepository
 from deepfix.protected_context import ProtectedContext
 
 
@@ -120,17 +121,20 @@ class _RecordingStore:
         self.actual = actual
         self.calls = calls
 
-    def save_prepared_snapshot(self, snapshot, input_hash):
+    def save_prepared(self, record):
         self.calls.append("snapshot_write")
-        return self.actual.save_prepared_snapshot(snapshot, input_hash)
+        return self.actual.save_prepared(record)
 
-    def get_snapshot(self, task_id, version):
+    def get(self, task_id, version):
+        return self.actual.get(task_id, version)
+
+    def project_snapshot(self, task_id, version, **kwargs):
         self.calls.append("snapshot_verify")
-        return self.actual.get_snapshot(task_id, version)
+        return self.actual.project_snapshot(task_id, version, **kwargs)
 
-    def activate_from_event(self, task_id, event):
+    def activate(self, task_id, version, event):
         self.calls.append("snapshot_activate")
-        return self.actual.activate_from_event(task_id, event)
+        return self.actual.activate(task_id, version, event)
 
     def __getattr__(self, name):
         return getattr(self.actual, name)
@@ -146,13 +150,14 @@ def _coordinator(
     model=None,
 ):
     database = tmp_path / "deepfix.sqlite3"
-    actual_store = CompactionStore(database)
     history = HistoryRepository(database)
+    evidence = EvidenceRepository(database)
+    investigation = InvestigationRepository(database)
     calls = calls if calls is not None else []
     artifact = adapter or DeepAgentsArtifactAdapter(
         FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True)
     )
-    snapshot_store = store or actual_store
+    snapshot_store = store or history
     return (
         CompactionCoordinator(
             adapter=(
@@ -162,16 +167,17 @@ def _coordinator(
             ),
             delta_generator=delta_generator or _RecordingDelta(calls),
             snapshot_builder=_RecordingBuilder(calls),
-            snapshot_store=(
+            history_repository=(
                 _RecordingStore(snapshot_store, calls)
                 if calls is not None and store is None
                 else snapshot_store
             ),
-            history_repository=history,
+            evidence_repository=evidence,
+            investigation_repository=investigation,
             model=model,
             partitioner=lambda messages, conflicts: _record_partition(calls, messages, conflicts),
         ),
-        actual_store,
+        history,
         history,
     )
 
@@ -197,7 +203,9 @@ def test_prepare_orders_artifact_before_snapshot_and_never_mutates_messages(tmp_
         "snapshot_validate",
         "snapshot_write",
         "snapshot_verify",
+        "snapshot_verify",
         "snapshot_activate",
+        "snapshot_verify",
     ]
     assert list(request.messages) == original
     assert prepared.snapshot.lifecycle == "active"
@@ -225,7 +233,7 @@ def test_success_returns_event_and_identical_prepare_reuses_snapshot(tmp_path):
     assert event["retained_message_ids"] == sorted(first.retention.retained_message_ids)
     assert event["input_hash"] == first.input_hash
     assert first.snapshot.version == second.snapshot.version == 1
-    assert store.get_snapshot("task-a", 1).lifecycle == "active"
+    assert store.get("task-a", 1).lifecycle == "active"
     assert received[0][0].id == first.snapshot_message.id
 
 
@@ -240,7 +248,7 @@ def test_handler_failure_returns_no_event_but_activation_precedes_message_replac
             lambda messages: (_ for _ in ()).throw(RuntimeError("model failed")),
         )
 
-    assert store.get_snapshot("task-a", 1).lifecycle == "active"
+    assert store.get("task-a", 1).lifecycle == "active"
 
 
 def _failure(code="artifact_write_failed"):
@@ -324,24 +332,29 @@ class _StageFailStore:
     def __init__(self, actual, stage):
         self.actual = actual
         self.stage = stage
+        self.project_calls = 0
 
-    def save_prepared_snapshot(self, snapshot, input_hash):
+    def save_prepared(self, record):
         if self.stage == "snapshot_write":
             raise RuntimeError("write failed")
-        return self.actual.save_prepared_snapshot(snapshot, input_hash)
+        return self.actual.save_prepared(record)
 
-    def get_snapshot(self, task_id, version):
-        if self.stage == "snapshot_verify":
+    def get(self, task_id, version):
+        return self.actual.get(task_id, version)
+
+    def project_snapshot(self, task_id, version, **kwargs):
+        self.project_calls += 1
+        if self.stage == "snapshot_verify" and self.project_calls == 2:
             raise RuntimeError("verify failed")
-        return self.actual.get_snapshot(task_id, version)
+        return self.actual.project_snapshot(task_id, version, **kwargs)
 
-    def activate_from_event(self, task_id, event):
+    def activate(self, task_id, version, event):
         if self.stage == "snapshot_activate":
             raise RuntimeError("activation failed")
         if self.stage == "snapshot_activate_after_commit":
-            self.actual.activate_from_event(task_id, event)
+            self.actual.activate(task_id, version, event)
             raise RuntimeError("activation response lost")
-        return self.actual.activate_from_event(task_id, event)
+        return self.actual.activate(task_id, version, event)
 
     def __getattr__(self, name):
         return getattr(self.actual, name)
@@ -349,7 +362,9 @@ class _StageFailStore:
 
 def _stage_failure_coordinator(tmp_path, stage):
     database = tmp_path / "deepfix.sqlite3"
-    store = CompactionStore(database)
+    store = HistoryRepository(database)
+    evidence = EvidenceRepository(database)
+    investigation = InvestigationRepository(database)
     adapter = DeepAgentsArtifactAdapter(
         FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True)
     )
@@ -369,7 +384,9 @@ def _stage_failure_coordinator(tmp_path, stage):
             adapter=adapter,
             delta_generator=delta,
             snapshot_builder=builder,
-            snapshot_store=snapshot_store,
+            history_repository=snapshot_store,
+            evidence_repository=evidence,
+            investigation_repository=investigation,
         ),
         store,
     )
@@ -439,7 +456,7 @@ def test_post_commit_activation_failure_does_not_mask_normal_passthrough(tmp_pat
 
     assert isinstance(result, ModelResponse)
     assert calls == [_messages()]
-    assert store.get_snapshot("task-a", 1).lifecycle == "active"
+    assert store.get("task-a", 1).lifecycle == "active"
     assert store.list_failures("task-a")[0].stage == "snapshot_activate"
 
 
@@ -456,7 +473,7 @@ def test_post_commit_activation_failure_does_not_mask_emergency_recovery(tmp_pat
         )
 
     assert captured.value.recovery.stage == "snapshot_activate"
-    assert store.get_snapshot("task-a", 1).lifecycle == "active"
+    assert store.get("task-a", 1).lifecycle == "active"
 
 
 def test_normal_failure_passthrough_once_and_same_input_skips_reprepare(tmp_path):
@@ -482,21 +499,24 @@ def test_normal_failure_passthrough_once_and_same_input_skips_reprepare(tmp_path
 class _VerifyFailStore:
     def __init__(self, actual):
         self.actual = actual
-        self.fail_verify = True
+        self.project_calls = 0
         self.abandoned = []
 
-    def save_prepared_snapshot(self, snapshot, input_hash):
-        return self.actual.save_prepared_snapshot(snapshot, input_hash)
+    def save_prepared(self, record):
+        return self.actual.save_prepared(record)
 
-    def get_snapshot(self, task_id, version):
-        if self.fail_verify:
-            self.fail_verify = False
+    def get(self, task_id, version):
+        return self.actual.get(task_id, version)
+
+    def project_snapshot(self, task_id, version, **kwargs):
+        self.project_calls += 1
+        if self.project_calls == 2:
             raise RuntimeError("verify failed")
-        return self.actual.get_snapshot(task_id, version)
+        return self.actual.project_snapshot(task_id, version, **kwargs)
 
-    def abandon_snapshot(self, task_id, version, reason):
+    def abandon(self, task_id, version, reason):
         self.abandoned.append(version)
-        return self.actual.abandon_snapshot(task_id, version, reason)
+        return self.actual.abandon(task_id, version, reason)
 
     def __getattr__(self, name):
         return getattr(self.actual, name)
@@ -505,12 +525,16 @@ class _VerifyFailStore:
 class _CoverageCorruptStore:
     def __init__(self, actual):
         self.actual = actual
+        self.project_calls = 0
 
-    def save_prepared_snapshot(self, snapshot, input_hash):
-        return self.actual.save_prepared_snapshot(snapshot, input_hash)
+    def save_prepared(self, record):
+        return self.actual.save_prepared(record)
 
-    def get_snapshot(self, task_id, version):
-        snapshot = self.actual.get_snapshot(task_id, version)
+    def project_snapshot(self, task_id, version, **kwargs):
+        snapshot = self.actual.project_snapshot(task_id, version, **kwargs)
+        self.project_calls += 1
+        if self.project_calls != 2:
+            return snapshot
         return snapshot.model_copy(
             update={"coverage": snapshot.coverage.model_copy(update={"covered_message_ids": []})}
         )
@@ -521,7 +545,7 @@ class _CoverageCorruptStore:
 
 def test_invalid_history_coverage_preserves_original_messages(tmp_path):
     database = tmp_path / "deepfix.sqlite3"
-    actual = CompactionStore(database)
+    actual = HistoryRepository(database)
     coordinator, _, _ = _coordinator(
         tmp_path,
         store=_CoverageCorruptStore(actual),
@@ -540,7 +564,7 @@ def test_invalid_history_coverage_preserves_original_messages(tmp_path):
 
 def test_passthrough_abandons_snapshot_prepared_before_failure(tmp_path):
     database = tmp_path / "deepfix.sqlite3"
-    actual = CompactionStore(database)
+    actual = HistoryRepository(database)
     failing = _VerifyFailStore(actual)
     coordinator, _, _ = _coordinator(tmp_path, store=failing)
 
@@ -550,7 +574,7 @@ def test_passthrough_abandons_snapshot_prepared_before_failure(tmp_path):
     )
 
     assert failing.abandoned == [1]
-    assert actual.get_snapshot("task-a", 1).lifecycle == "abandoned"
+    assert actual.get("task-a", 1).lifecycle == "abandoned"
 
 
 def test_emergency_preparation_failure_requires_recovery_without_handler(tmp_path):

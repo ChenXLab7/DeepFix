@@ -14,7 +14,7 @@ class SnapshotStoreStub:
         self.snapshots = list(snapshots)
         self.error: Exception | None = None
 
-    def list_snapshots(self, task_id: str):
+    def list_for_task(self, task_id: str):
         if self.error is not None:
             raise self.error
         return list(self.snapshots)

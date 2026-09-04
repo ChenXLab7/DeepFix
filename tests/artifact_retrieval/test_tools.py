@@ -333,7 +333,7 @@ def test_system_error_converts_to_investigation_recovery(
         "backend_read",
     )
     coordinator = coordinator_fixture(tmp_path)
-    status_before = coordinator.tasks.get("task-a").status
+    status_before = coordinator.tasks.get_lifecycle("task-a").status
     tool = builder(service, coordinator)
 
     with pytest.raises(InvestigationStateError) as caught:
@@ -347,4 +347,4 @@ def test_system_error_converts_to_investigation_recovery(
     assert caught.value.recovery.recovery_action == (
         "pause_and_retry_diagnostic_artifact_read"
     )
-    assert coordinator.tasks.get("task-a").status is status_before
+    assert coordinator.tasks.get_lifecycle("task-a").status is status_before

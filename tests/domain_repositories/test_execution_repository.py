@@ -19,14 +19,10 @@ from deepfix.domain_repositories.execution import (
 )
 from deepfix.domain_repositories.migration import DomainMigrator
 from deepfix.investigation.classification import result_fingerprint
-from deepfix.investigation.receipts import (
-    ToolExecutionReceipt,
-    ToolExecutionReceiptStore,
-)
+from deepfix.investigation.receipts import ToolExecutionReceipt, receipt_task_segment
 from deepfix.operations import (
     NewOperationEntry,
     OperationJournalEntry,
-    OperationJournalStore,
     OperationKind,
     OperationStateSnapshot,
     OperationStatus,
@@ -152,6 +148,12 @@ def test_approval_is_immutable_and_included_in_integrity_view(tmp_path: Path) ->
 
     assert repository.record_approval(approval) == approval
     assert repository.record_approval(approval) == approval
+    assert (
+        repository.record_approval(
+            approval.model_copy(update={"created_at": "2026-08-30T00:00:00+00:00"})
+        )
+        == approval
+    )
     with pytest.raises(ExecutionIdentityConflict):
         repository.record_approval(approval.model_copy(update={"decision": "deny"}))
 
@@ -182,9 +184,9 @@ def test_approval_builder_assigns_stable_identity_from_trusted_source() -> None:
     assert first.approval_id.startswith("approval_")
 
 
-def test_operation_journal_facade_delegates_to_execution_tables(tmp_path: Path) -> None:
+def test_operation_lifecycle_is_stored_in_execution_repository(tmp_path: Path) -> None:
     database_path = tmp_path / "deepfix.db"
-    store = OperationJournalStore(database_path)
+    store = ExecutionRepository(database_path)
     store.prepare(_operation("op-1", "call-1"))
     store.mark_started("op-1")
     store.observe_with_receipt(
@@ -199,19 +201,16 @@ def test_operation_journal_facade_delegates_to_execution_tables(tmp_path: Path) 
     )
 
 
-def test_receipt_facade_can_use_repository_without_writing_legacy_file(
+def test_receipt_is_stored_in_execution_repository_without_legacy_file(
     tmp_path: Path,
 ) -> None:
-    from deepfix.investigation.receipts import ToolExecutionReceiptStore
-
     repository = ExecutionRepository(tmp_path / "deepfix.db")
     root = tmp_path / "artifacts" / "investigation_receipts"
-    store = ToolExecutionReceiptStore(root, repository=repository)
     expected = _receipt("call-1")
 
-    store.save(expected)
+    repository.record_receipt(expected)
 
-    assert store.load("task-1", "call-1") == expected
+    assert repository.load_receipt("task-1", "call-1") == expected
     assert not list(root.rglob("*.json"))
 
 
@@ -276,13 +275,12 @@ def test_execution_migration_is_idempotent_and_preserves_legacy_sources(
                 ),
             ),
         )
-    legacy_receipts = ToolExecutionReceiptStore(
-        artifact_root / "investigation_receipts"
+    legacy_receipt_dir = artifact_root / "investigation_receipts" / receipt_task_segment("task-1")
+    legacy_receipt_dir.mkdir(parents=True)
+    (legacy_receipt_dir / "call-legacy.json").write_text(
+        _receipt("call-legacy").model_dump_json(indent=2), encoding="utf-8"
     )
-    legacy_receipts.save(_receipt("call-legacy"))
-    before = hashlib.sha256(
-        legacy_operation.model_dump_json().encode("utf-8")
-    ).hexdigest()
+    before = hashlib.sha256(legacy_operation.model_dump_json().encode("utf-8")).hexdigest()
 
     migrator = DomainMigrator(database, artifact_root=artifact_root)
     first = migrator.migrate_execution("task-1")
@@ -294,7 +292,10 @@ def test_execution_migration_is_idempotent_and_preserves_legacy_sources(
     execution = ExecutionRepository(database)
     assert execution.load_operation("op-legacy") == legacy_operation
     assert execution.load_receipt("task-1", "call-legacy") == _receipt("call-legacy")
-    assert len(execution.list_approvals("task-1")) == 1
+    approvals = execution.list_approvals("task-1")
+    assert len(approvals) == 1
+    assert approvals[0].operation == "execute pytest"
+    assert approvals[0].decision == "approve"
     with database.connection() as connection:
         payload = connection.execute(
             "SELECT payload FROM operation_journal WHERE operation_id = 'op-legacy'"

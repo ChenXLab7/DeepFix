@@ -21,7 +21,10 @@ from deepfix.config import AppConfig, redact_config_secrets
 from deepfix.debug import append_debug_record
 from deepfix.domain_repositories import DomainRepositories
 from deepfix.domain_repositories.execution import create_execution_approval
-from deepfix.domain_repositories.migration import DomainMigrator
+from deepfix.domain_repositories.migration import (
+    DomainAuthorityMigrationError,
+    DomainMigrator,
+)
 from deepfix.investigation.classification import is_pytest_verification
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import InvestigationCoordinationError
@@ -109,7 +112,9 @@ class BugfixService:
             TaskLifecycleStatus.RUNNING,
             expected_version=1,
         )
-        self._migrate_task_authorities(task_id)
+        migration_failure = self._guard_task_authority_migration(task_id)
+        if migration_failure is not None:
+            return migration_failure
         return self._invoke_authorities(
             task_id,
             {"messages": [HumanMessage(id=message_id, content=normalized_problem)]},
@@ -133,7 +138,9 @@ class BugfixService:
         )
 
     def get_runtime(self, task_id: str) -> TaskRuntime:
-        self._migrate_task_authorities(task_id)
+        migration_failure = self._guard_task_authority_migration(task_id)
+        if migration_failure is not None:
+            return migration_failure
         lifecycle = self.repository.get_lifecycle(task_id)
         actions = (
             self.pending_actions(task_id)
@@ -148,6 +155,9 @@ class BugfixService:
         task_id: str,
         user_message: str | None = None,
     ) -> TaskRuntime:
+        migration_failure = self._guard_task_authority_migration(task_id)
+        if migration_failure is not None:
+            return migration_failure
         lifecycle = self.repository.get_lifecycle(task_id)
         checkpoint_actions = self.pending_actions(task_id)
         if (
@@ -214,7 +224,9 @@ class BugfixService:
         return self._normalize_actions(interrupts)
 
     def pause_task(self, task_id: str, reason: str = "用户暂停任务") -> TaskRuntime:
-        self._migrate_task_authorities(task_id)
+        migration_failure = self._guard_task_authority_migration(task_id)
+        if migration_failure is not None:
+            return migration_failure
         lifecycle = self.repository.get_lifecycle(task_id)
         if lifecycle.status in {
             TaskLifecycleStatus.COMPLETED,
@@ -232,6 +244,9 @@ class BugfixService:
         return self.get_runtime(task_id)
 
     def decide(self, task_id: str, decisions: list[str]) -> TaskRuntime:
+        migration_failure = self._guard_task_authority_migration(task_id)
+        if migration_failure is not None:
+            return migration_failure
         lifecycle = self.repository.get_lifecycle(task_id)
         if lifecycle.status is not TaskLifecycleStatus.WAITING_APPROVAL:
             raise ValueError("任务当前不在等待审批状态")
@@ -397,11 +412,18 @@ class BugfixService:
                 path = str(args.get("file_path", args.get("path", "")))
                 if path:
                     approved_paths.append(path)
+            interrupt_id = str(action.get("interrupt_id", "")).strip()
+            action_index = int(action.get("interrupt_action_index", index))
+            approval_source = (
+                f"interrupt:{interrupt_id}:{action_index}"
+                if interrupt_id
+                else f"legacy-action:{index}:{name}:{dict(args)}"
+            )
             source_id = stable_conversation_message_id(
                 task_id,
                 index,
                 "approval",
-                f"{name}:{dict(args)}",
+                approval_source,
             )
             self.repositories.execution.record_approval(
                 create_execution_approval(
@@ -565,10 +587,11 @@ class BugfixService:
     def _normalize_actions(self, interrupts: object) -> list[dict[str, object]]:
         normalized: list[dict[str, object]] = []
         for interrupt in interrupts:
+            interrupt_id = str(getattr(interrupt, "id", "")).strip()
             value = getattr(interrupt, "value", interrupt)
             if not isinstance(value, Mapping):
                 continue
-            for request in value.get("action_requests", []):
+            for action_index, request in enumerate(value.get("action_requests", [])):
                 if not isinstance(request, Mapping):
                     continue
                 name = str(request.get("name", ""))
@@ -583,6 +606,8 @@ class BugfixService:
                         "risk": decision.risk.value,
                         "policy_action": decision.action.value,
                         "reason": decision.reason,
+                        "interrupt_id": interrupt_id,
+                        "interrupt_action_index": action_index,
                     }
                 )
         return normalized
@@ -598,9 +623,52 @@ class BugfixService:
         )
         for domain, migrate in migrations:
             try:
-                migrate(task_id)
-            except Exception as exc:  # noqa: BLE001 - legacy remains authoritative
+                report = migrate(task_id)
+                if not report.ready_to_switch:
+                    error = DomainAuthorityMigrationError(
+                        task_id=task_id,
+                        domain=domain,
+                        error_code="domain_authority_migration_not_ready",
+                    )
+                    self._record_domain_migration_failure(task_id, domain, error)
+                    raise error
+            except DomainAuthorityMigrationError:
+                raise
+            except Exception as exc:
                 self._record_domain_migration_failure(task_id, domain, exc)
+                raise DomainAuthorityMigrationError(
+                    task_id=task_id,
+                    domain=domain,
+                    error_code="domain_authority_migration_failed",
+                    cause=exc,
+                ) from exc
+
+    def _guard_task_authority_migration(self, task_id: str) -> TaskRuntime | None:
+        try:
+            self._migrate_task_authorities(task_id)
+        except DomainAuthorityMigrationError as error:
+            lifecycle = self.repository.get_lifecycle(task_id)
+            reason = f"领域权威迁移需要恢复：{error.error_code}:{error.domain}"
+            if lifecycle.status not in {
+                TaskLifecycleStatus.PAUSED,
+                TaskLifecycleStatus.COMPLETED,
+                TaskLifecycleStatus.FAILED,
+                TaskLifecycleStatus.CANCELLED,
+            }:
+                lifecycle = self.repository.transition_lifecycle(
+                    task_id,
+                    TaskLifecycleStatus.PAUSED,
+                    reason=reason,
+                    expected_version=lifecycle.version,
+                )
+            return TaskRuntime(
+                task_id=task_id,
+                lifecycle=lifecycle.status,
+                pending_actions=[],
+                latest_decision_id=None,
+                pause_reason=reason,
+            )
+        return None
 
     def _record_domain_migration_failure(
         self,

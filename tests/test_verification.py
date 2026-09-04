@@ -5,16 +5,13 @@ from langchain_core.messages import ToolMessage
 
 from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.models import SystemTestEvidence
-from deepfix.compaction.store import CompactionStore
-from deepfix.config import ApprovalMode
-from deepfix.models import TaskState
-from deepfix.research.store import ResearchEvidenceStore
+from deepfix.domain_repositories.evidence import EvidenceRepository
+from deepfix.task_domain.models import TaskDefinition
 from deepfix.task_domain.repository import TaskRepository
 from deepfix.verification import (
     VerificationPolicy,
     VerificationPolicyBuilder,
     VerificationPolicyConflict,
-    VerificationPolicyStore,
     evaluate_required_oracles,
 )
 from deepfix.workspace import WorkspaceFactory
@@ -37,15 +34,18 @@ def task_workspace(tmp_path, project):
 
 @pytest.fixture
 def task(task_workspace):
-    value = TaskState.create(
-        task_workspace.root,
-        "只允许修改 value.py，并运行 python -m pytest tests/test_value.py -q 验证",
-        ApprovalMode.MANUAL,
+    return TaskDefinition(
+        task_id="task-a",
+        original_message_id="message-task-a",
+        original_problem="只允许修改 value.py，并运行 python -m pytest tests/test_value.py -q 验证",
+        approval_mode="manual",
         source_project_root=task_workspace.baseline.source_root,
+        workspace_root=str(task_workspace.root),
         workspace_baseline_id=task_workspace.baseline.baseline_id,
+        project_python="python",
+        confinement_level="guarded_local",
+        created_at="2026-08-31T00:00:00+00:00",
     )
-    value.task_id = "task-a"
-    return value
 
 
 def test_existing_user_test_is_required_targeted_oracle(task_workspace, task):
@@ -68,9 +68,9 @@ def test_agent_created_test_cannot_be_required(task_workspace, task):
 
 
 def test_policy_cannot_downgrade_required_oracle(tmp_path, task_workspace, task):
-    store = VerificationPolicyStore(tmp_path / "state.db")
+    store = TaskRepository(tmp_path / "state.db")
     policy = VerificationPolicyBuilder().build(task, task_workspace)
-    store.save(policy)
+    store.save_verification_policy(policy)
     changed = policy.model_copy(
         update={
             "version": policy.version + 1,
@@ -80,22 +80,20 @@ def test_policy_cannot_downgrade_required_oracle(tmp_path, task_workspace, task)
     )
 
     with pytest.raises(VerificationPolicyConflict):
-        store.save(changed)
+        store.save_verification_policy(changed)
 
 
-def test_policy_store_can_delegate_to_task_repository(
+def test_policy_is_persisted_by_task_repository(
     tmp_path,
     task_workspace,
     task,
 ):
     tasks = TaskRepository(tmp_path / "state.db")
-    store = VerificationPolicyStore(tasks=tasks)
     policy = VerificationPolicyBuilder().build(task, task_workspace)
 
-    store.save(policy)
+    tasks.save_verification_policy(policy)
 
     assert tasks.load_verification_policy(task.task_id) == policy
-    assert store.load(task.task_id) == policy
 
 
 def test_verification_policy_has_no_workspace_allowed_paths(
@@ -125,7 +123,7 @@ def test_repository_suite_is_required_when_user_did_not_name_a_test(
     task_workspace,
     task,
 ):
-    task.user_problem = "修复 value.py 中的问题并验证"
+    task = task.model_copy(update={"original_problem": "修复 value.py 中的问题并验证"})
 
     policy = VerificationPolicyBuilder().build(task, task_workspace)
 
@@ -175,10 +173,7 @@ def test_modified_or_new_test_is_downgraded_to_agent_generated(
     generated = task_workspace.root / "tests" / "test_generated.py"
     generated.write_text("def test_x(): assert True\n", encoding="utf-8")
     database = tmp_path / "evidence.db"
-    collector = EvidenceCollector(
-        CompactionStore(database),
-        ResearchEvidenceStore(database),
-    )
+    collector = EvidenceCollector(EvidenceRepository(database))
     call = {
         "name": "execute",
         "args": {"command": "python -m pytest tests/test_generated.py -q"},

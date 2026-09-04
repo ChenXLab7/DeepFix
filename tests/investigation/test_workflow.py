@@ -10,6 +10,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 
+from deepfix.domain_repositories.execution import ExecutionRepository
 from deepfix.investigation.errors import (
     InvestigationStagnationError,
     InvestigationStateError,
@@ -20,7 +21,7 @@ from deepfix.investigation.models import (
     InvestigationRecoveryMetadata,
     RecordHypothesisInput,
 )
-from deepfix.investigation.receipts import ToolExecutionReceiptStore
+from deepfix.investigation.receipts import ToolResultArtifactStorage
 from investigation.helpers import (
     coordinator_fixture,
     seed_checked_location,
@@ -43,9 +44,8 @@ class OfflineRepairHarness:
         self.investigation = coordinator_fixture(tmp_path)
         self.middleware = InvestigationMiddleware(
             self.investigation,
-            ToolExecutionReceiptStore(
-                tmp_path / "artifacts" / "investigation_receipts"
-            ),
+            ExecutionRepository(self.investigation.evidence_repository.database),
+            ToolResultArtifactStorage(tmp_path / "artifacts" / "investigation_receipts"),
             {
                 "read_file": InvestigationCapability.READ,
                 "grep": InvestigationCapability.SEARCH,
@@ -61,9 +61,7 @@ class OfflineRepairHarness:
     @property
     def completed_read_calls(self) -> int:
         return sum(
-            count
-            for call_id, count in self.execution_counts.items()
-            if call_id.startswith("read-")
+            count for call_id, count in self.execution_counts.items() if call_id.startswith("read-")
         )
 
     def run(self, steps: list[ScriptStep]):
@@ -221,7 +219,7 @@ def test_normal_bugfix_flow_records_domain_progress_without_phase_navigation(
 ) -> None:
     harness = OfflineRepairHarness(tmp_path)
     evidence_id = "evidence-test-fail"
-    seed_evidence(harness.investigation.compaction_store, "task-a", evidence_id)
+    seed_evidence(harness.investigation.evidence_repository, "task-a", evidence_id)
     seed_checked_location(
         harness.investigation.store,
         "task-a",
@@ -276,9 +274,7 @@ def test_gcd_exact_repeat_is_corrected_then_pauses_before_permit(tmp_path: Path)
         harness.run(_repeated_pytest_steps(hypothesis.hypothesis_id))
 
     events = harness.investigation.store.list_events("task-a")
-    assert sum(
-        event.event_type == "investigation_permit_granted" for event in events
-    ) == 0
+    assert sum(event.event_type == "investigation_permit_granted" for event in events) == 0
     assert harness.execution_counts.total() == 1
     assert caught.value.recovery.error_code == "duplicate_execute_ignored"
 
@@ -312,14 +308,11 @@ def test_store_failure_after_tool_execution_does_not_rerun_tool(
     coordinator.record_tool_result = fail_once
     middleware = InvestigationMiddleware(
         coordinator,
-        ToolExecutionReceiptStore(
-            tmp_path / "artifacts" / "investigation_receipts"
-        ),
+        ExecutionRepository(coordinator.evidence_repository.database),
+        ToolResultArtifactStorage(tmp_path / "artifacts" / "investigation_receipts"),
         {"edit_file": InvestigationCapability.MODIFY},
     )
-    request = _tool_request(
-        "edit_file", "edit-1", {"file_path": "/src/sign.py"}
-    )
+    request = _tool_request("edit_file", "edit-1", {"file_path": "/src/sign.py"})
     result = _result(
         "edit-1",
         "edited",
@@ -338,7 +331,5 @@ def test_store_failure_after_tool_execution_does_not_rerun_tool(
     middleware.wrap_tool_call(request, handler)
 
     assert executions == 1
-    event_ids = [
-        item.event_id for item in coordinator.store.list_events("task-a")
-    ]
+    event_ids = [item.event_id for item in coordinator.store.list_events("task-a")]
     assert len(event_ids) == len(set(event_ids))

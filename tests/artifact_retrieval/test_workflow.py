@@ -23,13 +23,11 @@ from deepfix.compaction.adapter import DeepAgentsArtifactAdapter
 from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.identity import ensure_message_ids
 from deepfix.compaction.models import DeepFixCompactionEvent
-from deepfix.compaction.store import CompactionStore
 from deepfix.config import ApprovalMode, load_config
+from deepfix.domain_repositories import DomainRepositories
+from deepfix.domain_repositories.history import history_record_from_snapshot
 from deepfix.investigation.coordinator import InvestigationCoordinator
-from deepfix.investigation.store import InvestigationStore
-from deepfix.models import TaskState, TaskStatus
-from deepfix.persistence import TaskRepository
-from deepfix.research.store import ResearchEvidenceStore
+from deepfix.task_domain.models import TaskDefinition
 
 
 def _runtime(task_id: str, call_id: str) -> ToolRuntime:
@@ -116,52 +114,56 @@ def _environment(tmp_path, monkeypatch):
     project.mkdir()
     config = load_config(project, ApprovalMode.MANUAL)
     backend = build_backend(config)
-    tasks = TaskRepository(config.database_path)
+    repositories = DomainRepositories.create(config.database_path)
+    tasks = repositories.tasks
     for task_id in ("task-a", "task-b"):
-        tasks.save(
-            TaskState(
+        tasks.create_definition(
+            TaskDefinition(
                 task_id=task_id,
-                project_root=str(config.project_root),
-                project_python=str(config.project_python),
-                user_problem="bug",
+                original_message_id=f"user-{task_id}",
+                original_problem="bug",
                 approval_mode="manual",
-                status=TaskStatus.INVESTIGATING,
+                source_project_root=str(config.project_root),
+                workspace_root=str(config.project_root),
+                workspace_baseline_id=None,
+                project_python=str(config.project_python),
+                confinement_level="legacy_local",
+                created_at="2026-08-29T00:00:00+00:00",
             )
         )
-    compaction = CompactionStore(config.database_path)
-    research = ResearchEvidenceStore(config.database_path)
     coordinator = InvestigationCoordinator(
-        store=InvestigationStore(config.database_path),
+        store=repositories.investigation,
         tasks=tasks,
-        compaction_store=compaction,
-        evidence_collector=EvidenceCollector(compaction, research),
+        evidence_repository=repositories.evidence,
+        evidence_collector=EvidenceCollector(repositories.evidence),
     )
     service = DiagnosticArtifactService(
         tasks,
-        ArtifactReferenceCollector(compaction, backend),
+        ArtifactReferenceCollector(repositories.history, backend),
         backend,
     )
     return (
         backend,
-        compaction,
+        repositories.history,
         build_search_diagnostic_artifacts_tool(service, coordinator),
         build_read_diagnostic_artifact_tool(service, coordinator),
     )
 
 
-def _activate_history(compaction, task_id: str, reference) -> None:
+def _activate_history(history, task_id: str, reference) -> None:
     prepared = snapshot(
         task_id=task_id,
         lifecycle="prepared",
         references=[reference],
     )
-    prepared = compaction.save_prepared_snapshot(prepared, input_hash="d" * 64)
-    compaction.activate_from_event(
+    record = history.save_prepared(history_record_from_snapshot(prepared, input_hash="d" * 64))
+    history.activate(
         task_id,
+        record.version,
         DeepFixCompactionEvent(
             event_id=f"event-{task_id}",
             task_id=task_id,
-            active_snapshot_version=prepared.version,
+            active_snapshot_version=record.version,
             snapshot_message_id=f"snapshot-{task_id}",
             retained_message_ids=[],
             conversation_artifact=reference,
@@ -206,9 +208,7 @@ def test_public_filesystem_offload_is_searchable_by_diagnostic_tool(
         {"query": "AssertionError", "max_matches": 5},
     )
 
-    assert "/.deepfix-artifacts/large_tool_results/pytest-current" in str(
-        offloaded.content
-    )
+    assert "/.deepfix-artifacts/large_tool_results/pytest-current" in str(offloaded.content)
     assert "AssertionError" not in str(offloaded.content)
     assert result.status == "success"
     assert "AssertionError: sign=-1" in str(result.content)

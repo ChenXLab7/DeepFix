@@ -1,6 +1,10 @@
 import pytest
 from langchain.agents import create_agent
-from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    HumanInTheLoopMiddleware,
+    TodoListMiddleware,
+)
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import StructuredTool
@@ -26,10 +30,9 @@ from deepfix.extensions import (
     build_research_extensions,
 )
 from deepfix.investigation.models import InvestigationCapability
-from deepfix.models import RepairOutcome
 from deepfix.navigation.middleware import TodoNavigationMiddleware
 from deepfix.prompting import PromptPolicyMiddleware
-from deepfix.verification import VerificationPolicyStore
+from deepfix.task_domain.outcome import RepairOutcomeCandidate
 
 EXPECTED_TODO_SYSTEM_PROMPT = """## Bug-repair task navigation
 
@@ -150,7 +153,6 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     registered = {}
     main_model = object()
     compaction_model = object()
-    verification_policy_store = VerificationPolicyStore(config.database_path)
 
     def fake_create_deep_agent(**kwargs):
         captured.update(kwargs)
@@ -181,7 +183,6 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
         config,
         checkpointer=InMemorySaver(),
         extensions=extensions,
-        verification_policy_store=verification_policy_store,
     )
 
     tool_names = [tool.name for tool in captured["tools"]]
@@ -193,12 +194,13 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert tool_names.count("search_technical_sources") == 1
     assert tool_names.count("fetch_external_evidence") == 1
     assert tool_names.count("link_external_evidence") == 1
-    assert middleware_names[:8] == [
+    assert middleware_names[:9] == [
         "MessageIdentityMiddleware",
         "TodoListMiddleware",
         "TodoNavigationMiddleware",
         "LegacyContextMigrationMiddleware",
         "InvestigationMigrationMiddleware",
+        "HumanInTheLoopMiddleware",
         "InvestigationMiddleware",
         "PromptPolicyMiddleware",
         "DeepFixCompactionMiddleware",
@@ -209,7 +211,9 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
         "ContextMemoryMiddleware",
         "ResearchEvidenceMiddleware",
     } & set(middleware_names)
-    identity, todo_list, todo_navigation, migration, _, _, prompt, compaction = middleware[:8]
+    identity, todo_list, todo_navigation, migration, _, approval, _, prompt, compaction = (
+        middleware[:9]
+    )
     assert isinstance(identity, MessageIdentityMiddleware)
     assert isinstance(todo_list, TodoListMiddleware)
     assert todo_list.system_prompt == EXPECTED_TODO_SYSTEM_PROMPT
@@ -217,6 +221,7 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert todo_navigation.reminder_rounds == 3
     assert type(todo_navigation.feedback_source).__name__ == ("RepositoryNavigationFeedbackSource")
     assert type(migration).__name__ == "LegacyContextMigrationMiddleware"
+    assert isinstance(approval, HumanInTheLoopMiddleware)
     assert isinstance(prompt, PromptPolicyMiddleware)
     assert isinstance(compaction, DeepFixCompactionMiddleware)
     assert middleware_names.count("DeepFixCompactionMiddleware") == 1
@@ -231,7 +236,7 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
         item for item in middleware if type(item).__name__ == "InvestigationMiddleware"
     )
     assert (
-        investigation_middleware.receipts.root_dir
+        investigation_middleware.artifacts.root_dir
         == (config.artifacts_path / "investigation_receipts").resolve()
     )
     assert investigation_middleware.capabilities["search_diagnostic_artifacts"] is (
@@ -243,11 +248,12 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert investigation_middleware.capabilities["write_todos"] is (InvestigationCapability.META)
     assert captured["subagents"] == []
     assert captured["skills"] == []
-    assert captured["interrupt_on"] == {
-        "write_file": True,
-        "edit_file": True,
-        "delete": True,
-        "execute": True,
+    assert captured["interrupt_on"] is None
+    assert set(approval.interrupt_on) == {
+        "write_file",
+        "edit_file",
+        "delete",
+        "execute",
     }
     assert registered["key"] == f"deepseek:{config.main_model.model_name}"
     assert registered["profile"].excluded_middleware == frozenset({"SummarizationMiddleware"})
@@ -274,8 +280,7 @@ def test_agent_investigation_middleware_uses_shared_execution_repository(
     middleware = next(
         item for item in captured["middleware"] if type(item).__name__ == "InvestigationMiddleware"
     )
-    assert middleware.receipts.repository is repositories.execution
-    assert middleware.operation_journal.repository is repositories.execution
+    assert middleware.execution is repositories.execution
 
 
 def test_agent_configures_write_todos_with_deepfix_navigation_contract(
@@ -327,7 +332,7 @@ def test_experiment_builder_is_opt_in_and_legacy_builder_defaults_are_unchanged(
     assert build_experiment_agent(**kwargs) == "deepfix_experiment_executor"
 
     legacy, experiment = captured
-    assert legacy["response_format"] is RepairOutcome
+    assert legacy["response_format"] is RepairOutcomeCandidate
     assert any(isinstance(item, PromptPolicyMiddleware) for item in legacy["middleware"])
     assert experiment["response_format"].__name__ == "ExecutorNarrativeResult"
     assert not any(isinstance(item, PromptPolicyMiddleware) for item in experiment["middleware"])

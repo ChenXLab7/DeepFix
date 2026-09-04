@@ -1,5 +1,4 @@
 import asyncio
-import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -16,6 +15,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.runtime import ExecutionInfo, Runtime
 from langgraph.types import Command
 
+from deepfix.domain_repositories.execution import ExecutionRepository
 from deepfix.investigation.errors import (
     InvestigationStagnationError,
     InvestigationStateError,
@@ -30,8 +30,8 @@ from deepfix.investigation.models import (
     RecordHypothesisInput,
     ToolObservation,
 )
-from deepfix.investigation.receipts import ToolExecutionReceiptStore
-from deepfix.operations import OperationJournalStore, OperationStatus
+from deepfix.investigation.receipts import ToolResultArtifactStorage
+from deepfix.operations import OperationStatus
 from investigation.helpers import coordinator_fixture
 
 
@@ -225,12 +225,7 @@ def middleware_fixture(
 ) -> InvestigationMiddleware:
     del phase  # compatibility input proving phase labels no longer affect tools
     coordinator = coordinator_fixture(tmp_path)
-    if with_journal:
-        task = coordinator.tasks.get("task-a")
-        task.workspace_root = str(tmp_path.resolve())
-        task.project_root = task.workspace_root
-        task.workspace_baseline_id = "baseline-task-a"
-        coordinator.tasks.save(task)
+    del with_journal  # ExecutionRepository journal is always authoritative
     state = coordinator.store.ensure_started("task-a")
     candidate = InvestigationHypothesis(
         hypothesis_id="hyp-1",
@@ -293,11 +288,9 @@ def middleware_fixture(
     }
     return InvestigationMiddleware(
         coordinator,
-        ToolExecutionReceiptStore(tmp_path / "artifacts" / "investigation_receipts"),
+        ExecutionRepository(coordinator.evidence_repository.database),
+        ToolResultArtifactStorage(tmp_path / "artifacts" / "investigation_receipts"),
         capabilities,
-        operation_journal=(
-            OperationJournalStore(tmp_path / "deepfix.sqlite3") if with_journal else None
-        ),
     )
 
 
@@ -499,15 +492,21 @@ def test_stagnation_does_not_change_visible_tools(tmp_path):
     assert {tool.name for tool in after.tools} == {tool.name for tool in all_test_tools()}
 
 
-def test_interrupt_command_does_not_mark_pytest_as_executed(tmp_path):
+def test_unexpected_inner_interrupt_preserves_started_operation_for_recovery(tmp_path):
     middleware = middleware_fixture(tmp_path, phase="editing")
 
-    result = middleware.wrap_tool_call(
-        pytest_tool_request(),
-        lambda request: Command(goto="approval"),
-    )
+    with pytest.raises(InvestigationStateError) as captured:
+        middleware.wrap_tool_call(
+            pytest_tool_request(),
+            lambda request: Command(goto="approval"),
+        )
 
-    assert isinstance(result, Command)
+    assert captured.value.recovery.error_code == "operation_result_not_durable"
+    operation = middleware.execution.load_operation(
+        stable_investigation_id("operation", "task-a", "pytest-1")
+    )
+    assert operation is not None
+    assert operation.status is OperationStatus.STARTED
     assert middleware.coordinator.state("task-a").task_id == "task-a"
 
 
@@ -805,7 +804,7 @@ def test_committed_tool_receipt_prevents_side_effect_reexecution(tmp_path):
     middleware.wrap_tool_call(edit_request(call_id="edit-1"), handler)
 
     assert executions == 1
-    receipt = middleware.receipts.load("task-a", "edit-1")
+    receipt = middleware.execution.load_receipt("task-a", "edit-1")
     assert receipt is not None
     assert receipt.tool_message.tool_call_id == "edit-1"
 
@@ -834,7 +833,7 @@ def test_atomic_observation_failure_after_edit_does_not_reexecute_handler(
         raise OSError("simulated execution commit failure")
 
     monkeypatch.setattr(
-        middleware.operation_journal,
+        middleware.execution,
         "observe_with_receipt",
         fail_observation,
     )
@@ -847,7 +846,7 @@ def test_atomic_observation_failure_after_edit_does_not_reexecute_handler(
     assert first.value.recovery.error_code == "tool_receipt_persistence_failed"
     assert second.value.recovery.error_code == "operation_reconciliation_required"
     assert calls == 1
-    entries = middleware.operation_journal.list_incomplete("task-a")
+    entries = middleware.execution.list_incomplete("task-a")
     assert len(entries) == 1
     assert entries[0].status is OperationStatus.STARTED
 
@@ -872,8 +871,8 @@ def test_successful_edit_commits_journal_after_receipt_and_evidence(tmp_path):
     )
 
     assert result.status == "success"
-    assert middleware.operation_journal.list_incomplete("task-a") == []
-    entry = middleware.operation_journal.load(
+    assert middleware.execution.list_incomplete("task-a") == []
+    entry = middleware.execution.load_operation(
         stable_investigation_id(
             "operation",
             "task-a",
@@ -910,11 +909,11 @@ def test_evidence_commit_failure_leaves_observed_operation_and_resume_does_not_e
         middleware.wrap_tool_call(request, handler)
 
     operation_id = stable_investigation_id("operation", "task-a", "journal-edit-observed")
-    assert middleware.operation_journal.load(operation_id).status is OperationStatus.OBSERVED
+    assert middleware.execution.load_operation(operation_id).status is OperationStatus.OBSERVED
     middleware.wrap_tool_call(request, handler)
 
     assert calls == 1
-    assert middleware.operation_journal.load(operation_id).status is OperationStatus.COMMITTED
+    assert middleware.execution.load_operation(operation_id).status is OperationStatus.COMMITTED
 
 
 def test_committed_edit_uses_authoritative_receipt_without_legacy_file(tmp_path):
@@ -932,12 +931,9 @@ def test_committed_edit_uses_authoritative_receipt_without_legacy_file(tmp_path)
 
     request = edit_request("journal-edit-missing-receipt")
     middleware.wrap_tool_call(request, handler)
-    receipt_files = list(middleware.receipts.root_dir.rglob("*.json"))
+    receipt_files = list(middleware.artifacts.root_dir.rglob("*.json"))
     assert receipt_files == []
-    assert (
-        middleware.operation_journal.load_receipt("task-a", "journal-edit-missing-receipt")
-        is not None
-    )
+    assert middleware.execution.load_receipt("task-a", "journal-edit-missing-receipt") is not None
 
     result = middleware.wrap_tool_call(request, handler)
 
@@ -976,10 +972,10 @@ def test_receipt_store_is_verified_and_task_isolated(tmp_path):
 
     middleware.wrap_tool_call(request, lambda received: result)
 
-    receipt = middleware.receipts.load("task-a", "edit-receipt")
+    receipt = middleware.execution.load_receipt("task-a", "edit-receipt")
     assert receipt is not None
     assert receipt.tool_message == result
-    assert middleware.receipts.load("task-b", "edit-receipt") is None
+    assert middleware.execution.load_receipt("task-b", "edit-receipt") is None
 
 
 def test_receipt_persistence_failure_keeps_bounded_recovery_diagnostic(
@@ -988,10 +984,10 @@ def test_receipt_persistence_failure_keeps_bounded_recovery_diagnostic(
 ):
     middleware = middleware_fixture(tmp_path)
 
-    def fail_replace(source, destination):
+    def fail_record(receipt):
         raise OSError("simulated receipt disk failure")
 
-    monkeypatch.setattr(os, "replace", fail_replace)
+    monkeypatch.setattr(middleware.execution, "record_receipt", fail_record)
 
     with pytest.raises(InvestigationStateError) as captured:
         middleware.wrap_tool_call(read_request(), lambda request: read_result())
@@ -1030,8 +1026,8 @@ def test_two_parallel_read_files_commit_both_receipts_and_observations(tmp_path)
         results = [future.result() for future in futures]
 
     assert [result.status for result in results] == ["success", "success"]
-    assert middleware.receipts.load("task-a", "read-source") is not None
-    assert middleware.receipts.load("task-a", "read-test") is not None
+    assert middleware.execution.load_receipt("task-a", "read-source") is not None
+    assert middleware.execution.load_receipt("task-a", "read-test") is not None
     assert {item.path for item in middleware.coordinator.state("task-a").checked_files} >= {
         "src/code.py",
         "tests/test_code.py",

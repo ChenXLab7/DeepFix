@@ -5,13 +5,13 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from langchain_core.messages import ToolMessage
 
+from deepfix.domain_repositories.investigation import InvestigationStateConflict
 from deepfix.investigation.errors import InvestigationStateError
 from deepfix.investigation.models import (
     InvestigationCapability,
     RecordHypothesisInput,
     ToolObservation,
 )
-from deepfix.investigation.store import InvestigationStateConflict
 from investigation.helpers import (
     coordinator_fixture,
     seed_checked_location,
@@ -22,7 +22,7 @@ from investigation.helpers import (
 
 def test_supported_hypothesis_rejects_cross_task_evidence(tmp_path):
     coordinator = coordinator_fixture(tmp_path)
-    seed_evidence(coordinator.compaction_store, "task-b", "evidence-b")
+    seed_evidence(coordinator.evidence_repository, "task-b", "evidence-b")
     seed_checked_location(coordinator.store, "task-a", "src/sign.py", 1, 20)
 
     with pytest.raises(ValueError, match="当前任务"):
@@ -35,7 +35,7 @@ def test_supported_hypothesis_rejects_cross_task_evidence(tmp_path):
 
 def test_supported_hypothesis_records_stable_id_without_phase_navigation(tmp_path):
     coordinator = coordinator_fixture(tmp_path)
-    seed_evidence(coordinator.compaction_store, "task-a", "evidence-a")
+    seed_evidence(coordinator.evidence_repository, "task-a", "evidence-a")
     seed_checked_location(coordinator.store, "task-a", "src/sign.py", 1, 20)
     coordinator.record_observation(
         "task-a",
@@ -69,7 +69,7 @@ def test_supported_hypothesis_records_stable_id_without_phase_navigation(tmp_pat
 
 def test_failed_post_edit_test_cannot_resupport_same_hypothesis(tmp_path):
     coordinator = coordinator_fixture(tmp_path)
-    seed_evidence(coordinator.compaction_store, "task-a", "evidence-a")
+    seed_evidence(coordinator.evidence_repository, "task-a", "evidence-a")
     seed_checked_location(coordinator.store, "task-a", "src/sign.py", 1, 20)
     supported = coordinator.record_hypothesis(
         "task-a",
@@ -269,7 +269,7 @@ def test_tool_result_uses_shared_deterministic_evidence_identity(tmp_path):
         result,
     )
 
-    evidence = coordinator.evidence_collector.store.list_evidence("task-a")
+    evidence = coordinator.evidence_collector.repository.list_deterministic("task-a")
     assert coordinator.state("task-a").test_evidence_ids == [evidence[0].evidence_id]
 
 

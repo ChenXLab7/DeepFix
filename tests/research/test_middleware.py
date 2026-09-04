@@ -7,10 +7,9 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.runtime import ExecutionInfo, Runtime
 
-from deepfix.models import Evidence
+from deepfix.domain_repositories.evidence import EvidenceRepository
 from deepfix.research.middleware import ResearchEvidenceMiddleware
-from deepfix.research.models import ExternalEvidence, SearchCandidate
-from deepfix.research.store import ResearchEvidenceStore
+from deepfix.research.models import ExternalEvidence, LocalEvidenceReference, SearchCandidate
 
 
 def _request(task_id: str) -> ModelRequest:
@@ -43,7 +42,7 @@ def _capture(middleware, task_id: str) -> str:
 
 
 def _save_evidence(
-    store: ResearchEvidenceStore,
+    store: EvidenceRepository,
     *,
     task_id: str = "task-a",
     title: str,
@@ -52,9 +51,9 @@ def _save_evidence(
     excerpt: str = "短摘录",
     documented_version: str | None = "2.8",
     project_version: str | None = "2.8.4",
-    local_evidence: list[Evidence] | None = None,
+    local_evidence: list[LocalEvidenceReference] | None = None,
 ) -> ExternalEvidence:
-    candidate = store.save_candidates(
+    candidate = store.save_research_candidates(
         task_id,
         f"query for {title}",
         [
@@ -96,12 +95,12 @@ def _save_evidence(
         ),
         artifact_path=f"/.deepfix-artifacts/research/{task_id}/{evidence_id}.md",
     )
-    store.save_evidence(evidence)
+    store.save_external_evidence(evidence)
     return evidence
 
 
 def test_research_middleware_isolates_current_task(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     _save_evidence(store, task_id="task-b", title="其他任务的秘密证据")
 
     text = _capture(ResearchEvidenceMiddleware(store), "task-a")
@@ -111,7 +110,7 @@ def test_research_middleware_isolates_current_task(tmp_path):
 
 
 def test_research_middleware_orders_evidence_by_reliability(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     _save_evidence(store, title="未验证 E3", level="E3")
     _save_evidence(store, title="未验证 E1", level="E1")
     _save_evidence(store, title="已推翻 E1", level="E1", verification="contradicted")
@@ -128,7 +127,7 @@ def test_research_middleware_orders_evidence_by_reliability(tmp_path):
 
 
 def test_research_middleware_injects_at_most_five_records(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     for index in range(7):
         _save_evidence(store, title=f"证据-{index}")
 
@@ -138,7 +137,7 @@ def test_research_middleware_injects_at_most_five_records(tmp_path):
 
 
 def test_research_middleware_bounds_each_excerpt_to_800_characters(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     _save_evidence(store, title="长摘录", excerpt="x" * 800 + "END")
 
     text = _capture(ResearchEvidenceMiddleware(store), "task-a")
@@ -150,13 +149,15 @@ def test_research_middleware_bounds_each_excerpt_to_800_characters(tmp_path):
 
 
 def test_research_middleware_has_an_8000_character_total_bound(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     for index in range(7):
         _save_evidence(
             store,
             title=f"证据-{index}-" + "T" * 1000,
             excerpt="x" * 5000,
-            local_evidence=[Evidence("src/a.py:1", "观察" * 1000)],
+            local_evidence=[
+                LocalEvidenceReference(source="src/a.py:1", observation="观察" * 1000)
+            ],
         )
 
     text = _capture(ResearchEvidenceMiddleware(store), "task-a")
@@ -167,7 +168,7 @@ def test_research_middleware_has_an_8000_character_total_bound(tmp_path):
 
 
 def test_research_middleware_marks_version_mismatch_and_e3_warning(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     _save_evidence(
         store,
         title="版本不匹配",
@@ -184,7 +185,7 @@ def test_research_middleware_marks_version_mismatch_and_e3_warning(tmp_path):
 
 
 def test_research_middleware_escapes_untrusted_xml_content(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     _save_evidence(
         store,
         title="<script>恶意标题</script>",
@@ -200,7 +201,7 @@ def test_research_middleware_escapes_untrusted_xml_content(tmp_path):
 
 
 def test_research_middleware_references_artifact_without_reading_full_body(tmp_path):
-    store = ResearchEvidenceStore(tmp_path / "deepfix.sqlite3")
+    store = EvidenceRepository(tmp_path / "deepfix.sqlite3")
     evidence = _save_evidence(store, title="短证据", excerpt="SHORT EXCERPT")
     artifact = tmp_path / "artifact.md"
     artifact.write_text("FULL SECRET BODY", encoding="utf-8")

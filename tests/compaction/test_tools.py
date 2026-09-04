@@ -21,8 +21,8 @@ from deepfix.compaction.models import (
     TaskAnchor,
 )
 from deepfix.compaction.snapshot import CompactionSnapshotBuilder
-from deepfix.compaction.store import CompactionStore
 from deepfix.compaction.tools import build_compact_conversation_tool
+from deepfix.domain_repositories import DomainRepositories
 from deepfix.domain_repositories.execution import ExecutionIntegrity
 from deepfix.protected_context import ProtectedContext
 
@@ -113,6 +113,7 @@ def _runtime():
 
 def _coordinator(tmp_path, zone="normal_compaction", ratio=0.85, adapter=None):
     database = tmp_path / "deepfix.sqlite3"
+    repositories = DomainRepositories.create(database)
     return CompactionCoordinator(
         adapter=adapter
         or DeepAgentsArtifactAdapter(
@@ -120,7 +121,9 @@ def _coordinator(tmp_path, zone="normal_compaction", ratio=0.85, adapter=None):
         ),
         delta_generator=_Delta(),
         snapshot_builder=CompactionSnapshotBuilder(),
-        snapshot_store=CompactionStore(database),
+        history_repository=repositories.history,
+        evidence_repository=repositories.evidence,
+        investigation_repository=repositories.investigation,
         budget_monitor=_Budget(zone, ratio),
         protected_builder=_ProtectedBuilder(),
         model=object(),

@@ -4,6 +4,10 @@ import pytest
 
 from deepfix.compaction.models import ProvenancedClaim, ProvenanceRef, SystemTestEvidence
 from deepfix.domain_repositories.evidence import EvidenceRepository
+from deepfix.domain_repositories.investigation import (
+    InvestigationRepository,
+    InvestigationStateConflict,
+)
 from deepfix.investigation.experiments import (
     ExecutorNarrativeResult,
     ExperimentAssessment,
@@ -16,7 +20,6 @@ from deepfix.investigation.models import (
     NewInvestigationEvent,
 )
 from deepfix.investigation.reducer import InvestigationStateReducer
-from deepfix.investigation.store import InvestigationStateConflict, InvestigationStore
 
 
 def _result() -> ExperimentResult:
@@ -55,7 +58,7 @@ def _assessment(*, claims: list[ProvenancedClaim] | None = None) -> ExperimentAs
 
 
 def test_reducer_replay_is_idempotent(tmp_path) -> None:
-    store = InvestigationStore(tmp_path / "state.db")
+    store = InvestigationRepository(tmp_path / "state.db")
     reducer = InvestigationStateReducer("task-1", store)
 
     first = reducer.commit(0, _result(), _assessment())
@@ -67,7 +70,7 @@ def test_reducer_replay_is_idempotent(tmp_path) -> None:
 
 
 def test_reducer_propagates_parent_roots(tmp_path) -> None:
-    store = InvestigationStore(tmp_path / "state.db")
+    store = InvestigationRepository(tmp_path / "state.db")
     roots = {
         "evidence-a": ["root-a"],
         "evidence-b": ["root-b"],
@@ -92,7 +95,7 @@ def test_reducer_propagates_parent_roots(tmp_path) -> None:
 
 
 def test_reducer_rejects_stale_non_replay_commit(tmp_path) -> None:
-    store = InvestigationStore(tmp_path / "state.db")
+    store = InvestigationRepository(tmp_path / "state.db")
     reducer = InvestigationStateReducer("task-1", store)
     reducer.commit(0, _result(), _assessment())
     different = _result().model_copy(update={"experiment_id": "experiment-2"})
@@ -120,7 +123,7 @@ def test_reducer_attaches_assessment_evidence_before_supporting_hypothesis(
             ),
             provenance_root_ids=[f"call-{index}"],
         )
-    store = InvestigationStore(database)
+    store = InvestigationRepository(database)
     state = store.ensure_started("task-1")
     candidate = InvestigationHypothesis(
         hypothesis_id="h-1",
@@ -151,4 +154,4 @@ def test_reducer_attaches_assessment_evidence_before_supporting_hypothesis(
     supported = committed.hypotheses[0]
     assert supported.state == "supported"
     assert supported.evidence_ids == ["evidence-a", "evidence-b"]
-    assert store.repository.get_hypothesis("task-1", "h-1") == supported
+    assert store.get_hypothesis("task-1", "h-1") == supported

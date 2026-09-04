@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from compaction.test_long_context_workflow import _LongBugWorkflow
 from langchain.agents import create_agent
 from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -109,9 +108,7 @@ def test_todo_navigation_survives_checkpoint_resume_and_parallel_tool_rounds():
             AIMessage(
                 id="third-investigation-round",
                 content="",
-                tool_calls=[
-                    _call("read_file", "read-config", {"file_path": "pyproject.toml"})
-                ],
+                tool_calls=[_call("read_file", "read-config", {"file_path": "pyproject.toml"})],
             ),
             AIMessage(id="resume-stop", content="Ready to update the Todo."),
         ]
@@ -130,9 +127,10 @@ def test_todo_navigation_survives_checkpoint_resume_and_parallel_tool_rounds():
     assert checkpoint_before_resume["_deepfix_last_completed_tool_round_id"] == (
         "second-investigation-round"
     )
-    assert checkpoint_before_resume[
-        "_deepfix_last_todo_progress_fingerprint"
-    ] == "5f78ef6c5f272dfec1a91db55cc9a57d00166a64d93dc5e76a9af9a94efa2af1"
+    assert (
+        checkpoint_before_resume["_deepfix_last_todo_progress_fingerprint"]
+        == "5f78ef6c5f272dfec1a91db55cc9a57d00166a64d93dc5e76a9af9a94efa2af1"
+    )
     assert checkpoint_before_resume["_deepfix_last_navigation_hint_fingerprint"] is None
     assert checkpoint_before_resume["_deepfix_pending_navigation_reminder"] is None
 
@@ -153,33 +151,34 @@ def test_todo_navigation_survives_checkpoint_resume_and_parallel_tool_rounds():
         "third-investigation-round"
     )
     assert checkpoint_state["_deepfix_todo_rounds_since_update"] == 0
-    assert checkpoint_state[
-        "_deepfix_last_todo_progress_fingerprint"
-    ] == checkpoint_before_resume["_deepfix_last_todo_progress_fingerprint"]
+    assert (
+        checkpoint_state["_deepfix_last_todo_progress_fingerprint"]
+        == checkpoint_before_resume["_deepfix_last_todo_progress_fingerprint"]
+    )
     assert checkpoint_state["_deepfix_last_navigation_hint_fingerprint"] is None
-    assert "<todo_navigation_reminder>" in checkpoint_state[
-        "_deepfix_pending_navigation_reminder"
-    ]
+    assert "<todo_navigation_reminder>" in checkpoint_state["_deepfix_pending_navigation_reminder"]
     assert len(captured_after_resume) == 2
     assert "<todo_navigation_reminder>" not in captured_after_resume[0]
     assert "<todo_navigation_reminder>" in captured_system_prompt
     assert captured_system_prompt.count("<todo_navigation_reminder>") == 1
     assert len(model.captured_system_prompts) == 6
     assert all(
-        "<todo_navigation_reminder>" not in prompt
-        for prompt in model.captured_system_prompts[:-1]
+        "<todo_navigation_reminder>" not in prompt for prompt in model.captured_system_prompts[:-1]
     )
-    assert sum(
-        prompt.count("<todo_navigation_reminder>")
-        for prompt in model.captured_system_prompts
-    ) == 1
+    assert (
+        sum(prompt.count("<todo_navigation_reminder>") for prompt in model.captured_system_prompts)
+        == 1
+    )
 
 
 def test_post_compaction_cursor_rebase_counts_three_new_rounds_without_delay(
     tmp_path,
 ):
-    compacted = _LongBugWorkflow(tmp_path).run()
-    snapshot_message = compacted.final_snapshot_message
+    snapshot_message = SystemMessage(
+        id="snapshot-message-1",
+        content="Compacted task history",
+        additional_kwargs={"_deepfix_snapshot_version": 1},
+    )
     assert "_deepfix_snapshot_version" in snapshot_message.additional_kwargs
 
     model = _ScriptedChatModel(
@@ -187,9 +186,7 @@ def test_post_compaction_cursor_rebase_counts_three_new_rounds_without_delay(
             AIMessage(
                 id="new-1",
                 content="",
-                tool_calls=[
-                    _call("read_file", "new-call-1", {"file_path": "src/value.py"})
-                ],
+                tool_calls=[_call("read_file", "new-call-1", {"file_path": "src/value.py"})],
             ),
             AIMessage(id="stop-1", content="First new round complete."),
             AIMessage(
@@ -201,9 +198,7 @@ def test_post_compaction_cursor_rebase_counts_three_new_rounds_without_delay(
             AIMessage(
                 id="new-3",
                 content="",
-                tool_calls=[
-                    _call("read_file", "new-call-3", {"file_path": "tests/test_value.py"})
-                ],
+                tool_calls=[_call("read_file", "new-call-3", {"file_path": "tests/test_value.py"})],
             ),
             AIMessage(id="stop-3", content="Third new round complete."),
         ]
@@ -232,9 +227,7 @@ def test_post_compaction_cursor_rebase_counts_three_new_rounds_without_delay(
     seeded = seed_graph.get_state(config).values
     assert seeded["todos"] == TODOS
     assert seeded["_deepfix_todo_rounds_since_update"] == 0
-    assert seeded["_deepfix_last_completed_tool_round_id"] == (
-        "old-round-not-retained"
-    )
+    assert seeded["_deepfix_last_completed_tool_round_id"] == ("old-round-not-retained")
     assert seeded["messages"] == [snapshot_message]
     agent = _agent(model, checkpointer)
 
@@ -262,14 +255,9 @@ def test_post_compaction_cursor_rebase_counts_three_new_rounds_without_delay(
     assert after_new_2["_deepfix_pending_navigation_reminder"] is None
     assert after_new_3["_deepfix_todo_rounds_since_update"] == 0
     assert after_new_3["_deepfix_last_completed_tool_round_id"] == "new-3"
-    assert "<todo_navigation_reminder>" in after_new_3[
-        "_deepfix_pending_navigation_reminder"
-    ]
+    assert "<todo_navigation_reminder>" in after_new_3["_deepfix_pending_navigation_reminder"]
     assert len(model.captured_system_prompts) == 6
     assert all(
-        "<todo_navigation_reminder>" not in prompt
-        for prompt in model.captured_system_prompts[:-1]
+        "<todo_navigation_reminder>" not in prompt for prompt in model.captured_system_prompts[:-1]
     )
-    assert model.captured_system_prompts[-1].count(
-        "<todo_navigation_reminder>"
-    ) == 1
+    assert model.captured_system_prompts[-1].count("<todo_navigation_reminder>") == 1

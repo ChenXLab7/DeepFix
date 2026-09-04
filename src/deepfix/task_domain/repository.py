@@ -50,9 +50,7 @@ class TaskRepository:
             with self.database.unit_of_work(immediate=True) as connection:
                 result = self._create_definition(connection, definition)
         except sqlite3.IntegrityError as exc:
-            raise TaskDefinitionConflict(
-                "task definition identity conflict"
-            ) from exc
+            raise TaskDefinitionConflict("task definition identity conflict") from exc
         return result
 
     def get_definition(self, task_id: str) -> TaskDefinition:
@@ -101,9 +99,7 @@ class TaskRepository:
             with self.database.unit_of_work(immediate=True) as connection:
                 self._save_verification_policy(connection, policy)
         except sqlite3.IntegrityError as exc:
-            raise VerificationPolicyConflict(
-                "verification policy identity conflict"
-            ) from exc
+            raise VerificationPolicyConflict("verification policy identity conflict") from exc
 
     def load_verification_policy(
         self,
@@ -115,44 +111,49 @@ class TaskRepository:
 
     def record_adjudication(self, decision: AdjudicationDecision) -> None:
         with self.database.unit_of_work(immediate=True) as connection:
-            row = connection.execute(
-                """
-                SELECT task_id, outcome, evidence_ids_json,
-                       operation_ids_json, decided_at
-                FROM adjudication_decisions WHERE decision_id = ?
-                """,
-                (decision.decision_id,),
-            ).fetchone()
-            if row is not None:
-                existing = AdjudicationDecision(
-                    decision_id=decision.decision_id,
-                    task_id=str(row[0]),
-                    outcome=str(row[1]),
-                    evidence_ids=json.loads(str(row[2])),
-                    operation_ids=json.loads(str(row[3])),
-                    decided_at=str(row[4]),
-                )
-                if existing == decision:
-                    return
-                raise AdjudicationDecisionConflict(
-                    "adjudication decision identity conflict"
-                )
-            connection.execute(
-                """
-                INSERT INTO adjudication_decisions(
-                    decision_id, task_id, outcome, evidence_ids_json,
-                    operation_ids_json, decided_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    decision.decision_id,
-                    decision.task_id,
-                    decision.outcome,
-                    _canonical_json(decision.evidence_ids),
-                    _canonical_json(decision.operation_ids),
-                    decision.decided_at,
-                ),
+            self._record_adjudication(connection, decision)
+
+    @staticmethod
+    def _record_adjudication(
+        connection: sqlite3.Connection,
+        decision: AdjudicationDecision,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT task_id, outcome, evidence_ids_json,
+                   operation_ids_json, decided_at
+            FROM adjudication_decisions WHERE decision_id = ?
+            """,
+            (decision.decision_id,),
+        ).fetchone()
+        if row is not None:
+            existing = AdjudicationDecision(
+                decision_id=decision.decision_id,
+                task_id=str(row[0]),
+                outcome=str(row[1]),
+                evidence_ids=json.loads(str(row[2])),
+                operation_ids=json.loads(str(row[3])),
+                decided_at=str(row[4]),
             )
+            if existing == decision:
+                return
+            raise AdjudicationDecisionConflict("adjudication decision identity conflict")
+        connection.execute(
+            """
+            INSERT INTO adjudication_decisions(
+                decision_id, task_id, outcome, evidence_ids_json,
+                operation_ids_json, decided_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision.decision_id,
+                decision.task_id,
+                decision.outcome,
+                _canonical_json(decision.evidence_ids),
+                _canonical_json(decision.operation_ids),
+                decision.decided_at,
+            ),
+        )
 
     def latest_adjudication(self, task_id: str) -> AdjudicationDecision | None:
         with self.database.connection() as connection:
@@ -253,9 +254,7 @@ class TaskRepository:
             available_input = int(budget[0]) - int(budget[2]) - int(outstanding[0])
             available_output = int(budget[1]) - int(budget[3]) - int(outstanding[1])
             if input_tokens > available_input or output_tokens > available_output:
-                raise TokenBudgetExhausted(
-                    "token reservation exceeds available budget"
-                )
+                raise TokenBudgetExhausted("token reservation exceeds available budget")
             reservation = TokenReservation(
                 reservation_id=reservation_id,
                 task_id=task_id,
@@ -548,8 +547,7 @@ class TaskRepository:
         paused_from = current.status if next_status is TaskLifecycleStatus.PAUSED else None
         next_reason = (
             reason
-            if next_status
-            in {TaskLifecycleStatus.PAUSED, TaskLifecycleStatus.FAILED}
+            if next_status in {TaskLifecycleStatus.PAUSED, TaskLifecycleStatus.FAILED}
             else None
         )
         updated_at = _now()
@@ -606,9 +604,7 @@ class TaskRepository:
             old_required = {item.oracle_id for item in latest.required_oracles}
             new_required = {item.oracle_id for item in policy.required_oracles}
             if not old_required.issubset(new_required):
-                raise VerificationPolicyConflict(
-                    "required oracle cannot be removed or downgraded"
-                )
+                raise VerificationPolicyConflict("required oracle cannot be removed or downgraded")
         connection.execute(
             """
             INSERT INTO verification_policies(task_id, version, policy_id, payload)
@@ -630,13 +626,8 @@ class TaskRepository:
     ) -> VerificationPolicy | None:
         from deepfix.verification import VerificationPolicy
 
-        query = (
-            "SELECT payload FROM verification_policies WHERE task_id = ? "
-            + (
-                "AND version = ?"
-                if version is not None
-                else "ORDER BY version DESC LIMIT 1"
-            )
+        query = "SELECT payload FROM verification_policies WHERE task_id = ? " + (
+            "AND version = ?" if version is not None else "ORDER BY version DESC LIMIT 1"
         )
         parameters = (task_id, version) if version is not None else (task_id,)
         row = connection.execute(query, parameters).fetchone()
@@ -784,8 +775,8 @@ class TaskRepository:
                     legacy.definition.task_id,
                 ),
             )
-        if legacy.adjudication is not None:
-            self.record_adjudication(legacy.adjudication)
+            if legacy.adjudication is not None:
+                self._record_adjudication(connection, legacy.adjudication)
 
     def _backfill_all_historical_tasks(self) -> None:
         with self.database.connection() as connection:
@@ -848,9 +839,7 @@ class TaskRepository:
             task_id=str(row[0]),
             status=TaskLifecycleStatus(str(row[1])),
             version=int(row[2]),
-            paused_from=(
-                TaskLifecycleStatus(str(row[3])) if row[3] is not None else None
-            ),
+            paused_from=(TaskLifecycleStatus(str(row[3])) if row[3] is not None else None),
             reason=str(row[4]) if row[4] is not None else None,
             updated_at=str(row[5]),
         )

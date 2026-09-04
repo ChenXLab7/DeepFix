@@ -5,11 +5,11 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from langchain_core.messages import ToolMessage
 
-from deepfix.investigation.receipts import ToolExecutionReceiptStore
+from deepfix.domain_repositories.execution import ExecutionRepository
+from deepfix.investigation.receipts import ToolResultArtifactStorage, receipt_from_result
 from deepfix.operations import (
     NewOperationEntry,
     OperationConflictError,
-    OperationJournalStore,
     OperationKind,
     OperationReconciler,
     OperationStateSnapshot,
@@ -40,8 +40,21 @@ def prepared_operation() -> NewOperationEntry:
     )
 
 
+def _receipt(call_id: str, content: str = "ok"):
+    return receipt_from_result(
+        "task-1",
+        {
+            "name": "execute",
+            "id": call_id,
+            "args": {"command": "python -m pytest -q"},
+            "type": "tool_call",
+        },
+        ToolMessage(content=content, name="execute", tool_call_id=call_id),
+    )
+
+
 def test_journal_requires_prepared_before_started(tmp_path) -> None:
-    store = OperationJournalStore(tmp_path / "state.db")
+    store = ExecutionRepository(tmp_path / "state.db")
 
     with pytest.raises(OperationTransitionError, match="missing"):
         store.mark_started("missing")
@@ -51,7 +64,7 @@ def test_prepare_is_idempotent_for_same_operation(
     tmp_path,
     prepared_operation,
 ) -> None:
-    store = OperationJournalStore(tmp_path / "state.db")
+    store = ExecutionRepository(tmp_path / "state.db")
 
     first = store.prepare(prepared_operation)
     second = store.prepare(prepared_operation)
@@ -65,7 +78,7 @@ def test_prepare_rejects_same_id_with_different_hash(
     tmp_path,
     prepared_operation,
 ) -> None:
-    store = OperationJournalStore(tmp_path / "state.db")
+    store = ExecutionRepository(tmp_path / "state.db")
     store.prepare(prepared_operation)
     changed = prepared_operation.model_copy(update={"call_hash": "e" * 64})
 
@@ -77,7 +90,7 @@ def test_transitions_are_ordered_and_exact_replays_are_idempotent(
     tmp_path,
     prepared_operation,
 ) -> None:
-    store = OperationJournalStore(tmp_path / "state.db")
+    store = ExecutionRepository(tmp_path / "state.db")
     prepared = store.prepare(prepared_operation)
 
     with pytest.raises(OperationTransitionError, match="observed"):
@@ -90,17 +103,20 @@ def test_transitions_are_ordered_and_exact_replays_are_idempotent(
         file_hash="d" * 64,
         code_state_hash="f" * 64,
     )
-    observed = store.observe(
-        prepared.operation_id,
-        post_state=post_state,
-        receipt_id="receipt-1",
-        artifact_references=["operations/output-1.json"],
+    receipt = _receipt(prepared.tool_call_id).model_copy(
+        update={"call_hash": prepared.call_hash}
     )
-    assert store.observe(
+    observed = store.observe_with_receipt(
         prepared.operation_id,
         post_state=post_state,
-        receipt_id="receipt-1",
-        artifact_references=["operations/output-1.json"],
+        receipt=receipt,
+        artifact_references=[],
+    )
+    assert store.observe_with_receipt(
+        prepared.operation_id,
+        post_state=post_state,
+        receipt=receipt,
+        artifact_references=[],
     ) == observed
     committed = store.commit(prepared.operation_id)
 
@@ -113,23 +129,27 @@ def test_observe_replay_with_different_receipt_is_rejected(
     tmp_path,
     prepared_operation,
 ) -> None:
-    store = OperationJournalStore(tmp_path / "state.db")
+    store = ExecutionRepository(tmp_path / "state.db")
     store.prepare(prepared_operation)
     store.mark_started(prepared_operation.operation_id)
     post_state = prepared_operation.expected_post_state
     assert post_state is not None
-    store.observe(
+    store.observe_with_receipt(
         prepared_operation.operation_id,
         post_state=post_state,
-        receipt_id="receipt-1",
+        receipt=_receipt(prepared_operation.tool_call_id).model_copy(
+            update={"call_hash": prepared_operation.call_hash}
+        ),
         artifact_references=[],
     )
 
     with pytest.raises(OperationConflictError, match="observation conflict"):
-        store.observe(
+        store.observe_with_receipt(
             prepared_operation.operation_id,
             post_state=post_state,
-            receipt_id="receipt-2",
+            receipt=_receipt(prepared_operation.tool_call_id, "different").model_copy(
+                update={"call_hash": prepared_operation.call_hash}
+            ),
             artifact_references=[],
         )
 
@@ -138,7 +158,7 @@ def test_started_operation_can_be_marked_unknown_without_becoming_replayable(
     tmp_path,
     prepared_operation,
 ) -> None:
-    store = OperationJournalStore(tmp_path / "state.db")
+    store = ExecutionRepository(tmp_path / "state.db")
     store.prepare(prepared_operation)
     store.mark_started(prepared_operation.operation_id)
 
@@ -157,7 +177,7 @@ def test_parallel_identical_prepare_creates_one_row(
     tmp_path,
     prepared_operation,
 ) -> None:
-    store = OperationJournalStore(tmp_path / "state.db")
+    store = ExecutionRepository(tmp_path / "state.db")
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         results = list(
@@ -173,8 +193,8 @@ def test_file_post_hash_reconstructs_observed_receipt(tmp_path) -> None:
     target = workspace / "src" / "value.py"
     target.parent.mkdir(parents=True)
     target.write_text("broken\n", encoding="utf-8")
-    store = OperationJournalStore(tmp_path / "state.db")
-    receipts = ToolExecutionReceiptStore(tmp_path / "artifacts" / "receipts")
+    store = ExecutionRepository(tmp_path / "state.db")
+    artifacts = ToolResultArtifactStorage(tmp_path / "artifacts" / "receipts")
     prepared = NewOperationEntry(
         operation_id="operation-recover",
         task_id="task-1",
@@ -198,14 +218,14 @@ def test_file_post_hash_reconstructs_observed_receipt(tmp_path) -> None:
     store.mark_started(prepared.operation_id)
     target.write_text("fixed\n", encoding="utf-8")
 
-    result = OperationReconciler(store, receipts).reconcile_task(
+    result = OperationReconciler(store, artifacts).reconcile_task(
         "task-1", workspace
     )
 
     assert result.reconstructed_operation_ids == [prepared.operation_id]
     assert result.conflict_operation_ids == []
-    assert receipts.load("task-1", "call-recover") is not None
-    assert store.load(prepared.operation_id).status is OperationStatus.OBSERVED
+    assert store.load_receipt("task-1", "call-recover") is not None
+    assert store.load_operation(prepared.operation_id).status is OperationStatus.OBSERVED
 
 
 def test_unexpected_file_hash_pauses_recovery(tmp_path) -> None:
@@ -213,7 +233,7 @@ def test_unexpected_file_hash_pauses_recovery(tmp_path) -> None:
     target = workspace / "src" / "value.py"
     target.parent.mkdir(parents=True)
     target.write_text("broken\n", encoding="utf-8")
-    store = OperationJournalStore(tmp_path / "state.db")
+    store = ExecutionRepository(tmp_path / "state.db")
     prepared = NewOperationEntry(
         operation_id="operation-conflict",
         task_id="task-1",
@@ -239,18 +259,18 @@ def test_unexpected_file_hash_pauses_recovery(tmp_path) -> None:
 
     result = OperationReconciler(
         store,
-        ToolExecutionReceiptStore(tmp_path / "artifacts" / "receipts"),
+        ToolResultArtifactStorage(tmp_path / "artifacts" / "receipts"),
     ).reconcile_task("task-1", workspace)
 
     assert result.conflict_operation_ids == [prepared.operation_id]
-    assert store.load(prepared.operation_id).status is OperationStatus.UNKNOWN
+    assert store.load_operation(prepared.operation_id).status is OperationStatus.UNKNOWN
 
 
 def test_command_artifact_with_exit_status_reconstructs_receipt(tmp_path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    store = OperationJournalStore(tmp_path / "state.db")
-    receipts = ToolExecutionReceiptStore(tmp_path / "artifacts" / "receipts")
+    store = ExecutionRepository(tmp_path / "state.db")
+    artifacts = ToolResultArtifactStorage(tmp_path / "artifacts" / "receipts")
     prepared = NewOperationEntry(
         operation_id="operation-command",
         task_id="task-1",
@@ -263,7 +283,7 @@ def test_command_artifact_with_exit_status_reconstructs_receipt(tmp_path) -> Non
     )
     store.prepare(prepared)
     store.mark_started(prepared.operation_id)
-    receipts.save_result_artifact(
+    artifacts.save_result_artifact(
         "task-1",
         "execute-1",
         "execute",
@@ -275,20 +295,22 @@ def test_command_artifact_with_exit_status_reconstructs_receipt(tmp_path) -> Non
         ),
     )
 
-    result = OperationReconciler(store, receipts).reconcile_task(
+    result = OperationReconciler(store, artifacts).reconcile_task(
         "task-1", workspace
     )
 
     assert result.reconstructed_operation_ids == [prepared.operation_id]
-    assert receipts.load("task-1", "execute-1").tool_message.artifact["exit_code"] == 1
-    assert store.load(prepared.operation_id).status is OperationStatus.OBSERVED
+    assert store.load_receipt("task-1", "execute-1").tool_message.artifact[
+        "exit_code"
+    ] == 1
+    assert store.load_operation(prepared.operation_id).status is OperationStatus.OBSERVED
 
 
 def test_command_without_verified_exit_status_is_unknown_and_terminated(tmp_path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    store = OperationJournalStore(tmp_path / "state.db")
-    receipts = ToolExecutionReceiptStore(tmp_path / "artifacts" / "receipts")
+    store = ExecutionRepository(tmp_path / "state.db")
+    artifacts = ToolResultArtifactStorage(tmp_path / "artifacts" / "receipts")
     prepared = NewOperationEntry(
         operation_id="operation-command-unknown",
         task_id="task-1",
@@ -305,13 +327,13 @@ def test_command_without_verified_exit_status_is_unknown_and_terminated(tmp_path
 
     result = OperationReconciler(
         store,
-        receipts,
+        artifacts,
         terminate_process_group=lambda entry: terminated.append(entry.operation_id),
     ).reconcile_task("task-1", workspace)
 
     assert result.unknown_operation_ids == [prepared.operation_id]
     assert terminated == [prepared.operation_id]
-    assert store.load(prepared.operation_id).status is OperationStatus.UNKNOWN
+    assert store.load_operation(prepared.operation_id).status is OperationStatus.UNKNOWN
 
 
 def _hash(path) -> str:

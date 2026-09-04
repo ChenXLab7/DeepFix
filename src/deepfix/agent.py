@@ -8,7 +8,7 @@ from deepagents.profiles.harness import (
     HarnessProfile,
     register_harness_profile,
 )
-from langchain.agents.middleware import TodoListMiddleware
+from langchain.agents.middleware import HumanInTheLoopMiddleware, TodoListMiddleware
 from langchain_deepseek import ChatDeepSeek
 
 from deepfix.approval import merge_interrupt_on
@@ -123,9 +123,7 @@ def build_agent(
     )
     evidence_collector = EvidenceCollector(repositories.evidence)
     investigation_store = (
-        investigation.store
-        if investigation is not None
-        else repositories.investigation
+        investigation.store if investigation is not None else repositories.investigation
     )
     investigation = investigation or InvestigationCoordinator(
         store=investigation_store,
@@ -209,6 +207,7 @@ def build_agent(
         "delete": True,
         "execute": True,
     }
+    approval_interrupts = merge_interrupt_on(core_interrupts, resolved.tools)
     prompt_policy_middleware = [] if _experiment_mode else [PromptPolicyMiddleware()]
     return create_deep_agent(
         model=main_model,
@@ -243,12 +242,11 @@ def build_agent(
                     evidence_repository=repositories.evidence,
                 )
             ),
+            HumanInTheLoopMiddleware(interrupt_on=approval_interrupts),
             InvestigationMiddleware(
                 investigation,
                 repositories.execution,
-                ToolResultArtifactStorage(
-                    config.artifacts_path / "investigation_receipts"
-                ),
+                ToolResultArtifactStorage(config.artifacts_path / "investigation_receipts"),
                 capabilities,
             ),
             *prompt_policy_middleware,
@@ -266,10 +264,8 @@ def build_agent(
         backend=resolved_backend,
         subagents=[],
         skills=list(resolved.skill_sources),
-        response_format=(
-            ExecutorNarrativeResult if _experiment_mode else RepairOutcomeCandidate
-        ),
-        interrupt_on=merge_interrupt_on(core_interrupts, resolved.tools),
+        response_format=(ExecutorNarrativeResult if _experiment_mode else RepairOutcomeCandidate),
+        interrupt_on=None,
         checkpointer=checkpointer,
         name=("deepfix_experiment_executor" if _experiment_mode else "deepfix_repair_agent"),
     )

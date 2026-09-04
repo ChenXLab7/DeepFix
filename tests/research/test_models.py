@@ -3,11 +3,11 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from deepfix.models import Evidence
 from deepfix.research.models import (
     DependencyContext,
     DependencyFinding,
     ExternalEvidence,
+    LocalEvidenceReference,
     ResearchQuery,
     SearchCandidate,
 )
@@ -98,7 +98,7 @@ def test_external_evidence_converts_local_evidence_and_tracks_verification():
     )
 
     assert external.local_evidence == [
-        Evidence("tests/test_models.py:10", "pytest passed")
+        LocalEvidenceReference(source="tests/test_models.py:10", observation="pytest passed")
     ]
     assert external.local_verification == "verified"
 

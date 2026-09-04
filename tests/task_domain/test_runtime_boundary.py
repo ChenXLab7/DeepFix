@@ -8,11 +8,10 @@ from pydantic import ValidationError
 from deepfix.approval import ApprovalPolicy
 from deepfix.cli import print_task_list
 from deepfix.config import ApprovalMode, load_config
-from deepfix.models import RepairOutcome
 from deepfix.persistence import TaskRepository
-from deepfix.research.store import ResearchEvidenceStore
 from deepfix.service import BugfixService
 from deepfix.task_domain.models import TaskDefinition, TaskLifecycleStatus
+from deepfix.task_domain.outcome import RepairOutcomeCandidate
 from deepfix.task_domain.runtime import TaskRuntime
 
 FORBIDDEN_FACT_FIELDS = {
@@ -68,7 +67,7 @@ class _NeedsInputAgent:
         self.calls += 1
         return {
             "messages": [],
-            "structured_response": RepairOutcome(
+            "structured_response": RepairOutcomeCandidate(
                 status="needs_input",
                 question="Which Python version?",
                 summary="Need one environment detail",
@@ -88,7 +87,6 @@ def test_service_start_returns_runtime_projection_not_legacy_aggregate(
         tasks,
         ApprovalPolicy(config.approval_mode),
         config,
-        ResearchEvidenceStore(config.database_path),
     )
 
     result = service.start("parser fails")
@@ -116,16 +114,9 @@ def test_service_continue_returns_runtime_projection(tmp_path, monkeypatch) -> N
         tasks,
         ApprovalPolicy(config.approval_mode),
         config,
-        ResearchEvidenceStore(config.database_path),
     )
     for method_name in ("_load_current_task", "_save", "_sync_context"):
-        monkeypatch.setattr(
-            service,
-            method_name,
-            lambda *args, _name=method_name, **kwargs: pytest.fail(
-                f"bounded runtime called legacy method: {_name}"
-            ),
-        )
+        assert not hasattr(service, method_name)
     started = service.start("parser fails")
 
     continued = service.continue_task(started.task_id, "Python 3.12")
@@ -163,7 +154,6 @@ def test_pause_uses_lifecycle_without_legacy_task_projection(tmp_path, monkeypat
         tasks,
         ApprovalPolicy(config.approval_mode),
         config,
-        ResearchEvidenceStore(config.database_path),
     )
 
     result = service.pause_task("task-runtime-only", "user paused")
@@ -226,7 +216,6 @@ def test_pending_actions_are_read_from_graph_checkpoint_not_legacy_payload(
         tasks,
         ApprovalPolicy(config.approval_mode),
         config,
-        ResearchEvidenceStore(config.database_path),
     )
 
     actions = service.pending_actions("task-approval")
@@ -263,11 +252,7 @@ def test_cli_task_list_reads_definition_and_lifecycle_not_legacy_payload(
     tasks.transition_lifecycle(
         "task-list", TaskLifecycleStatus.RUNNING, expected_version=1
     )
-    monkeypatch.setattr(
-        tasks,
-        "list_recent",
-        lambda *args, **kwargs: pytest.fail("CLI must not load legacy TaskState"),
-    )
+    assert not hasattr(tasks, "list_recent")
     output: list[str] = []
 
     print_task_list(tasks, output_fn=output.append)

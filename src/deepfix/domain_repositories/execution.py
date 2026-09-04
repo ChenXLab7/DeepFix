@@ -281,7 +281,10 @@ class ExecutionRepository:
             ).fetchone()
             if row is not None:
                 existing = ExecutionApproval.model_validate_json(row[0])
-                if existing != approval:
+                same_identity = (
+                    existing.model_copy(update={"created_at": approval.created_at}) == approval
+                )
+                if not same_identity:
                     raise ExecutionIdentityConflict("approval identity conflict")
                 return existing
             connection.execute(
@@ -360,12 +363,9 @@ class ExecutionRepository:
                 return current
             if current.status is not expected:
                 raise OperationTransitionError(
-                    f"operation must be {expected.value} before {target.value}: "
-                    f"{operation_id}"
+                    f"operation must be {expected.value} before {target.value}: {operation_id}"
                 )
-            transitioned = current.model_copy(
-                update={"status": target, "updated_at": _now()}
-            )
+            transitioned = current.model_copy(update={"status": target, "updated_at": _now()})
             references = self._load_artifact_references(connection, operation_id)
             self._update_operation(connection, current.status, transitioned, references)
             return transitioned

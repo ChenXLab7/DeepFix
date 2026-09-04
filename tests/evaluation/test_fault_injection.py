@@ -8,27 +8,27 @@ from pathlib import Path
 import pytest
 
 from deepfix.compaction.models import FileChangeEvidence, ProvenanceRef, SystemTestEvidence
+from deepfix.domain_repositories.execution import ExecutionRepository
 from deepfix.execution import WorkspaceCommandPolicy
 from deepfix.investigation.evaluation import RepairLoopOutcome, adjudicate_outcome
 from deepfix.investigation.models import ExperimentClaimRecord, InvestigationState
-from deepfix.investigation.receipts import ToolExecutionReceiptStore
+from deepfix.investigation.receipts import ToolResultArtifactStorage
 from deepfix.investigation.stagnation import progress_fingerprint
 from deepfix.investigation.token_budget import TokenBudgetExhausted, TokenBudgetStore
 from deepfix.operations import (
     NewOperationEntry,
-    OperationJournalStore,
     OperationKind,
     OperationReconciler,
     OperationStateSnapshot,
     OperationStatus,
 )
+from deepfix.task_domain.repository import TaskRepository
 from deepfix.verification import (
     OracleConflictRule,
     OracleEvaluation,
     VerificationOracle,
     VerificationPolicy,
     VerificationPolicyConflict,
-    VerificationPolicyStore,
     evaluate_required_oracles,
 )
 from deepfix.workspace import WorkspaceFactory, WorkspacePathPolicy, WorkspaceScopeError
@@ -75,8 +75,8 @@ def _file_operation(workspace, *, operation_id="operation-1"):
 )
 def test_side_effect_fault_never_replays(fault, tmp_path) -> None:
     workspace = _workspace(tmp_path)
-    journal = OperationJournalStore(tmp_path / "state.db")
-    receipts = ToolExecutionReceiptStore(tmp_path / "artifacts" / "receipts")
+    journal = ExecutionRepository(tmp_path / "state.db")
+    artifacts = ToolResultArtifactStorage(tmp_path / "artifacts" / "receipts")
     side_effect_handler_calls = 0
 
     def apply_side_effect(content: str | None = None) -> None:
@@ -102,7 +102,7 @@ def test_side_effect_fault_never_replays(fault, tmp_path) -> None:
         terminated = []
         reconciler = OperationReconciler(
             journal,
-            receipts,
+            artifacts,
             terminate_process_group=lambda entry: terminated.append(entry.operation_id),
         )
         first = reconciler.reconcile_task("task-1", workspace.root)
@@ -115,7 +115,7 @@ def test_side_effect_fault_never_replays(fault, tmp_path) -> None:
         journal.prepare(operation)
         journal.mark_started(operation.operation_id)
         apply_side_effect("fixed\n")
-        reconciler = OperationReconciler(journal, receipts)
+        reconciler = OperationReconciler(journal, artifacts)
         if fault == "parallel_identical_side_effect_replay":
             with ThreadPoolExecutor(max_workers=4) as pool:
                 results = list(
@@ -132,8 +132,8 @@ def test_side_effect_fault_never_replays(fault, tmp_path) -> None:
             assert operation.operation_id in first.replayable_operation_ids
             second = reconciler.reconcile_task("task-1", workspace.root)
             assert second.replayable_operation_ids == [operation.operation_id]
-        assert receipts.load("task-1", operation.tool_call_id) is not None
-        assert journal.load(operation.operation_id).status is OperationStatus.OBSERVED
+        assert journal.load_receipt("task-1", operation.tool_call_id) is not None
+        assert journal.load_operation(operation.operation_id).status is OperationStatus.OBSERVED
 
     duplicate_side_effects = side_effect_handler_calls - 1
     assert side_effect_handler_calls == 1
@@ -244,12 +244,12 @@ def _test_evidence(
 
 
 def test_required_oracle_cannot_be_downgraded(tmp_path) -> None:
-    store = VerificationPolicyStore(tmp_path / "state.db")
+    store = TaskRepository(tmp_path / "state.db")
     policy = _policy()
-    store.save(policy)
+    store.save_verification_policy(policy)
 
     with pytest.raises(VerificationPolicyConflict):
-        store.save(
+        store.save_verification_policy(
             policy.model_copy(
                 update={
                     "version": 2,
@@ -342,7 +342,7 @@ def test_weak_claim_does_not_reset_progress_fingerprint() -> None:
                 ExperimentClaimRecord(
                     claim_id="weak-claim",
                     text="This might be related",
-                    sources=[ProvenanceRef(kind="working_memory", ref_id="memory-1")],
+                    sources=[ProvenanceRef(kind="snapshot_record", ref_id="snapshot-1")],
                     provenance_root_ids=[],
                 )
             ]

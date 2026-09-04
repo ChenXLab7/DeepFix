@@ -8,9 +8,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import ToolMessage
 from pydantic import SecretStr
 
 from deepfix.config import AppConfig, ApprovalMode, ModelRoleConfig
+from deepfix.domain_repositories import DomainRepositories
 from deepfix.evaluation.harness import EvaluationHarness
 from deepfix.evaluation.legacy import LegacyLoopRunner, _run_oracle
 from deepfix.evaluation.models import (
@@ -19,11 +21,13 @@ from deepfix.evaluation.models import (
     EvaluationRun,
     RunUsage,
 )
+from deepfix.investigation.receipts import receipt_from_result
 from deepfix.investigation.token_budget import (
     TokenBudgetCallbackHandler,
     TokenBudgetMiddleware,
 )
-from deepfix.models import TaskState, TaskStatus
+from deepfix.task_domain.models import AdjudicationDecision, TaskDefinition, TaskLifecycleStatus
+from deepfix.task_domain.runtime import TaskRuntime
 
 BUDGET = EvaluationBudget(
     max_input_tokens=100_000,
@@ -320,11 +324,54 @@ def _app_config(workspace: Path, run_dir: Path) -> AppConfig:
 
 
 class FakeService:
-    def __init__(self, task: TaskState) -> None:
+    def __init__(self, task: TaskRuntime) -> None:
         self.task = task
         self.problems: list[str] = []
+        workspace = Path(task._workspace)
+        self.repositories = DomainRepositories.create(workspace / "evaluation-test.db")
+        self.repository = self.repositories.tasks
+        self.repository.create_definition(
+            TaskDefinition(
+                task_id=task.task_id,
+                original_message_id="message-evaluation",
+                original_problem="fixture",
+                approval_mode="guarded",
+                source_project_root=str(workspace),
+                workspace_root=str(workspace),
+                workspace_baseline_id=None,
+                project_python=sys.executable,
+                confinement_level="legacy_local",
+                created_at="2026-08-31T00:00:00+00:00",
+            )
+        )
+        resolution = getattr(task, "_resolution", None)
+        if resolution is not None:
+            self.repository.record_adjudication(
+                AdjudicationDecision(
+                    decision_id="decision-evaluation",
+                    task_id=task.task_id,
+                    outcome=resolution,
+                    decided_at="2026-08-31T00:00:00+00:00",
+                )
+            )
+        for index in range(int(getattr(task, "_tool_calls", 0))):
+            call_id = f"tool-{index + 1}"
+            self.repositories.execution.record_receipt(
+                receipt_from_result(
+                    task.task_id,
+                    {
+                        "name": "read_file",
+                        "id": call_id,
+                        "args": {"file_path": "sample.py"},
+                        "type": "tool_call",
+                    },
+                    ToolMessage(
+                        content="ok", name="read_file", tool_call_id=call_id
+                    ),
+                )
+            )
 
-    def start(self, problem: str) -> TaskState:
+    def start(self, problem: str) -> TaskRuntime:
         self.problems.append(problem)
         return self.task
 
@@ -332,19 +379,16 @@ class FakeService:
 def _task(
     workspace: Path,
     *,
-    status: TaskStatus,
+    status: TaskLifecycleStatus,
     resolution: str | None = None,
-) -> TaskState:
-    task = TaskState.create(
-        workspace,
-        "fixture",
-        ApprovalMode.GUARDED,
-        sys.executable,
+) -> TaskRuntime:
+    task = TaskRuntime(
+        task_id="task-evaluation",
+        lifecycle=status,
     )
-    task.task_id = "task-evaluation"
-    task.status = status
-    task.resolution = resolution
-    task.processed_tool_call_ids = ["tool-1", "tool-2"]
+    object.__setattr__(task, "_workspace", str(workspace))
+    object.__setattr__(task, "_resolution", resolution)
+    object.__setattr__(task, "_tool_calls", 2)
     return task
 
 
@@ -369,7 +413,7 @@ def test_legacy_runner_invokes_service_oracle_and_trace_summary(tmp_path) -> Non
         encoding="utf-8",
     )
     service = FakeService(
-        _task(workspace, status=TaskStatus.COMPLETED, resolution="fixed")
+        _task(workspace, status=TaskLifecycleStatus.COMPLETED, resolution="fixed")
     )
     seen_oracles: list[tuple[str, Path, int, Path]] = []
 
@@ -457,7 +501,7 @@ def test_default_legacy_runner_receives_runtime_token_budget(
         )
         evaluation_middleware.store.charge_unknown(compact.reservation_id)
         yield FakeService(
-            _task(workspace, status=TaskStatus.COMPLETED, resolution="fixed")
+            _task(workspace, status=TaskLifecycleStatus.COMPLETED, resolution="fixed")
         )
 
     monkeypatch.setattr(
@@ -542,15 +586,18 @@ def test_legacy_runner_does_not_approve_manual_actions(tmp_path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     config = _app_config(workspace, run_dir)
-    task = _task(workspace, status=TaskStatus.WAITING_APPROVAL)
-    task.pending_actions = [
+    task = _task(workspace, status=TaskLifecycleStatus.WAITING_APPROVAL)
+    task = task.model_copy(update={"pending_actions": [
         {
             "name": "execute",
             "policy_action": "ask",
             "risk": "L2",
             "args": {"command": "custom-command"},
         }
-    ]
+    ]})
+    object.__setattr__(task, "_workspace", str(workspace))
+    object.__setattr__(task, "_resolution", None)
+    object.__setattr__(task, "_tool_calls", 2)
 
     @contextmanager
     def service_factory(_config):
@@ -588,7 +635,7 @@ def test_default_legacy_config_is_isolated_below_run_directory(
     def service_factory(config: AppConfig):
         captured.append(config)
         yield FakeService(
-            _task(workspace, status=TaskStatus.COMPLETED, resolution="fixed")
+            _task(workspace, status=TaskLifecycleStatus.COMPLETED, resolution="fixed")
         )
 
     times = iter([1.0, 2.0])

@@ -343,9 +343,7 @@ class InvestigationMiddleware(AgentMiddleware):
     ) -> OperationJournalEntry | None:
         if name not in _SIDE_EFFECT_KINDS:
             return None
-        return self.execution.load_operation(
-            stable_investigation_id("operation", task_id, call_id)
-        )
+        return self.execution.load_operation(stable_investigation_id("operation", task_id, call_id))
 
     def _prepare_operation(
         self,
@@ -399,8 +397,8 @@ class InvestigationMiddleware(AgentMiddleware):
             if isinstance(value, str):
                 content = value
         elif name == "edit_file" and pre_state.target_path:
-            task = self.coordinator.tasks.get(task_id)
-            target = Path(task.workspace_root or task.project_root) / pre_state.target_path
+            task = self.coordinator.tasks.get_definition(task_id)
+            target = Path(task.workspace_root) / pre_state.target_path
             old = arguments.get("old_string")
             new = arguments.get("new_string")
             if target.is_file() and isinstance(old, str) and isinstance(new, str):
@@ -426,8 +424,8 @@ class InvestigationMiddleware(AgentMiddleware):
         *,
         result: ToolMessage | None = None,
     ) -> OperationStateSnapshot:
-        task = self.coordinator.tasks.get(task_id)
-        workspace = Path(task.workspace_root or task.project_root)
+        task = self.coordinator.tasks.get_definition(task_id)
+        workspace = Path(task.workspace_root)
         name = str(request.tool_call.get("name", "")).strip()
         arguments = _tool_arguments(request.tool_call)
         if name == "execute":

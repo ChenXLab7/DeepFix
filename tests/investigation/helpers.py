@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.models import SystemTestEvidence
-from deepfix.compaction.store import CompactionStore
+from deepfix.domain_repositories import DomainRepositories
+from deepfix.domain_repositories.evidence import EvidenceRepository
+from deepfix.domain_repositories.investigation import InvestigationRepository
 from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.models import (
@@ -17,54 +18,52 @@ from deepfix.investigation.models import (
     RecordHypothesisInput,
     ScopeKind,
 )
-from deepfix.investigation.store import InvestigationStore
-from deepfix.models import TaskState, TaskStatus
-from deepfix.persistence import TaskRepository
-from deepfix.research.store import ResearchEvidenceStore
+from deepfix.task_domain.models import TaskDefinition
 
 
 def coordinator_fixture(tmp_path: Path) -> InvestigationCoordinator:
     database = tmp_path / "deepfix.sqlite3"
-    tasks = TaskRepository(database)
-    tasks.save(
-        TaskState(
+    repositories = DomainRepositories.create(database)
+    repositories.tasks.create_definition(
+        TaskDefinition(
             task_id="task-a",
-            project_root=str(tmp_path),
-            project_python=sys.executable,
-            user_problem="sign bug",
+            original_message_id="message-user",
+            original_problem="sign bug",
             approval_mode="manual",
-            status=TaskStatus.INVESTIGATING,
+            source_project_root=str(tmp_path),
+            workspace_root=str(tmp_path),
             workspace_baseline_id="baseline-task-a",
+            project_python="python",
+            confinement_level="workspace",
+            created_at="2026-08-31T00:00:00+00:00",
         )
     )
-    compaction = CompactionStore(database)
     return InvestigationCoordinator(
-        store=InvestigationStore(database),
-        tasks=tasks,
-        compaction_store=compaction,
-        evidence_collector=EvidenceCollector(
-            compaction,
-            ResearchEvidenceStore(database),
-        ),
+        store=repositories.investigation,
+        tasks=repositories.tasks,
+        evidence_repository=repositories.evidence,
+        evidence_collector=EvidenceCollector(repositories.evidence),
     )
 
 
-def seed_evidence(store: CompactionStore, task_id: str, evidence_id: str) -> None:
-    store.save_evidence(
+def seed_evidence(store: EvidenceRepository, task_id: str, evidence_id: str) -> None:
+    evidence = SystemTestEvidence(
+        evidence_id=evidence_id,
+        command="python -m pytest -q",
+        exit_code=1,
+        summary="1 failed",
+        tool_call_id=f"call-{evidence_id}",
+        source_message_id=f"msg-{evidence_id}",
+    )
+    store.record_deterministic(
         task_id,
-        SystemTestEvidence(
-            evidence_id=evidence_id,
-            command="python -m pytest -q",
-            exit_code=1,
-            summary="1 failed",
-            tool_call_id=f"call-{evidence_id}",
-            source_message_id=f"msg-{evidence_id}",
-        ),
+        evidence,
+        provenance_root_ids=[evidence.evidence_id],
     )
 
 
 def seed_checked_location(
-    store: InvestigationStore,
+    store: InvestigationRepository,
     task_id: str,
     path: str,
     start_line: int,

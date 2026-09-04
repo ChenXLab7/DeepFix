@@ -13,9 +13,8 @@ from deepfix.compaction.errors import ContextRecoveryRequired
 from deepfix.compaction.middleware import DeepFixCompactionMiddleware
 from deepfix.compaction.models import CompactionDelta, DeterministicEvidenceBlock, TaskAnchor
 from deepfix.compaction.snapshot import CompactionSnapshotBuilder
-from deepfix.compaction.store import CompactionStore
+from deepfix.domain_repositories import DomainRepositories
 from deepfix.domain_repositories.execution import ExecutionIntegrity
-from deepfix.domain_repositories.history import HistoryRepository
 from deepfix.protected_context import ProtectedContext
 
 from .test_middleware import _request
@@ -104,7 +103,8 @@ def _empty_delta():
 
 def _middleware(tmp_path, adapter=None):
     database = tmp_path / "deepfix.sqlite3"
-    history = HistoryRepository(database)
+    repositories = DomainRepositories.create(database)
+    history = repositories.history
     coordinator = CompactionCoordinator(
         adapter=adapter
         or DeepAgentsArtifactAdapter(
@@ -112,8 +112,9 @@ def _middleware(tmp_path, adapter=None):
         ),
         delta_generator=_Delta(),
         snapshot_builder=CompactionSnapshotBuilder(),
-        snapshot_store=CompactionStore(database),
         history_repository=history,
+        evidence_repository=repositories.evidence,
+        investigation_repository=repositories.investigation,
     )
     return DeepFixCompactionMiddleware(_ProtectedBuilder(), _Budget(), coordinator), history
 
