@@ -106,8 +106,8 @@ conversation summaries / report fields
 
 **Status:** COMPLETE — Tasks 1–8, migration cutover hardening, bounded repository
 wiring, focused/trusted/core offline gates, and exact completion evidence recorded
-in `2026-08-28-deepfix-domain-repository-consolidation.md` on 2026-08-30.
-Awaiting user review before Plan 4 begins.
+in `2026-08-28-deepfix-domain-repository-consolidation.md` on 2026-08-30;
+its review gate was accepted before Plan 4 execution.
 
 **Planned document:** `docs/superpowers/plans/2026-08-28-deepfix-domain-repository-consolidation.md`
 
@@ -127,6 +127,8 @@ Awaiting user review before Plan 4 begins.
 **Review gate:** Migration tests prove stable IDs, counts, hashes, provenance roots, and Artifact references survive; parallel Receipt writes remain idempotent; fault injection produces no duplicate side effect; current domain records override stale Snapshot projections; legacy Store writes can be disabled without losing restore or reporting data.
 
 ### Plan 4: Legacy Authority Retirement and Pure Adjudication
+
+**Status:** COMPLETE — implementation, repository-native migration/recovery hardening, full offline verification, and independent code review completed on 2026-09-04. Awaiting user review before any merge or push.
 
 **Planned document:** `docs/superpowers/plans/2026-08-28-deepfix-legacy-state-retirement.md`
 

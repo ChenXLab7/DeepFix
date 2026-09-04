@@ -14,7 +14,7 @@
 
 **Prerequisite:** Plan 3 is complete at commit `1ad8885` with migration cutover hardening at `5521219`.
 
-**Status:** READY FOR REVIEW — implementation has not started.
+**Status:** COMPLETE — implementation, offline verification, and independent code review completed on 2026-09-04. Awaiting user review before any merge or push.
 
 ## Frozen Authority Rules
 
@@ -650,7 +650,7 @@ python -m pytest tests/task_domain/test_migration.py tests/domain_repositories/t
 python -m ruff check src/deepfix tests
 ```
 
-- [ ] **Step 8: Commit.**
+- [x] **Step 8: Commit.**
 
 ```powershell
 git add -A src/deepfix tests
@@ -665,7 +665,7 @@ git commit -m "refactor: retire legacy state and store facades"
 - Modify: `docs/superpowers/plans/2026-08-28-deepfix-state-authority-migration-program.md` — mark Plan 4 complete only after all gates pass
 - Modify: any test-only import cleanup found by the final gate
 
-- [ ] **Step 1: Inspect final Agent middleware/tool construction.**
+- [x] **Step 1: Inspect final Agent middleware/tool construction.**
 
 Required production order/ownership:
 
@@ -680,13 +680,13 @@ Required production order/ownership:
 
 There must be no separate Phase middleware, duplicate context injector, Working Memory middleware, or public catch-all progress tool.
 
-- [ ] **Step 2: Run focused final suites.**
+- [x] **Step 2: Run focused final suites.**
 
 ```powershell
 python -m pytest tests/task_domain tests/domain_repositories tests/navigation tests/compaction tests/investigation tests/artifact_retrieval tests/research tests/test_agent.py tests/test_service.py tests/test_cli.py tests/test_reporting.py tests/test_operations.py tests/test_verification.py -q
 ```
 
-- [ ] **Step 3: Run the trusted offline core suite.**
+- [x] **Step 3: Run the trusted offline core suite.**
 
 Use the repository's established core selector and preserve the known Windows environment exclusions only when they reproduce the previously documented `_overlapped`/WinError 10106 infrastructure failure. Do not silently add new exclusions.
 
@@ -694,7 +694,7 @@ Use the repository's established core selector and preserve the known Windows en
 python -m pytest -q
 ```
 
-- [ ] **Step 4: Run formatting, source, and diff gates.**
+- [x] **Step 4: Run formatting, source, and diff gates.**
 
 ```powershell
 python -m ruff check src tests
@@ -702,15 +702,15 @@ git diff --check
 rg -n "TaskState|WorkingMemoryStore|AgentPhase|PhaseResolver|PHASE_PROMPTS|LegacyNavigationFeedbackSource|save_progress|continue_investigation" src/deepfix
 ```
 
-- [ ] **Step 5: Record exact evidence.**
+- [x] **Step 5: Record exact evidence.**
 
 Update this document with commands, pass/fail/skip counts, known environment-only failures, removal-search results, commit IDs, and remaining migration-only references. Do not write “all passed” without command output.
 
-- [ ] **Step 6: Request code review.**
+- [x] **Step 6: Request code review.**
 
 Use `superpowers:requesting-code-review` against the Plan 4 diff. Fix correctness/authority/recovery findings with TDD and rerun affected gates.
 
-- [ ] **Step 7: Mark the program complete and commit docs.**
+- [x] **Step 7: Mark the program complete and commit docs.**
 
 Only after review and verification:
 
@@ -718,6 +718,18 @@ Only after review and verification:
 git add docs/superpowers/plans/2026-08-28-deepfix-legacy-state-retirement.md docs/superpowers/plans/2026-08-28-deepfix-state-authority-migration-program.md
 git commit -m "docs: record legacy authority retirement"
 ```
+
+### Task 9 Completion Evidence
+
+- **Final production construction:** stable Message identity → DeepAgents native Todo → Todo navigation feedback → legacy migration guard for unswitched historical tasks → explicit DeepAgents `HumanInTheLoopMiddleware` → DeepFix Investigation/Operation/Receipt middleware → stable prompt policy → the single protected-context/compaction owner → optional extensions/trace → DeepAgents backend. There is no production Phase middleware, Working Memory middleware, duplicate protected-context injector, or catch-all progress tool.
+- **Focused repository-native suites:** `498 passed in 69.50s` across task-domain, repositories, navigation, compaction, investigation, artifact retrieval, research, Agent, service/runtime, CLI, operations, and verification coverage.
+- **Final trusted offline suite:** with `PYTHONPATH` bound to this worktree's `src`, `pytest -q` completed with `873 passed, 2 skipped, 2 deselected in 98.70s`. The two skips are the existing Windows symlink/junction capability exclusions; the two deselections are online tests. No new exclusion was added.
+- **Static/diff gates:** `python -m ruff check src tests` returned `All checks passed!`; `git diff --check` exited successfully.
+- **Retirement source gate:** the required production-symbol search returned no matches (`NO_RETIRED_RUNTIME_SYMBOLS`). References that remain are confined to the one-way migration implementation in `domain_repositories/migration.py`, the migration-only parser in `task_domain/legacy_payload.py`, historical table/field decoding, and evaluation terminology. These paths reconstruct bounded repository records and do not instantiate a runtime authority.
+- **Recovery and authority hardening:** migration reports that are not ready now pause before Agent invocation; sanitized typed migration failures reach `BugfixService`; legacy approvals migrate from the projection; historical task backfill is atomic; HITL interrupts occur before external-operation preparation; unresolved `STARTED` operations remain fail-closed; approval identity is stable within one interrupt and distinct across later approval rounds.
+- **Independent review:** initial review identified migration-readiness, approval migration/identity, side-effect recovery, atomicity, and removed-test coverage gaps. They were fixed with focused regression tests. Final reviewer verdict: no remaining Critical or Important findings; ready for integration review.
+- **Task 9 implementation commit:** `5a030a5` (`fix: harden legacy authority retirement`). Earlier retirement cutover commit: `75ab620` (`refactor: retire legacy state and store facades`).
+- **Scope boundary:** no paid QuixBugs run or formal A/B benchmark was executed. No Gitee push or branch merge was performed.
 
 ### Final Review Checkpoint
 
@@ -745,21 +757,21 @@ Present to the user before any merge/push:
 
 Plan 4 is complete only when all of the following are true:
 
-- [ ] DeepAgents/LangGraph remain the only Agent Loop, Message, Todo, Checkpoint, interrupt, and resume owners.
-- [ ] Five bounded repositories are the only current business-state persistence authorities.
-- [ ] OutcomeAdjudicator is deterministic/pure and persists only outcome plus supporting IDs.
-- [ ] Required oracle conflicts, scope violations, unknown operations, and missing post-change verification prevent false `fixed`.
-- [ ] `TaskReportView` is assembled at read time and is not persisted.
-- [ ] Protected Context is injected exactly once and deduplicates constraint/evidence/hypothesis IDs.
-- [ ] Current domain state overrides stale Snapshot semantics while provenance remains visible.
-- [ ] Todo reminder behavior and Graph State schema remain unchanged.
-- [ ] Phase, phase prompt/tool gating, `continue_investigation`, `save_progress`, and Working Memory are absent from production runtime.
-- [ ] Service runtime contains no duplicate fact/conversation aggregate.
-- [ ] Old Store class names are absent from production construction paths.
-- [ ] Historical restore works through migration-only parsing and LangGraph Checkpoint.
-- [ ] Approval, confinement, Receipt idempotency, Operation recovery, Artifact integrity, compaction atomicity, overflow single retry, and required-oracle tests remain green.
-- [ ] Focused and core offline gates are recorded with exact evidence.
-- [ ] No online QuixBugs or formal A/B benchmark was run.
+- [x] DeepAgents/LangGraph remain the only Agent Loop, Message, Todo, Checkpoint, interrupt, and resume owners.
+- [x] Five bounded repositories are the only current business-state persistence authorities.
+- [x] OutcomeAdjudicator is deterministic/pure and persists only outcome plus supporting IDs.
+- [x] Required oracle conflicts, scope violations, unknown operations, and missing post-change verification prevent false `fixed`.
+- [x] `TaskReportView` is assembled at read time and is not persisted.
+- [x] Protected Context is injected exactly once and deduplicates constraint/evidence/hypothesis IDs.
+- [x] Current domain state overrides stale Snapshot semantics while provenance remains visible.
+- [x] Todo reminder behavior and Graph State schema remain unchanged.
+- [x] Phase, phase prompt/tool gating, `continue_investigation`, `save_progress`, and Working Memory are absent from production runtime.
+- [x] Service runtime contains no duplicate fact/conversation aggregate.
+- [x] Old Store class names are absent from production construction paths.
+- [x] Historical restore works through migration-only parsing and LangGraph Checkpoint.
+- [x] Approval, confinement, Receipt idempotency, Operation recovery, Artifact integrity, compaction atomicity, overflow single retry, and required-oracle tests remain green.
+- [x] Focused and core offline gates are recorded with exact evidence.
+- [x] No online QuixBugs or formal A/B benchmark was run.
 
 ## Self-Review Checklist
 
