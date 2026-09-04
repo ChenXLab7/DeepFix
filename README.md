@@ -23,7 +23,7 @@ DEEPFIX_COMPACTION_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPFIX_DIAGNOSTIC_TIMEOUT_SECONDS=10
 DEEPFIX_VERIFICATION_TIMEOUT_SECONDS=120
-DEEPFIX_MAX_GRAPH_STEPS=40
+DEEPFIX_MAX_GRAPH_STEPS=80
 ```
 
 进程环境变量优先于这个文件。不要把真实 API Key 写进源码、配置样例、测试或 Git 历史，也不要提交
@@ -33,7 +33,8 @@ Shell 执行有两级不可突破的硬上限：普通诊断命令默认 10 秒�
 120 秒。模型提供的 `timeout` 只能缩短、不能提高上限。超时会终止整个进程树，并以
 `exit_code=124` 和 `timed_out=true` 返回给 Agent，供其判断死循环或阻塞原因。
 
-单次 Agent Graph 执行默认最多 40 个步骤。达到上限通常表示模型陷入重复工具调用，
+单次 Agent Graph 执行默认最多 80 个步骤。Graph Step 包含模型、工具和状态节点，
+并不等于 LLM 调用次数。达到上限通常表示模型陷入重复工具调用，
 DeepFix 会暂停任务并保留恢复状态，而不是继续消耗模型调用。可以通过
 `DEEPFIX_MAX_GRAPH_STEPS` 调低或调高该上限。
 
@@ -43,6 +44,18 @@ DeepFix 会暂停任务并保留恢复状态，而不是继续消耗模型调用
 deepfix new --project 'C:\projects\broken-python-app' `
   --python 'C:\projects\broken-python-app\.venv\Scripts\python.exe' `
   --mode manual '运行 pytest 时 test_divide 失败'
+```
+
+DeepFix 沙箱设置 `PYTHONNOUSERSITE=1`，不会加载用户目录中的 Python 包。如果 pytest
+插件只安装在 user site-packages 中，应为目标项目建立独立虚拟环境，将 pytest 及所需
+插件安装到该环境，再通过 `--python` 传入虚拟环境解释器。例如：
+
+```powershell
+python -m venv "$env:TEMP\deepfix-project-venv"
+& "$env:TEMP\deepfix-project-venv\Scripts\python.exe" -m pip install pytest pytest-timeout
+deepfix new --project 'C:\projects\broken-python-app' `
+  --python "$env:TEMP\deepfix-project-venv\Scripts\python.exe" `
+  --mode manual '修复失败测试并运行 pytest --timeout=5 验证'
 ```
 
 ## 终端命令

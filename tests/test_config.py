@@ -64,6 +64,7 @@ def test_load_config_resolves_project_and_state_paths(tmp_path, monkeypatch):
     assert config.approval_mode is ApprovalMode.MANUAL
     assert config.diagnostic_timeout_seconds == 10
     assert config.verification_timeout_seconds == 120
+    assert config.max_graph_steps == 80
 
 
 def test_load_config_accepts_separate_shell_timeout_limits(tmp_path, monkeypatch):

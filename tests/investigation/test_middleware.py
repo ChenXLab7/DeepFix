@@ -540,6 +540,34 @@ def test_pytest_usage_error_is_feedback_not_bug_reproduction(tmp_path):
     assert state.diagnostic_test_count_since_decision == 0
 
 
+def test_missing_timeout_plugin_explains_isolated_environment_recovery(tmp_path):
+    middleware = middleware_fixture(tmp_path, phase="investigating")
+    request = tool_request(
+        "execute",
+        "pytest-timeout-missing",
+        {
+            "command": (
+                "python -m pytest python_testcases/test_find_in_sorted.py "
+                "-q --timeout=5"
+            )
+        },
+    )
+    raw_result = ToolMessage(
+        id="msg-pytest-timeout-missing",
+        content="ERROR: unrecognized arguments: --timeout=5",
+        tool_call_id="pytest-timeout-missing",
+        artifact={"exit_code": 4},
+    )
+
+    result = middleware.wrap_tool_call(request, lambda _request: raw_result)
+
+    feedback = str(result.content)
+    assert "PYTHONNOUSERSITE=1" in feedback
+    assert "pytest-timeout" in feedback
+    assert "独立虚拟环境" in feedback
+    assert "--python" in feedback
+
+
 def test_post_edit_failure_records_fact_but_does_not_gate_tools(tmp_path):
     middleware = middleware_fixture(tmp_path, phase="planning")
     middleware.wrap_tool_call(

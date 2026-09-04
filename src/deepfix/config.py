@@ -42,7 +42,7 @@ class AppConfig:
     max_changed_files: int = 10
     max_agent_invocations: int = 30
     max_consecutive_test_failures: int = 3
-    max_graph_steps: int = 40
+    max_graph_steps: int = 80
     workspaces_path: Path | None = None
 
 
@@ -91,7 +91,7 @@ def load_config(
         "DEEPFIX_VERIFICATION_TIMEOUT_SECONDS",
         120,
     )
-    max_graph_steps = _positive_int("DEEPFIX_MAX_GRAPH_STEPS", 40)
+    max_graph_steps = _positive_int("DEEPFIX_MAX_GRAPH_STEPS", 80)
     database_path = state_database_path()
     artifacts_path = database_path.parent / "artifacts"
     artifacts_path.mkdir(parents=True, exist_ok=True)

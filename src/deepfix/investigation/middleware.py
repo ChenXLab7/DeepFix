@@ -540,11 +540,20 @@ def _classify_pytest_infrastructure_result(
         return result
     if artifact.get("result_type") == "pytest_infrastructure_error":
         return result
+    recovery_guidance = ""
+    raw_content = str(result.content)
+    if "unrecognized arguments" in raw_content.lower() and "--timeout" in raw_content:
+        recovery_guidance = (
+            "检测到 --timeout 无法识别。DeepFix 沙箱保留 PYTHONNOUSERSITE=1，"
+            "不会加载用户目录中的 pytest-timeout。请创建独立虚拟环境，"
+            "在其中安装 pytest 与 pytest-timeout，并通过 --python 指向该环境后重试。"
+        )
     content = (
         "pytest 返回 exit_code=4：这是用法、配置或测试入口错误，"
         "测试断言尚未执行，不能视为 Bug 已复现。"
-        "请停止代码根因调查并返回 needs_input，说明具体基础设施错误。\n\n"
-        + str(result.content)
+        "请停止代码根因调查并返回 needs_input，说明具体基础设施错误。"
+        + (f"{recovery_guidance}\n\n" if recovery_guidance else "\n\n")
+        + raw_content
     )
     return result.model_copy(
         update={

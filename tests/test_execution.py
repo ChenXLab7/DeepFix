@@ -93,7 +93,7 @@ from pathlib import Path
 def test_environment_is_task_scoped():
     Path('environment.json').write_text(json.dumps({
         name: os.environ[name]
-        for name in ('HOME', 'USERPROFILE', 'TEMP', 'TMP', 'PIP_CONFIG_FILE', 'GIT_CONFIG_GLOBAL')
+        for name in ('HOME', 'USERPROFILE', 'TEMP', 'TMP', 'PIP_CONFIG_FILE', 'GIT_CONFIG_GLOBAL', 'PYTHONNOUSERSITE')
     }), encoding='utf-8')
 """.lstrip(),
         encoding="utf-8",
@@ -118,6 +118,7 @@ def test_environment_is_task_scoped():
     assert second.exit_code == 126
     assert "already consumed" in second.output.lower()
     environment = json.loads(output_file.read_text(encoding="utf-8"))
+    assert environment.pop("PYTHONNOUSERSITE") == "1"
     assert all(
         _is_relative_to(Path(value), workspace.root)
         for value in environment.values()
