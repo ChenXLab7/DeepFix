@@ -163,6 +163,12 @@ class BugfixService:
         if migration_failure is not None:
             return migration_failure
         lifecycle = self.repository.get_lifecycle(task_id)
+        if lifecycle.status in {
+            TaskLifecycleStatus.COMPLETED,
+            TaskLifecycleStatus.FAILED,
+            TaskLifecycleStatus.CANCELLED,
+        }:
+            raise ValueError("终态任务不能继续")
         checkpoint_actions = self.pending_actions(task_id)
         if (
             lifecycle.status is TaskLifecycleStatus.PAUSED
@@ -338,6 +344,11 @@ class BugfixService:
             )
         except Exception as exc:  # noqa: BLE001 - persist Agent boundary failure
             safe_error = redact_config_secrets(str(exc), self.config)
+            if _is_model_provider_error(exc):
+                return self._pause_authority(
+                    task_id,
+                    f"模型服务调用需要恢复：{type(exc).__name__}: {safe_error}",
+                )
             return self._fail_authority(task_id, f"Agent 执行失败: {safe_error}")
 
         messages = ensure_message_ids(task_id, result.get("messages", [])).messages
@@ -755,3 +766,14 @@ class BugfixService:
     @staticmethod
     def _is_pytest(command: str, project_python: str) -> bool:
         return is_pytest_verification(command, project_python)
+
+
+def _is_model_provider_error(error: Exception) -> bool:
+    recoverable_bases = {
+        ("httpx", "TransportError"),
+        ("openai", "APIError"),
+    }
+    return any(
+        (base.__module__, base.__name__) in recoverable_bases
+        for base in type(error).__mro__
+    )

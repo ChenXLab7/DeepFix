@@ -5,7 +5,9 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from httpx import Request, Response, StreamConsumed
 from langgraph.types import Interrupt
+from openai import BadRequestError
 
 from deepfix.approval import ApprovalPolicy
 from deepfix.compaction.errors import ContextRecoveryRequired
@@ -138,6 +140,15 @@ def approval_interrupt(interrupt_id: str = "approval-1"):
             ),
         )
     }
+
+
+def provider_bad_request() -> BadRequestError:
+    request = Request("POST", "https://provider.example/v1/chat/completions")
+    return BadRequestError(
+        "provider rejected one request",
+        response=Response(400, request=request),
+        body={"code": "InvalidParameter", "param": ""},
+    )
 
 
 def test_service_creates_canonical_state_in_dependency_order(config) -> None:
@@ -328,6 +339,42 @@ def test_service_boundaries_update_business_lifecycle(config) -> None:
     assert (
         failed_service.repository.get_lifecycle(failed.task_id).status is TaskLifecycleStatus.FAILED
     )
+
+
+def test_provider_error_pauses_and_resume_can_reach_approval(config) -> None:
+    agent = FakeAgent(provider_bad_request(), approval_interrupt())
+    service = service_for(config, agent)
+
+    paused = service.start("供应商临时拒绝后允许恢复")
+
+    assert paused.lifecycle is TaskLifecycleStatus.PAUSED
+    assert paused.pause_reason is not None
+    assert "BadRequestError" in paused.pause_reason
+
+    waiting = service.continue_task(paused.task_id, "重试并继续验证")
+
+    assert waiting.lifecycle is TaskLifecycleStatus.WAITING_APPROVAL
+    assert [action["name"] for action in waiting.pending_actions] == ["execute"]
+    assert agent.invocations == 2
+
+
+def test_failed_task_rejects_resume_before_agent_invocation(config) -> None:
+    agent = FakeAgent(RuntimeError("internal bug"))
+    service = service_for(config, agent)
+    failed = service.start("内部错误保持终态")
+
+    with pytest.raises(ValueError, match="终态任务不能继续"):
+        service.continue_task(failed.task_id, "不要再次调用模型")
+
+    assert agent.invocations == 1
+
+
+def test_local_http_client_usage_error_remains_failed(config) -> None:
+    service = service_for(config, FakeAgent(StreamConsumed()))
+
+    failed = service.start("本地 HTTP 客户端使用错误不是可恢复的供应商错误")
+
+    assert failed.lifecycle is TaskLifecycleStatus.FAILED
 
 
 def test_rejected_approval_is_recorded_and_resumes_same_task(config) -> None:
