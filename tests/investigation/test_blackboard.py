@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from deepfix.compaction.models import (
     CompactionSnapshot,
     DeterministicEvidenceBlock,
@@ -126,3 +128,17 @@ def test_blackboard_rejects_context_from_another_task() -> None:
         assert "task mismatch" in str(exc)
     else:
         raise AssertionError("cross-task context must be rejected")
+
+
+def test_pytest_usage_error_does_not_mark_bug_reproduced() -> None:
+    usage_error = _test_evidence(exit_code=4)
+    context = _context()
+    context = replace(
+        context,
+        deterministic_evidence=DeterministicEvidenceBlock(tests=[usage_error]),
+        active_snapshot=None,
+    )
+
+    view = CaseBlackboardBuilder(lambda _task_id: context).build("task-1")
+
+    assert view.reproduction_state == "unknown"

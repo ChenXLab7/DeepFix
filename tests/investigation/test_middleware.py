@@ -523,6 +523,23 @@ def test_real_pytest_tool_message_records_failure_without_phase_events(tmp_path)
     assert result.artifact["exit_code"] == 1
 
 
+def test_pytest_usage_error_is_feedback_not_bug_reproduction(tmp_path):
+    middleware = middleware_fixture(tmp_path, phase="investigating")
+
+    result = middleware.wrap_tool_call(
+        pytest_tool_request(),
+        lambda request: pytest_result(exit_code=4),
+    )
+
+    events = middleware.coordinator.store.list_events("task-a")
+    state = middleware.coordinator.state("task-a")
+    assert result.artifact["result_type"] == "pytest_infrastructure_error"
+    assert result.artifact["error_code"] == "pytest_usage_error"
+    assert "测试断言尚未执行" in str(result.content)
+    assert events[-1].event_type == "tool_completed"
+    assert state.diagnostic_test_count_since_decision == 0
+
+
 def test_post_edit_failure_records_fact_but_does_not_gate_tools(tmp_path):
     middleware = middleware_fixture(tmp_path, phase="planning")
     middleware.wrap_tool_call(

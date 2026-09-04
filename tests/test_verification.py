@@ -13,6 +13,8 @@ from deepfix.verification import (
     VerificationPolicyBuilder,
     VerificationPolicyConflict,
     evaluate_required_oracles,
+    pytest_target_paths,
+    unavailable_required_oracle_paths,
 )
 from deepfix.workspace import WorkspaceFactory
 
@@ -163,6 +165,108 @@ def test_required_unavailable_and_related_suite_failure_block_fixed(
     assert conflict.all_required_satisfied is True
     assert conflict.fixed_allowed is False
     assert conflict.conflicting_evidence_ids == ["suite-failure"]
+
+
+def test_pytest_usage_error_keeps_required_oracle_unavailable(
+    task_workspace,
+    task,
+):
+    policy = VerificationPolicyBuilder().build(task, task_workspace)
+    oracle = policy.required_oracles[0]
+    usage_error = _test_evidence(
+        oracle.command,
+        origin="user_specified",
+        scope="targeted",
+        exit_code=4,
+        evidence_id="pytest-usage-error",
+    ).model_copy(
+        update={
+            "summary": "pytest: error: unrecognized arguments: --timeout=5"
+        }
+    )
+
+    evaluation = evaluate_required_oracles(policy, [usage_error])
+
+    assert evaluation.unavailable_required_oracle_ids == [oracle.oracle_id]
+    assert evaluation.failed_required_oracle_ids == []
+    assert evaluation.fixed_allowed is False
+
+
+def test_pytest_usage_error_is_not_a_repository_failure_conflict(
+    task_workspace,
+    task,
+):
+    policy = VerificationPolicyBuilder().build(task, task_workspace)
+    oracle = policy.required_oracles[0]
+    targeted_pass = _test_evidence(
+        oracle.command,
+        origin="user_specified",
+        scope="targeted",
+        exit_code=0,
+        evidence_id="targeted-pass",
+    )
+    suite_usage_error = _test_evidence(
+        "python -m pytest -q",
+        origin="repository_existing",
+        scope="full_suite",
+        exit_code=4,
+        evidence_id="suite-usage-error",
+    )
+
+    evaluation = evaluate_required_oracles(
+        policy,
+        [targeted_pass, suite_usage_error],
+    )
+
+    assert evaluation.conflicting_evidence_ids == []
+    assert evaluation.fixed_allowed is True
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("python -m pytest -k test_regression -q", []),
+        ("python -m pytest -m slow -q", []),
+        ("python -m pytest --ignore tests/test_optional.py tests -q", ["tests"]),
+        (
+            "python -m pytest --log-file reports/test.log tests/test_value.py -q",
+            ["tests/test_value.py"],
+        ),
+        (
+            "python -m pytest --cov-report xml:reports/coverage.xml tests -q",
+            ["tests"],
+        ),
+        (
+            "python -m pytest --setup-show tests/test_missing.py -q",
+            ["tests/test_missing.py"],
+        ),
+        (
+            "python -m pytest --plugin-flag tests/test_missing.py -q",
+            ["tests/test_missing.py"],
+        ),
+        ("python -m pytest integration/ -q", ["integration/"]),
+        ("python -m pytest test_suite -q", ["test_suite"]),
+        ("python -m pytest ./tests/test_value.py -q", ["tests/test_value.py"]),
+        ("python -m pytest ../outside/test_value.py -q", ["../outside/test_value.py"]),
+    ],
+)
+def test_pytest_target_paths_only_returns_positional_targets(command, expected):
+    assert pytest_target_paths(command) == expected
+
+
+def test_required_oracle_path_preflight_rejects_workspace_escape(
+    task_workspace,
+    task,
+):
+    policy = VerificationPolicyBuilder().build(task, task_workspace)
+    escaped = policy.required_oracles[0].model_copy(
+        update={"relevant_paths": ["../outside/test_value.py"]}
+    )
+    policy = policy.model_copy(update={"required_oracles": [escaped]})
+
+    assert unavailable_required_oracle_paths(policy, task_workspace.root) == [
+        "../outside/test_value.py"
+    ]
 
 
 def test_modified_or_new_test_is_downgraded_to_agent_generated(

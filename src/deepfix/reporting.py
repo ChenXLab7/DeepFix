@@ -22,7 +22,11 @@ from deepfix.operations import OperationJournalEntry
 from deepfix.research.models import ExternalEvidence
 from deepfix.research.reporting import render_external_evidence
 from deepfix.task_domain.models import AdjudicationDecision, TaskDefinition, TaskLifecycle
-from deepfix.verification import VerificationPolicy, evaluate_required_oracles
+from deepfix.verification import (
+    VerificationPolicy,
+    classify_pytest_result,
+    evaluate_required_oracles,
+)
 
 
 class HistorySummaryView(StrictModel):
@@ -241,8 +245,13 @@ def _repository_unverified_lines(
 def _repository_test_lines(items: list[SystemTestEvidence]) -> list[str]:
     if not items:
         return ["无"]
+    labels = {
+        "passed": "通过",
+        "test_failure": "失败",
+        "infrastructure_error": "基础设施错误",
+    }
     return [
-        f"- [{'通过' if item.exit_code == 0 else '失败'}] "
+        f"- [{labels[classify_pytest_result(item.exit_code)]}] "
         f"`{item.command}` (exit_code={item.exit_code})：{item.summary}"
         for item in items
     ]

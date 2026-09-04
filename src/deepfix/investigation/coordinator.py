@@ -180,6 +180,20 @@ class InvestigationCoordinator:
                         payload=tool_payload,
                     ),
                 )
+            if artifact.get("result_type") == "pytest_infrastructure_error":
+                return self.record_observation(
+                    task_id,
+                    self._tool_observation(
+                        InvestigationEventType.TOOL_COMPLETED,
+                        call_id,
+                        result,
+                        signature,
+                        fingerprint,
+                        evidence_id=evidence.evidence_id,
+                        exit_code=evidence.exit_code,
+                        payload=tool_payload,
+                    ),
+                )
             has_successful_change = any(
                 isinstance(item, FileChangeEvidence) and item.status == "succeeded"
                 for item in self.evidence_repository.list_deterministic(task_id)

@@ -43,6 +43,7 @@ from deepfix.operations import (
     OperationStatus,
 )
 from deepfix.prompting import model_request_task_id
+from deepfix.verification import classify_pytest_result
 from deepfix.workspace import WorkspacePathPolicy, compute_code_state_hash
 
 _PLATFORM_NAME = os.name
@@ -275,6 +276,12 @@ class InvestigationMiddleware(AgentMiddleware):
                 call_id,
                 "pause_and_inspect_tool_result",
             )
+        result = _classify_pytest_infrastructure_result(
+            task_id,
+            request,
+            result,
+            self.coordinator.project_python(task_id),
+        )
         artifact_references: list[ArtifactReference] = (
             self.execution.load_artifact_references(operation.operation_id)
             if operation is not None
@@ -511,6 +518,45 @@ def render_investigation_state(
 
 def _runtime_task_id(request: ToolCallRequest) -> str:
     return str(request.runtime.config.get("configurable", {}).get("thread_id", "")).strip()
+
+
+def _classify_pytest_infrastructure_result(
+    task_id: str,
+    request: ToolCallRequest,
+    result: ToolMessage,
+    project_python: str,
+) -> ToolMessage:
+    if str(request.tool_call.get("name", "")).strip() != "execute":
+        return result
+    command = str(_tool_arguments(request.tool_call).get("command", "")).strip()
+    artifact = result.artifact if isinstance(result.artifact, Mapping) else {}
+    exit_code = artifact.get("exit_code")
+    if (
+        not is_pytest_verification(command, project_python)
+        or isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or classify_pytest_result(exit_code) != "infrastructure_error"
+    ):
+        return result
+    if artifact.get("result_type") == "pytest_infrastructure_error":
+        return result
+    content = (
+        "pytest 返回 exit_code=4：这是用法、配置或测试入口错误，"
+        "测试断言尚未执行，不能视为 Bug 已复现。"
+        "请停止代码根因调查并返回 needs_input，说明具体基础设施错误。\n\n"
+        + str(result.content)
+    )
+    return result.model_copy(
+        update={
+            "content": content,
+            "status": "error",
+            "artifact": {
+                **artifact,
+                "result_type": "pytest_infrastructure_error",
+                "error_code": "pytest_usage_error",
+            },
+        }
+    )
 
 
 def _experiment_allowed_capabilities(

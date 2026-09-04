@@ -181,6 +181,102 @@ def test_unvalidated_domain_migration_pauses_before_agent_invocation(config) -> 
     assert agent.invocations == 0
 
 
+def test_missing_required_oracle_path_pauses_before_agent_invocation(config) -> None:
+    agent = FakeAgent(no_response())
+    service = service_for(config, agent, workspace=True)
+
+    task = service.start(
+        "修复问题，并运行 python -m pytest tests/test_missing.py -q 验证"
+    )
+
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
+    assert task.pause_reason == (
+        "Required Oracle 路径不可用：tests/test_missing.py"
+    )
+    assert agent.invocations == 0
+    policy = service.repository.load_verification_policy(task.task_id)
+    assert policy is not None
+    assert policy.required_oracles[0].relevant_paths == ["tests/test_missing.py"]
+
+
+def test_missing_required_oracle_is_rechecked_before_continue_invocation(config) -> None:
+    agent = FakeAgent(no_response())
+    service = service_for(config, agent, workspace=True)
+    task = service.start(
+        "修复问题，并运行 python -m pytest tests/test_missing.py -q 验证"
+    )
+
+    resumed = service.continue_task(task.task_id, "测试文件仍然没有提供")
+
+    assert resumed.lifecycle is TaskLifecycleStatus.PAUSED
+    assert resumed.pause_reason == "Required Oracle 路径不可用：tests/test_missing.py"
+    assert agent.invocations == 0
+
+
+def test_pytest_output_option_is_not_treated_as_required_oracle_path(config) -> None:
+    test_path = config.project_root / "tests" / "test_value.py"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text("def test_value(): assert True\n", encoding="utf-8")
+    agent = FakeAgent(no_response())
+    service = service_for(config, agent, workspace=True)
+
+    task = service.start(
+        "运行 python -m pytest --log-file reports/test.log "
+        "tests/test_value.py -q 验证"
+    )
+
+    assert task.lifecycle is TaskLifecycleStatus.RUNNING
+    assert agent.invocations == 1
+
+
+def test_missing_oracle_after_boolean_pytest_flag_pauses_before_model(config) -> None:
+    agent = FakeAgent(no_response())
+    service = service_for(config, agent, workspace=True)
+
+    task = service.start(
+        "运行 python -m pytest --setup-show tests/test_missing.py -q 验证"
+    )
+
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
+    assert task.pause_reason == "Required Oracle 路径不可用：tests/test_missing.py"
+    assert agent.invocations == 0
+
+
+def test_missing_required_oracle_directory_pauses_before_model(config) -> None:
+    agent = FakeAgent(no_response())
+    service = service_for(config, agent, workspace=True)
+
+    task = service.start("运行 python -m pytest integration/ -q 验证")
+
+    assert task.lifecycle is TaskLifecycleStatus.PAUSED
+    assert task.pause_reason == "Required Oracle 路径不可用：integration/"
+    assert agent.invocations == 0
+
+
+def test_pytest_usage_error_does_not_consume_test_failure_budget(config) -> None:
+    service = service_for(config, FakeAgent(no_response()))
+    task = service.start("调查测试环境")
+    service.repositories.evidence.record_deterministic(
+        task.task_id,
+        SystemTestEvidence(
+            evidence_id="pytest-usage-error",
+            command="python -m pytest -q --bad-option",
+            exit_code=4,
+            summary="pytest: error: unrecognized arguments: --bad-option",
+            tool_call_id="usage-call",
+            source_message_id="usage-result",
+            origin="repository_existing",
+            scope="full_suite",
+            timing="post_change",
+            workspace_baseline_id="baseline-1",
+            code_state_hash="code-state-1",
+        ),
+        provenance_root_ids=["usage-call"],
+    )
+
+    assert service._consecutive_post_change_failures(task.task_id) == 0
+
+
 def test_domain_migration_exception_pauses_without_leaking_secret(config) -> None:
     class FailingMigrator(NotReadyMigrator):
         def migrate_deterministic_evidence(self, _task_id):

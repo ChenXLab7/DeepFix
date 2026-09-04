@@ -24,7 +24,7 @@ from deepfix.investigation.identity import stable_investigation_id
 from deepfix.operations import OperationJournalEntry
 from deepfix.protected_context import ProtectedContext
 from deepfix.research.models import ExternalEvidence
-from deepfix.verification import VerificationPolicy
+from deepfix.verification import VerificationPolicy, classify_pytest_result
 
 DeterministicEvidence = Annotated[
     SystemTestEvidence | FileChangeEvidence | ApprovalEvidence | ResearchStatusEvidence,
@@ -239,9 +239,15 @@ def _reproduction_state(
         for item in evidence
         if isinstance(item, SystemTestEvidence) and item.timing == "baseline"
     ]
-    if any(item.exit_code != 0 for item in baseline_tests):
+    if any(
+        classify_pytest_result(item.exit_code) == "test_failure"
+        for item in baseline_tests
+    ):
         return "reproduced"
-    if baseline_tests and all(item.exit_code == 0 for item in baseline_tests):
+    if baseline_tests and all(
+        classify_pytest_result(item.exit_code) == "passed"
+        for item in baseline_tests
+    ):
         return "not_reproduced"
     return "unknown"
 

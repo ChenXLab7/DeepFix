@@ -35,7 +35,11 @@ from deepfix.task_domain.adjudication import OutcomeAdjudicationInput, OutcomeAd
 from deepfix.task_domain.models import TaskDefinition, TaskLifecycleStatus
 from deepfix.task_domain.outcome import RepairOutcomeCandidate
 from deepfix.task_domain.runtime import TaskRuntime
-from deepfix.verification import VerificationPolicyBuilder
+from deepfix.verification import (
+    VerificationPolicyBuilder,
+    classify_pytest_result,
+    unavailable_required_oracle_paths,
+)
 from deepfix.workspace import WorkspaceFactory
 
 
@@ -285,6 +289,17 @@ class BugfixService:
                     task_id,
                     "副作用操作需要人工恢复：" + ", ".join(dict.fromkeys(unresolved)),
                 )
+        verification = self.repository.load_verification_policy(task_id)
+        if verification is not None:
+            unavailable_paths = unavailable_required_oracle_paths(
+                verification,
+                definition.workspace_root,
+            )
+            if unavailable_paths:
+                return self._pause_authority(
+                    task_id,
+                    "Required Oracle 路径不可用：" + ", ".join(unavailable_paths),
+                )
         invocation_count = self._agent_invocations.get(task_id, 0)
         if invocation_count >= self.config.max_agent_invocations:
             return self._pause_authority(task_id, "已达到 Agent 最大调用次数")
@@ -478,7 +493,10 @@ class BugfixService:
             for item in verification.file_change_evidence
             if item.status == "succeeded"
         ]
-        if successful_changes or any(item.exit_code != 0 for item in verification.test_evidence):
+        if successful_changes or any(
+            classify_pytest_result(item.exit_code) == "test_failure"
+            for item in verification.test_evidence
+        ):
             reproduction_state = "reproduced"
         elif any(item.exit_code == 0 for item in verification.test_evidence):
             reproduction_state = "not_reproduced"
@@ -579,9 +597,11 @@ class BugfixService:
         for item in reversed(self.repositories.evidence.verification_view(task_id).test_evidence):
             if item.timing not in {"post_change", "post_recovery"}:
                 continue
-            if item.exit_code == 0:
+            classification = classify_pytest_result(item.exit_code)
+            if classification == "passed":
                 break
-            count += 1
+            if classification == "test_failure":
+                count += 1
         return count
 
     def _normalize_actions(self, interrupts: object) -> list[dict[str, object]]:

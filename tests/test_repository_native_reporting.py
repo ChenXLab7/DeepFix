@@ -7,7 +7,7 @@ from deepfix.compaction.models import FileChangeEvidence, SystemTestEvidence
 from deepfix.domain_repositories import DomainRepositories
 from deepfix.domain_repositories.execution import create_execution_approval
 from deepfix.investigation.models import InvestigationHypothesis
-from deepfix.reporting import build_task_report_view, render_report
+from deepfix.reporting import _repository_test_lines, build_task_report_view, render_report
 from deepfix.task_domain.models import (
     AdjudicationDecision,
     TaskDefinition,
@@ -60,6 +60,26 @@ def test_report_view_is_ephemeral_and_not_persisted(tmp_path: Path) -> None:
     assert second == first
     assert "task_reports" not in table_names
     assert "task_report_views" not in table_names
+
+
+def test_report_labels_pytest_usage_error_as_infrastructure_error() -> None:
+    usage_error = SystemTestEvidence(
+        evidence_id="pytest-usage-error",
+        command="python -m pytest -q --bad-option",
+        exit_code=4,
+        summary="pytest: error: unrecognized arguments: --bad-option",
+        tool_call_id="usage-call",
+        source_message_id="usage-result",
+        origin="repository_existing",
+        scope="full_suite",
+        timing="post_change",
+        workspace_baseline_id="baseline-1",
+        code_state_hash="code-state-1",
+    )
+
+    lines = _repository_test_lines([usage_error])
+
+    assert lines[0].startswith("- [基础设施错误]")
 
 
 def _seed_task(repositories: DomainRepositories) -> None:

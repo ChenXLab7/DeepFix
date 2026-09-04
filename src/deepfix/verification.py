@@ -15,6 +15,48 @@ from deepfix.workspace import TaskWorkspace
 _PYTEST_COMMAND = re.compile(
     r"(?i)(?:python(?:\.exe)?\s+-m\s+pytest|pytest)(?:\s+[^\r\n，。；;]+)?"
 )
+_PYTEST_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "-W",
+        "-c",
+        "-k",
+        "-m",
+        "-o",
+        "-r",
+        "--basetemp",
+        "--capture",
+        "--confcutdir",
+        "--cov",
+        "--cov-config",
+        "--cov-context",
+        "--cov-fail-under",
+        "--cov-report",
+        "--deselect",
+        "--doctest-glob",
+        "--doctest-report",
+        "--durations",
+        "--ignore",
+        "--ignore-glob",
+        "--import-mode",
+        "--junit-prefix",
+        "--junitxml",
+        "--log-cli-date-format",
+        "--log-cli-format",
+        "--log-cli-level",
+        "--log-file",
+        "--log-file-date-format",
+        "--log-file-format",
+        "--log-file-level",
+        "--maxfail",
+        "--override-ini",
+        "--pdbcls",
+        "--rootdir",
+        "--tb",
+        "--timeout",
+        "--timeout-method",
+        "--verbosity",
+    }
+)
 
 
 class VerificationPolicyConflict(RuntimeError):
@@ -54,6 +96,35 @@ class OracleEvaluation(StrictModel):
     conflicting_evidence_ids: list[str] = Field(default_factory=list)
     all_required_satisfied: bool
     fixed_allowed: bool
+
+
+def classify_pytest_result(
+    exit_code: int,
+) -> Literal["passed", "test_failure", "infrastructure_error"]:
+    if exit_code == 0:
+        return "passed"
+    if exit_code == 4:
+        return "infrastructure_error"
+    return "test_failure"
+
+
+def unavailable_required_oracle_paths(
+    policy: VerificationPolicy,
+    workspace_root: str | Path,
+) -> list[str]:
+    root = Path(workspace_root).resolve()
+    unavailable: list[str] = []
+    for oracle in policy.required_oracles:
+        for relative in oracle.relevant_paths:
+            candidate = (root / relative).resolve(strict=False)
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                unavailable.append(relative)
+                continue
+            if not candidate.exists():
+                unavailable.append(relative)
+    return list(dict.fromkeys(unavailable))
 
 
 class VerificationPolicyBuilder:
@@ -122,7 +193,9 @@ def evaluate_required_oracles(
             and item.origin == oracle.origin
             and _timing_satisfies(item.timing, oracle.required_timing)
         ]
-        if not matches:
+        if not matches or (
+            classify_pytest_result(matches[-1].exit_code) == "infrastructure_error"
+        ):
             unavailable.append(oracle.oracle_id)
         elif matches[-1].exit_code == oracle.expected_exit_code:
             passed.append(oracle.oracle_id)
@@ -137,7 +210,7 @@ def evaluate_required_oracles(
         item.evidence_id
         for item in evidence
         if item.timing == "post_change"
-        and item.exit_code != 0
+        and classify_pytest_result(item.exit_code) == "test_failure"
         and item.scope in blocking_scopes
         and item.origin == "repository_existing"
         and (not accepted_hashes or item.code_state_hash in accepted_hashes)
@@ -189,9 +262,8 @@ def classify_pytest_scope(command: str) -> Literal["targeted", "module", "full_s
 
 def pytest_target_paths(command: str) -> list[str]:
     return [
-        token.split("::", 1)[0].replace("\\", "/").lstrip("./")
-        for token in _tokens_after_pytest(command)
-        if not token.startswith("-") and _looks_like_test_target(token)
+        _normalize_pytest_target(token)
+        for token in _pytest_positional_tokens(command)
     ]
 
 
@@ -243,9 +315,33 @@ def _tokens_after_pytest(command: str) -> list[str]:
     return tokens[index + 1 :]
 
 
-def _looks_like_test_target(token: str) -> bool:
-    value = token.split("::", 1)[0]
-    return "/" in value or value.endswith(".py") or value.startswith("test")
+def _pytest_positional_tokens(command: str) -> list[str]:
+    positional: list[str] = []
+    skip_value = False
+    options_ended = False
+    for token in _tokens_after_pytest(command):
+        if skip_value:
+            skip_value = False
+            continue
+        if token == "--":
+            options_ended = True
+            continue
+        if not options_ended and token.startswith("-"):
+            option = token.split("=", 1)[0]
+            # Parsing remains intentionally independent of pytest internals and
+            # project plugins. Unknown options are treated as boolean flags;
+            # plugin options with path-like values must use --option=value.
+            skip_value = "=" not in token and option in _PYTEST_OPTIONS_WITH_VALUE
+            continue
+        positional.append(token)
+    return positional
+
+
+def _normalize_pytest_target(token: str) -> str:
+    value = token.split("::", 1)[0].replace("\\", "/")
+    while value.startswith("./"):
+        value = value[2:]
+    return value
 
 
 def _normalize_command(command: str) -> str:
