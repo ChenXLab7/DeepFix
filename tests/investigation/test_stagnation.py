@@ -1,0 +1,216 @@
+import pytest
+
+from deepfix.investigation.experiments import StrategyDecision
+from deepfix.investigation.models import (
+    InvestigationState,
+    ToolObservation,
+)
+from deepfix.investigation.stagnation import (
+    ExperimentStagnationDetector,
+    StagnationDetector,
+    matching_cycle_size,
+    progress_fingerprint,
+    strategy_signature,
+)
+
+
+def event(event_type: str, progress: str | None = None) -> ToolObservation:
+    return ToolObservation(event_type=event_type, progress_kind=progress)
+
+
+def no_progress(signature: str, scope: str = "direct") -> ToolObservation:
+    return ToolObservation(
+        event_type="tool_completed",
+        signature=signature,
+        result_fingerprint=f"result-{signature}",
+        scope=scope,
+    )
+
+
+def state_with_no_progress_count(count: int) -> InvestigationState:
+    return InvestigationState.new("task-a").model_copy(
+        update={
+            "no_progress_count": count,
+            "recent_tool_signatures": [f"old-{index}" for index in range(count)],
+        }
+    )
+
+
+def test_memory_and_audit_updates_do_not_change_progress_fingerprint():
+    state = InvestigationState.new("task-a")
+    changed = state.model_copy(
+        update={
+            "version": state.version + 1,
+            "memory_saved_generation": 9,
+            "last_progress_event_id": "audit-only-event",
+        }
+    )
+
+    assert progress_fingerprint(changed) == progress_fingerprint(state)
+
+
+def test_closed_gap_changes_progress_fingerprint():
+    state = InvestigationState.new("task-a")
+    changed = state.model_copy(update={"closed_evidence_gap_ids": ["gap-1"]})
+
+    assert progress_fingerprint(changed) != progress_fingerprint(state)
+
+
+def test_strategy_signature_ignores_identity_and_blackboard_version():
+    values = {
+        "task_id": "task-a",
+        "decision_type": "ask_user",
+        "current_assessment": "Need one user-only fact",
+        "evidence_gap_ids": ["gap-1"],
+        "uncertainty": 0.8,
+        "rationale_refs": [],
+        "question_for_user": "Which behavior is intended?",
+    }
+    first = StrategyDecision(
+        decision_id="decision-1",
+        blackboard_fingerprint="blackboard-1",
+        **values,
+    )
+    second = StrategyDecision(
+        decision_id="decision-2",
+        blackboard_fingerprint="blackboard-2",
+        **values,
+    )
+
+    assert strategy_signature(first) == strategy_signature(second)
+
+
+def test_experiment_stagnation_requires_repeated_strategy_without_progress():
+    decision = StrategyDecision(
+        decision_id="decision-1",
+        task_id="task-a",
+        blackboard_fingerprint="blackboard-1",
+        decision_type="ask_user",
+        current_assessment="Need one user-only fact",
+        evidence_gap_ids=["gap-1"],
+        uncertainty=0.8,
+        rationale_refs=[],
+        question_for_user="Which behavior is intended?",
+    )
+    signature = strategy_signature(decision)
+    state = InvestigationState.new("task-a").model_copy(
+        update={"last_strategy_signature": signature, "no_progress_count": 1}
+    )
+    before = progress_fingerprint(state)
+
+    stalled = ExperimentStagnationDetector().after_experiment(state, decision, before)
+    progressed = ExperimentStagnationDetector().after_experiment(
+        state.model_copy(update={"closed_evidence_gap_ids": ["gap-1"]}),
+        decision,
+        before,
+    )
+
+    assert stalled.reevaluation_required is True
+    assert stalled.stagnation_level == 1
+    assert progressed.no_progress_count == 0
+
+
+def test_exact_repeat_triggers_on_third_result():
+    detector = StagnationDetector()
+    state = InvestigationState.new("task-a")
+
+    for _ in range(2):
+        state = detector.after_tool(state, no_progress("same-signature"))
+        assert state.stagnation_level == 0
+    state = detector.after_tool(state, no_progress("same-signature"))
+
+    assert state.stagnation_level == 1
+
+
+def test_same_tool_arguments_with_different_results_are_not_exact_repeats():
+    detector = StagnationDetector()
+    state = InvestigationState.new("task-a")
+
+    for index in range(3):
+        state = detector.after_tool(
+            state,
+            ToolObservation(
+                event_type="tool_completed",
+                signature="same-tool-args",
+                result_fingerprint=f"different-result-{index}",
+            ),
+        )
+
+    assert state.stagnation_level == 0
+
+
+@pytest.mark.parametrize("size", [2, 8])
+def test_short_cycle_repeated_twice_triggers(size):
+    signatures = [f"s-{index}" for index in range(size)] * 2
+
+    assert matching_cycle_size(signatures) == size
+
+
+def test_six_no_progress_results_trigger_reevaluation():
+    detector = StagnationDetector()
+    state = InvestigationState.new("task-a")
+
+    for index in range(6):
+        state = detector.after_tool(state, no_progress(f"unique-{index}"))
+
+    assert state.stagnation_level == 1
+    assert state.reevaluation_required
+
+
+def test_four_exploratory_results_trigger_reevaluation():
+    detector = StagnationDetector()
+    state = InvestigationState.new("task-a")
+
+    for index in range(4):
+        state = detector.after_tool(
+            state,
+            no_progress(f"explore-{index}", scope="exploratory"),
+        )
+
+    assert state.stagnation_level == 1
+
+
+def test_non_progress_event_and_new_file_do_not_reset_stagnation():
+    detector = StagnationDetector()
+    state = state_with_no_progress_count(5)
+
+    state = detector.after_event(state, event("tool_completed"))
+    state = detector.after_tool(
+        state,
+        no_progress("read-new-file", scope="exploratory"),
+    )
+
+    assert state.stagnation_level == 1
+
+
+def test_artifact_retrieval_counts_as_ordinary_no_progress_activity():
+    detector = StagnationDetector()
+    state = InvestigationState.new("task-a")
+
+    for index in range(6):
+        state = detector.after_tool(
+            state,
+            ToolObservation(
+                event_type="artifact_searched",
+                signature=f"artifact-query-{index}",
+                result_fingerprint=f"artifact-result-{index}",
+            ),
+        )
+
+    assert state.no_progress_count == 6
+    assert state.progress_generation == 0
+    assert state.stagnation_level == 1
+
+
+def test_strong_progress_resets_generation_and_counters():
+    detector = StagnationDetector()
+    state = state_with_no_progress_count(5)
+
+    updated = detector.after_event(
+        state,
+        event("hypothesis_rejected", progress="hypothesis_transition"),
+    )
+
+    assert updated.progress_generation == state.progress_generation + 1
+    assert updated.no_progress_count == 0
+    assert updated.stagnation_level == 0

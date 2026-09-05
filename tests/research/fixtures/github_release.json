@@ -1,0 +1,12 @@
+[
+  {
+    "id": 2001,
+    "tag_name": "v2.8.4",
+    "name": "Pydantic v2.8.4",
+    "html_url": "https://github.com/pydantic/pydantic/releases/tag/v2.8.4",
+    "draft": false,
+    "prerelease": false,
+    "published_at": "2024-08-01T00:00:00Z",
+    "body": "Validation fixes"
+  }
+]
