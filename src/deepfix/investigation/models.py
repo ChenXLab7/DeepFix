@@ -251,6 +251,10 @@ class InvestigationState(StrictModel):
     last_execute_signature: str | None = None
     last_execute_generation: int | None = None
     duplicate_execute_correction_signature: str | None = None
+    duplicate_read_correction_signatures: list[str] = Field(
+        default_factory=list,
+        max_length=16,
+    )
     duplicate_hypothesis_correction_ids: list[str] = Field(
         default_factory=list,
         max_length=16,

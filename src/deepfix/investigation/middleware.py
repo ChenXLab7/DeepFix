@@ -235,6 +235,13 @@ class InvestigationMiddleware(AgentMiddleware):
         if authorization.correction_required:
             if authorization.correction_kind == "duplicate_execute":
                 return task_id, None, _duplicate_execute_message(task_id, call_id), None
+            if authorization.correction_kind == "duplicate_read":
+                return (
+                    task_id,
+                    None,
+                    _duplicate_read_message(task_id, call_id, name),
+                    None,
+                )
             if authorization.correction_kind == "duplicate_hypothesis":
                 return (
                     task_id,
@@ -661,6 +668,40 @@ def _duplicate_execute_message(task_id: str, call_id: str) -> ToolMessage:
         artifact={
             "result_type": "duplicate_execute_correction",
             "error_code": "duplicate_execute_in_progress_generation",
+        },
+    )
+
+
+def _duplicate_read_message(
+    task_id: str,
+    call_id: str,
+    tool_name: str,
+) -> ToolMessage:
+    next_action = (
+        'grep 默认只返回文件名；需要定位命中行时，请改用 output_mode="content"，'
+        "或选择已命中的生产文件继续 read_file。"
+        if tool_name == "grep"
+        else "若文件尚未读完，请根据上次结果中的剩余行提示增加 offset，读取下一个未检查区间。"
+    )
+    return ToolMessage(
+        id=stable_generated_message_id(
+            task_id,
+            call_id,
+            "duplicate_read_correction",
+        ),
+        content=(
+            "相同的只读工具调用已在当前进展代次完成，已有结果不会因原样重试而改变。"
+            f"{next_action}"
+            "请分析现有结果；若目标符号只存在于测试而不存在于生产代码，"
+            "应把‘功能尚未实现’作为候选根因，并读取相关入口或调用点。"
+            "否则请更改路径、范围或搜索目标以获得可区分的新证据。"
+        ),
+        tool_call_id=call_id,
+        name=tool_name,
+        status="error",
+        artifact={
+            "result_type": "duplicate_read_correction",
+            "error_code": "duplicate_read_in_progress_generation",
         },
     )
 

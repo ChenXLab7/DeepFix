@@ -114,6 +114,7 @@ class StagnationDetector:
                 "seen_progress_fingerprints": state.seen_progress_fingerprints[-1:],
                 "reevaluation_required": False,
                 "stagnation_level": 0,
+                "duplicate_read_correction_signatures": [],
                 "duplicate_hypothesis_correction_ids": [],
             }
         )

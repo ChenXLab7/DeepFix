@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import time
 
@@ -204,6 +205,70 @@ def test_backend_routes_context_artifacts_outside_target_project(tmp_path, monke
     ).read_text(encoding="utf-8") == "history"
     assert not (config.project_root / ".deepfix-artifacts").exists()
     assert not (config.project_root / "conversation_history").exists()
+
+
+def test_default_grep_searches_project_without_internal_artifact_route(
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "source.py").write_text("project_only_marker\n", encoding="utf-8")
+    (project / ".deepfix-runtime").mkdir()
+    (project / ".deepfix-runtime" / "runtime.txt").write_text(
+        "project_only_marker\n",
+        encoding="utf-8",
+    )
+    (project / ".pytest_cache").mkdir()
+    (project / ".pytest_cache" / "cache.txt").write_text(
+        "project_only_marker\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    config = load_config(project, ApprovalMode.MANUAL)
+    backend = build_backend(config)
+    monkeypatch.setattr(
+        backend.default,
+        "_ripgrep_search",
+        lambda *args, **kwargs: (None, False),
+    )
+    backend.write(
+        "/.deepfix-artifacts/debug/llm_calls.jsonl",
+        "artifact_only_marker\n",
+    )
+
+    project_result = backend.grep("project_only_marker")
+    artifact_result = backend.grep("artifact_only_marker")
+    explicit_artifact_result = backend.grep(
+        "artifact_only_marker",
+        path="/.deepfix-artifacts/",
+    )
+
+    assert [match["path"] for match in project_result.matches or []] == [
+        "/source.py"
+    ]
+    assert artifact_result.matches == []
+    assert [match["path"] for match in explicit_artifact_result.matches or []] == [
+        "/.deepfix-artifacts/debug/llm_calls.jsonl"
+    ]
+
+
+def test_default_async_grep_excludes_internal_artifact_route(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    config = load_config(project, ApprovalMode.MANUAL)
+    backend = build_backend(config)
+    backend.write(
+        "/.deepfix-artifacts/debug/llm_calls.jsonl",
+        "artifact_only_marker\n",
+    )
+
+    result = asyncio.run(backend.agrep("artifact_only_marker"))
+
+    assert result.matches == []
 
 
 def test_history_adapter_uses_internal_artifact_route(tmp_path, monkeypatch):
