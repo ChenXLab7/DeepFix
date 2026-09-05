@@ -6,11 +6,11 @@ import subprocess
 import sys
 from collections import defaultdict
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from deepagents.backends import CompositeBackend, FilesystemBackend, LocalShellBackend
-from deepagents.backends.protocol import ExecuteResponse
+from deepagents.backends.protocol import ExecuteResponse, GrepResult
 
 from deepfix.config import AppConfig
 from deepfix.investigation.classification import is_pytest_verification
@@ -24,6 +24,9 @@ _SAFE_ENVIRONMENT_VARIABLES = (
     "TEMP",
     "TMP",
     "WINDIR",
+)
+_INTERNAL_GREP_PARTS = frozenset(
+    {".deepfix-artifacts", ".deepfix-runtime", ".pytest_cache"}
 )
 
 
@@ -345,6 +348,49 @@ class DeepFixBackend(CompositeBackend):
             artifacts_root="/.deepfix-artifacts",
         )
 
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        *,
+        max_count: int | None = None,
+    ) -> GrepResult:
+        if path is None or path == "/":
+            return _filter_project_grep_result(
+                self.default.grep(
+                    pattern,
+                    path="/",
+                    glob=glob,
+                    max_count=max_count,
+                )
+            )
+        return super().grep(pattern, path=path, glob=glob, max_count=max_count)
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        *,
+        max_count: int | None = None,
+    ) -> GrepResult:
+        if path is None or path == "/":
+            return _filter_project_grep_result(
+                await self.default.agrep(
+                    pattern,
+                    path="/",
+                    glob=glob,
+                    max_count=max_count,
+                )
+            )
+        return await super().agrep(
+            pattern,
+            path=path,
+            glob=glob,
+            max_count=max_count,
+        )
+
     def activate_workspace(self, task: TaskDefinition | TaskWorkspace) -> None:
         workspace = task if isinstance(task, TaskWorkspace) else _task_workspace(task)
         if self.active_workspace is not None and (
@@ -364,6 +410,21 @@ def _task_workspace(task: TaskDefinition) -> TaskWorkspace:
     if baseline.task_id != task.task_id or baseline.baseline_id != task.workspace_baseline_id:
         raise RuntimeError("task workspace baseline identity mismatch")
     return TaskWorkspace(task_id=task.task_id, root=root, baseline=baseline)
+
+
+def _filter_project_grep_result(result: GrepResult) -> GrepResult:
+    matches = [
+        match
+        for match in result.matches or []
+        if not _INTERNAL_GREP_PARTS.intersection(
+            PurePosixPath(str(match["path"]).replace("\\", "/")).parts
+        )
+    ]
+    return GrepResult(
+        error=result.error,
+        matches=matches,
+        truncated=result.truncated,
+    )
 
 
 def build_backend(

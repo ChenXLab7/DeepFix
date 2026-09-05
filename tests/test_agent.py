@@ -127,6 +127,10 @@ def test_role_models_use_independent_names_keys_and_shared_base_url(config):
     assert main.openai_api_base == compaction.openai_api_base == "https://api.deepseek.com"
     assert main.openai_api_key.get_secret_value() == "main-secret"
     assert compaction.openai_api_key.get_secret_value() == "compact-secret"
+    assert main.request_timeout == 120
+    assert compaction.request_timeout == 120
+    assert main.max_retries == 0
+    assert compaction.max_retries == 0
 
 
 def test_both_role_models_disable_thinking_for_tool_choice_compatibility(config):

@@ -24,6 +24,7 @@ class ModelRoleConfig:
     model_name: str
     api_key: SecretStr
     base_url: str
+    request_timeout_seconds: int = 120
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,14 @@ def load_config(
     compaction_model_name = _model_name(
         "DEEPFIX_COMPACTION_MODEL", "deepseek-v4-flash"
     )
+    main_request_timeout_seconds = _positive_int(
+        "DEEPFIX_MAIN_REQUEST_TIMEOUT_SECONDS",
+        120,
+    )
+    compaction_request_timeout_seconds = _positive_int(
+        "DEEPFIX_COMPACTION_REQUEST_TIMEOUT_SECONDS",
+        120,
+    )
     python_executable = Path(project_python or sys.executable).expanduser().resolve()
     if not python_executable.is_file():
         raise ValueError(f"Python 解释器不存在: {python_executable}")
@@ -106,11 +115,13 @@ def load_config(
             model_name=main_model_name,
             api_key=SecretStr(main_key),
             base_url=base_url,
+            request_timeout_seconds=main_request_timeout_seconds,
         ),
         compaction_model=ModelRoleConfig(
             model_name=compaction_model_name,
             api_key=SecretStr(compaction_key),
             base_url=base_url,
+            request_timeout_seconds=compaction_request_timeout_seconds,
         ),
         approval_mode=approval_mode,
         project_python=python_executable,

@@ -64,6 +64,7 @@ _DIAGNOSTIC_RESULT_EVENTS = {
     ): InvestigationEventType.ARTIFACT_READ,
 }
 _STATE_COMMIT_MAX_ATTEMPTS = 4
+_REPEAT_GUARDED_READ_TOOLS = frozenset({"grep", "read_file"})
 _DIAGNOSTIC_PAYLOAD_FIELDS = {
     "diagnostic_artifact_search": (
         "artifact_ids",
@@ -678,6 +679,48 @@ class InvestigationCoordinator:
                 correction_required=True,
                 correction_kind="duplicate_execute",
             )
+        if (
+            normalized_tool in _REPEAT_GUARDED_READ_TOOLS
+            and _has_recent_tool_signature(state, signature)
+        ):
+            if signature in state.duplicate_read_correction_signatures:
+                raise InvestigationStagnationError(
+                    self.recovery(
+                        task_id,
+                        "duplicate_read_ignored",
+                        state=state,
+                        tool_call_id=tool_call_id,
+                        checkpoint_available=True,
+                        recovery_action="pause_and_change_investigation_action",
+                    )
+                )
+            source_id = tool_call_id or stable_investigation_id(
+                "duplicate-read-correction",
+                task_id,
+                signature,
+            )
+            self._record_lifecycle(
+                state,
+                state.model_copy(
+                    update={
+                        "duplicate_read_correction_signatures": list(
+                            dict.fromkeys(
+                                [
+                                    *state.duplicate_read_correction_signatures,
+                                    signature,
+                                ]
+                            )
+                        )[-16:]
+                    }
+                ),
+                InvestigationEventType.REEVALUATION_REQUIRED,
+                source_id,
+            )
+            return ToolAuthorization(
+                allowed=False,
+                correction_required=True,
+                correction_kind="duplicate_read",
+            )
         # Navigation checkpoints are advisory. Approval, workspace confinement,
         # Receipt/Journal recovery, experiment scope, and duplicate-side-effect
         # checks remain authoritative; legacy phase/stagnation state cannot gate tools.
@@ -952,6 +995,11 @@ def _normalized_path(value: str) -> str:
     if not normalized:
         raise ValueError("文件路径不能为空")
     return str(PurePosixPath(normalized))
+
+
+def _has_recent_tool_signature(state: InvestigationState, signature: str) -> bool:
+    prefix = f"{signature}|"
+    return any(item.startswith(prefix) for item in state.recent_tool_signatures)
 
 
 def _target_from_arguments(

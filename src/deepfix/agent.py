@@ -79,6 +79,8 @@ def _build_deepseek_model(role: ModelRoleConfig) -> ChatDeepSeek:
         api_key=role.api_key,
         base_url=role.base_url,
         temperature=0,
+        timeout=role.request_timeout_seconds,
+        max_retries=0,
         profile=profile,
         extra_body={"thinking": {"type": "disabled"}},
     )

@@ -648,6 +648,58 @@ def test_duplicate_execute_is_corrected_once_then_pauses(tmp_path):
     assert caught.value.recovery.error_code == "duplicate_execute_ignored"
 
 
+@pytest.mark.parametrize("tool_name", ["grep", "read_file"])
+def test_duplicate_read_only_call_is_corrected_once_then_pauses(
+    tmp_path,
+    tool_name,
+):
+    middleware = middleware_fixture(tmp_path, phase="investigating")
+    executions = 0
+
+    def handler(request):
+        nonlocal executions
+        executions += 1
+        call_id = str(request.tool_call["id"])
+        return ToolMessage(
+            id=f"msg-{call_id}",
+            content="same bounded result",
+            name=tool_name,
+            tool_call_id=call_id,
+            status="success",
+        )
+
+    arguments = (
+        {"pattern": "custom_repr"}
+        if tool_name == "grep"
+        else {"file_path": "/pysnooper/tracer.py"}
+    )
+    middleware.wrap_tool_call(
+        tool_request(tool_name, f"{tool_name}-1", arguments),
+        handler,
+    )
+    correction = middleware.wrap_tool_call(
+        tool_request(tool_name, f"{tool_name}-2", arguments),
+        handler,
+    )
+
+    assert executions == 1
+    assert isinstance(correction, ToolMessage)
+    assert correction.artifact["result_type"] == "duplicate_read_correction"
+    if tool_name == "grep":
+        assert 'output_mode="content"' in correction.content
+    else:
+        assert "offset" in correction.content
+
+    with pytest.raises(InvestigationStagnationError) as caught:
+        middleware.wrap_tool_call(
+            tool_request(tool_name, f"{tool_name}-3", arguments),
+            handler,
+        )
+
+    assert executions == 1
+    assert caught.value.recovery.error_code == "duplicate_read_ignored"
+
+
 def test_windows_unix_pipeline_is_blocked_before_execution(tmp_path, monkeypatch):
     middleware = middleware_fixture(tmp_path, phase="investigating")
     monkeypatch.setattr("deepfix.investigation.middleware._PLATFORM_NAME", "nt")
