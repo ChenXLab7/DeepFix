@@ -31,15 +31,8 @@ from deepfix.compaction.models import (
 )
 from deepfix.compaction.snapshot import snapshot_content_hash
 from deepfix.database import SQLiteDatabase
-from deepfix.domain_repositories.evidence import (
-    EvidenceKind,
-    EvidenceRepository,
-    restore_deterministic_evidence,
-)
-from deepfix.domain_repositories.investigation import (
-    InvestigationRepository,
-    stable_question_id,
-)
+from deepfix.domain_repositories.evidence import EvidenceRepository
+from deepfix.domain_repositories.investigation import InvestigationRepository, stable_question_id
 
 
 class HistoryIdentityConflict(RuntimeError):
@@ -601,9 +594,16 @@ class HistoryRepository:
         task_id: str,
         version: int,
         *,
-        evidence: EvidenceRepository,
-        investigation: InvestigationRepository,
+        evidence: EvidenceRepository | None = None,
+        investigation: InvestigationRepository | None = None,
     ) -> CompactionSnapshot:
+        """Reconstruct only the historical snapshot stored for this version.
+
+        The repository arguments remain temporarily compatible with existing
+        callers. Live domain state is intentionally excluded: it is assembled
+        by the protected-context boundary rather than projected over history.
+        """
+        del evidence, investigation
         record = self.get(task_id, version)
         by_kind: dict[str, list[HistoricalSemanticItem]] = {}
         for item in record.semantic_items:
@@ -649,47 +649,10 @@ class HistoryRepository:
             | FileChangeEvidence
             | ApprovalEvidence
             | ResearchStatusEvidence
-        ] = []
-        for envelope in evidence.list_for_task(task_id):
-            if envelope.kind in {
-                EvidenceKind.TEST,
-                EvidenceKind.FILE_CHANGE,
-                EvidenceKind.APPROVAL,
-                EvidenceKind.RESEARCH_STATUS,
-            }:
-                deterministic.append(restore_deterministic_evidence(envelope))
-            elif envelope.kind is EvidenceKind.SEMANTIC_CLAIM:
-                claim = ProvenancedClaim.model_validate(envelope.payload)
-                facts[claim.claim_id] = claim
-
-        for current in investigation.list_hypotheses(task_id):
-            hypotheses[current.hypothesis_id] = HypothesisRecord(
-                hypothesis_id=current.hypothesis_id,
-                text=current.statement,
-                state={
-                    "candidate": "active",
-                    "supported": "confirmed",
-                    "rejected": "rejected",
-                }[current.state],
-                reason=current.reason,
-                reopens_hypothesis_id=current.reopens_hypothesis_id,
-                sources=[
-                    ProvenanceRef(kind="system_evidence", ref_id=evidence_id)
-                    for evidence_id in current.evidence_ids
-                ],
-                updated_in_version=record.version,
-            )
-        for question in investigation.list_questions(task_id):
-            if question.status == "resolved":
-                questions.pop(question.question_id, None)
-                continue
-            questions[question.question_id] = ProvenancedText(
-                text=question.text,
-                sources=[
-                    ProvenanceRef(kind="snapshot_record", ref_id=source_id)
-                    for source_id in question.source_ids
-                ],
-            )
+        ] = [
+            _restore_historical_evidence(item)
+            for item in by_kind.get("evidence", [])
+        ]
 
         block = DeterministicEvidenceBlock(
             tests=[item for item in deterministic if isinstance(item, SystemTestEvidence)],
@@ -1153,6 +1116,26 @@ def _deterministic_roots(
     elif isinstance(item, ResearchStatusEvidence) and item.artifact_path is not None:
         roots.append(item.artifact_path)
     return list(dict.fromkeys(roots))
+
+
+def _restore_historical_evidence(
+    item: HistoricalSemanticItem,
+) -> (
+    SystemTestEvidence
+    | FileChangeEvidence
+    | ApprovalEvidence
+    | ResearchStatusEvidence
+):
+    models = {
+        "SystemTestEvidence": SystemTestEvidence,
+        "FileChangeEvidence": FileChangeEvidence,
+        "ApprovalEvidence": ApprovalEvidence,
+        "ResearchStatusEvidence": ResearchStatusEvidence,
+    }
+    model = models.get(item.payload_type)
+    if model is None:
+        raise ValueError(f"unsupported historical evidence type: {item.payload_type}")
+    return model.model_validate(item.payload)
 
 
 def _stable_item_id(task_id: str, kind: str, semantic_id: str) -> str:

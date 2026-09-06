@@ -14,6 +14,8 @@ from deepfix.verification import VerificationOracle, VerificationPolicy, evaluat
 
 
 class OutcomeAdjudicationInput(StrictModel):
+    current_code_state_hash: str | None = Field(default=None, min_length=1)
+    workspace_baseline_id: str | None = Field(default=None, min_length=1)
     definition: TaskDefinition
     lifecycle: TaskLifecycle
     verification_policy: VerificationPolicy | None
@@ -57,6 +59,8 @@ class OutcomeAdjudicator:
             oracle = evaluate_required_oracles(
                 value.verification_policy,
                 value.verification.test_evidence,
+                current_code_state_hash=value.current_code_state_hash,
+                workspace_baseline_id=value.workspace_baseline_id,
             )
             if oracle.conflicting_evidence_ids:
                 return OutcomeAssessment(
@@ -65,10 +69,7 @@ class OutcomeAdjudicator:
                     blocking_evidence_ids=oracle.conflicting_evidence_ids,
                 )
             if oracle.fixed_allowed and real_change_ids:
-                required_test_ids = _required_test_evidence_ids(
-                    value.verification_policy,
-                    value.verification.test_evidence,
-                )
+                required_test_ids = oracle.accepted_required_evidence_ids
                 evidence_ids = list(dict.fromkeys([*real_change_ids, *required_test_ids]))
                 return OutcomeAssessment(
                     outcome="fixed",
@@ -80,6 +81,8 @@ class OutcomeAdjudicator:
             baseline_ids = _passing_user_baseline_ids(
                 value.verification_policy,
                 value.verification.test_evidence,
+                current_code_state_hash=value.current_code_state_hash,
+                workspace_baseline_id=value.workspace_baseline_id,
             )
             if baseline_ids:
                 return OutcomeAssessment(
@@ -103,11 +106,7 @@ class OutcomeAdjudicator:
         task_ids = {
             value.definition.task_id,
             value.lifecycle.task_id,
-            *(
-                [value.verification_policy.task_id]
-                if value.verification_policy is not None
-                else []
-            ),
+            *([value.verification_policy.task_id] if value.verification_policy is not None else []),
         }
         if len(task_ids) != 1:
             raise ValueError("adjudication inputs belong to different tasks")
@@ -141,8 +140,7 @@ class OutcomeAdjudicator:
             separators=(",", ":"),
         )
         return AdjudicationDecision(
-            decision_id="adjudication_"
-            + hashlib.sha256(semantic.encode("utf-8")).hexdigest()[:32],
+            decision_id="adjudication_" + hashlib.sha256(semantic.encode("utf-8")).hexdigest()[:32],
             task_id=value.definition.task_id,
             outcome=outcome,
             evidence_ids=evidence_ids,
@@ -151,38 +149,31 @@ class OutcomeAdjudicator:
         )
 
 
-def _required_test_evidence_ids(
-    policy: VerificationPolicy,
-    evidence: list[SystemTestEvidence],
-) -> list[str]:
-    selected: list[str] = []
-    for oracle in policy.required_oracles:
-        matches = [
-            item
-            for item in evidence
-            if _matches_oracle(item, oracle)
-            and _timing_satisfies(item.timing, oracle.required_timing)
-        ]
-        if matches and matches[-1].exit_code == oracle.expected_exit_code:
-            selected.append(matches[-1].evidence_id)
-    return selected
-
-
 def _passing_user_baseline_ids(
     policy: VerificationPolicy | None,
     evidence: list[SystemTestEvidence],
+    *,
+    current_code_state_hash: str | None = None,
+    workspace_baseline_id: str | None = None,
 ) -> list[str]:
     if policy is None:
         return []
     selected: list[str] = []
-    user_oracles = [
-        item for item in policy.required_oracles if item.origin == "user_specified"
-    ]
+    user_oracles = [item for item in policy.required_oracles if item.origin == "user_specified"]
     for oracle in user_oracles:
         matches = [
             item
             for item in evidence
-            if _matches_oracle(item, oracle) and item.timing == "baseline"
+            if _matches_oracle(item, oracle)
+            and item.timing == "baseline"
+            and (
+                current_code_state_hash is None
+                or item.code_state_hash == current_code_state_hash
+            )
+            and (
+                workspace_baseline_id is None
+                or item.workspace_baseline_id == workspace_baseline_id
+            )
         ]
         if not matches or matches[-1].exit_code != oracle.expected_exit_code:
             return []
@@ -191,15 +182,9 @@ def _passing_user_baseline_ids(
 
 
 def _matches_oracle(item: SystemTestEvidence, oracle: VerificationOracle) -> bool:
-    return item.origin == oracle.origin and _normalize_command(
-        item.command
-    ) == _normalize_command(oracle.command)
-
-
-def _timing_satisfies(actual: str, required: str) -> bool:
-    if required == "baseline":
-        return actual == "baseline"
-    return actual in {"post_change", "post_recovery"}
+    return item.origin == oracle.origin and _normalize_command(item.command) == _normalize_command(
+        oracle.command
+    )
 
 
 def _normalize_command(command: str) -> str:

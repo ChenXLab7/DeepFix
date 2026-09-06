@@ -24,6 +24,7 @@ class TaskLifecycleStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
+    WAITING_INPUT = "waiting_input"
     PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -45,6 +46,7 @@ _ALLOWED_LIFECYCLE_TRANSITIONS: dict[
     TaskLifecycleStatus.RUNNING: frozenset(
         {
             TaskLifecycleStatus.WAITING_APPROVAL,
+            TaskLifecycleStatus.WAITING_INPUT,
             TaskLifecycleStatus.PAUSED,
             TaskLifecycleStatus.COMPLETED,
             TaskLifecycleStatus.FAILED,
@@ -66,6 +68,9 @@ _ALLOWED_LIFECYCLE_TRANSITIONS: dict[
             TaskLifecycleStatus.FAILED,
             TaskLifecycleStatus.CANCELLED,
         }
+    ),
+    TaskLifecycleStatus.WAITING_INPUT: frozenset(
+        {TaskLifecycleStatus.RUNNING, TaskLifecycleStatus.PAUSED, TaskLifecycleStatus.CANCELLED}
     ),
     TaskLifecycleStatus.COMPLETED: frozenset(),
     TaskLifecycleStatus.FAILED: frozenset(),
@@ -96,6 +101,27 @@ class TaskDefinition(StrictModel):
     project_python: str = Field(min_length=1)
     confinement_level: str = Field(min_length=1)
     created_at: str = Field(min_length=1)
+
+
+class TaskInput(StrictModel):
+    """Original user contribution; its interpretation never grants execution authority."""
+
+    input_id: str
+    task_id: str
+    text: str = Field(min_length=1)
+    kind: Literal["problem", "control", "information", "direction", "hypothesis", "constraint"]
+    supersedes_input_id: str | None = None
+    created_at: str
+
+
+class TaskRun(StrictModel):
+    """Execution identity and durable usage, not another lifecycle authority."""
+
+    run_id: str
+    task_id: str
+    input_id: str
+    invocations: int = 0
+    created_at: str
 
 
 class TaskLifecycle(StrictModel):

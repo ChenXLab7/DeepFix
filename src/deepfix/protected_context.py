@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from html import escape
@@ -37,6 +36,7 @@ from deepfix.domain_repositories.execution import ExecutionIntegrity
 from deepfix.investigation.models import InvestigationHypothesis
 from deepfix.prompting import model_request_task_id
 from deepfix.research.models import ExternalEvidence
+from deepfix.task_domain.models import TaskInput
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,7 @@ class ProtectedContext:
     execution_integrity: ExecutionIntegrity
     external_evidence: tuple[ExternalEvidence, ...]
     active_snapshot: CompactionSnapshot | None
+    user_inputs: tuple[TaskInput, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -79,13 +80,9 @@ class ProtectedContextBuilder:
             definition = self.repositories.tasks.get_definition(task_id)
             lifecycle = self.repositories.tasks.get_lifecycle(task_id)
             normalized_event = (
-                DeepFixCompactionEvent.model_validate(event)
-                if isinstance(event, dict)
-                else event
+                DeepFixCompactionEvent.model_validate(event) if isinstance(event, dict) else event
             )
-            active_record = self.repositories.history.active_from_event(
-                task_id, normalized_event
-            )
+            active_record = self.repositories.history.active_from_event(task_id, normalized_event)
             if active_record is not None:
                 active_snapshot = self.repositories.history.project_snapshot(
                     task_id,
@@ -111,15 +108,14 @@ class ProtectedContextBuilder:
             )
             integrity = self.repositories.execution.integrity_view(task_id)
             execution_approvals = self.repositories.execution.list_approvals(task_id)
+            inputs = self.repositories.tasks.list_inputs(task_id)
         except Exception as exc:
             raise ProtectedContextLoadError(
                 ContextRecoveryMetadata(
                     task_id=task_id,
                     stage="protected_context",
                     error_code="protected_context_read_failed",
-                    active_snapshot_version=(
-                        active_snapshot.version if active_snapshot else None
-                    ),
+                    active_snapshot_version=(active_snapshot.version if active_snapshot else None),
                     original_messages_preserved=True,
                 )
             ) from exc
@@ -127,17 +123,20 @@ class ProtectedContextBuilder:
         identities = ensure_message_ids(task_id, request_messages).messages
         user_messages = [item for item in identities if isinstance(item, HumanMessage)]
         latest_user_message_id = (
-            str(user_messages[-1].id)
-            if user_messages
-            else definition.original_message_id
+            str(user_messages[-1].id) if user_messages else definition.original_message_id
         )
-        constraints = _current_constraints(
-            task_id,
-            definition.original_message_id,
-            definition.original_problem,
-            user_messages,
-            active_snapshot,
-        )
+        superseded = {item.supersedes_input_id for item in inputs if item.supersedes_input_id}
+        constraints = [
+            UserConstraint(
+                constraint_id=item.input_id,
+                text=item.text,
+                source_user_message_id=item.input_id,
+            )
+            for item in inputs
+            if item.kind == "constraint" and item.input_id not in superseded
+        ]
+        if inputs:
+            latest_user_message_id = inputs[-1].input_id
         deterministic = [
             restore_deterministic_evidence(item)
             for item in envelopes
@@ -150,9 +149,7 @@ class ProtectedContextBuilder:
             }
         ]
         approval_by_id = {
-            item.evidence_id: item
-            for item in deterministic
-            if isinstance(item, ApprovalEvidence)
+            item.evidence_id: item for item in deterministic if isinstance(item, ApprovalEvidence)
         }
         for item in execution_approvals:
             approval_by_id.setdefault(
@@ -174,6 +171,7 @@ class ProtectedContextBuilder:
             ProvenancedClaim.model_validate(item.payload)
             for item in envelopes
             if item.kind is EvidenceKind.SEMANTIC_CLAIM
+            and item.verification_state.value == "verified"
         )
         external = tuple(
             restore_external_evidence(item)
@@ -197,6 +195,7 @@ class ProtectedContextBuilder:
             execution_integrity=integrity,
             external_evidence=external,
             active_snapshot=active_snapshot,
+            user_inputs=tuple(item for item in inputs if item.input_id not in superseded),
         )
 
 
@@ -213,9 +212,7 @@ class ProtectedContextProjector:
             deterministic_evidence_xml=_render_deterministic_evidence(
                 context.deterministic_evidence
             ),
-            execution_integrity_xml=_render_execution_integrity(
-                context.execution_integrity
-            ),
+            execution_integrity_xml=_render_execution_integrity(context.execution_integrity),
             visible_snapshot_xml=_render_visible_snapshot(visible, context),
         )
 
@@ -260,35 +257,6 @@ def render_protected_context(
     return "<deepfix_protected_context>\n" + "\n\n".join(blocks) + "\n</deepfix_protected_context>"
 
 
-def _current_constraints(
-    task_id: str,
-    original_message_id: str,
-    original_problem: str,
-    messages: Sequence[HumanMessage],
-    snapshot: CompactionSnapshot | None,
-) -> list[UserConstraint]:
-    constraints = {
-        item.constraint_id: item for item in (snapshot.user_constraints if snapshot else [])
-    }
-    all_messages = [(original_message_id, original_problem)]
-    all_messages.extend(
-        (str(item.id), str(item.content))
-        for item in messages
-        if str(item.id) != original_message_id
-    )
-    for message_id, text in all_messages:
-        identity = hashlib.sha256(
-            f"{task_id}\0{message_id}\0{' '.join(text.split())}".encode()
-        ).hexdigest()[:32]
-        constraint = UserConstraint(
-            constraint_id=f"constraint_{identity}",
-            text=text,
-            source_user_message_id=message_id,
-        )
-        constraints[constraint.constraint_id] = constraint
-    return list(constraints.values())
-
-
 def _hypothesis_record(item: InvestigationHypothesis, version: int) -> HypothesisRecord:
     return HypothesisRecord(
         hypothesis_id=item.hypothesis_id,
@@ -323,7 +291,13 @@ def _render_anchor(anchor: TaskAnchor) -> str:
 
 
 def _render_current_state(context: ProtectedContext) -> str:
-    lines = ["<deepfix_current_state>", "<confirmed_facts>"]
+    lines = ["<deepfix_current_state>", "<user_inputs>"]
+    lines.extend(
+        f'<input id="{_xml(item.input_id, 120)}" kind="{item.kind}">{_xml(item.text, 2000)}</input>'
+        for item in context.user_inputs[-30:]
+        if item.kind not in {"problem", "constraint"}
+    )
+    lines.extend(["</user_inputs>", "<confirmed_facts>"])
     lines.extend(
         f'<fact claim_id="{_xml(item.claim_id, 120)}">{_xml(item.text, 500)}</fact>'
         for item in context.confirmed_facts
@@ -334,7 +308,9 @@ def _render_current_state(context: ProtectedContext) -> str:
         for item in context.hypotheses
     )
     lines.extend(("</hypotheses>", "<unresolved_questions>"))
-    lines.extend(f"<question>{_xml(item.text, 500)}</question>" for item in context.unresolved_questions)
+    lines.extend(
+        f"<question>{_xml(item.text, 500)}</question>" for item in context.unresolved_questions
+    )
     lines.extend(("</unresolved_questions>", "<external_research>"))
     lines.extend(
         f'<external evidence_id="{_xml(item.evidence_id, 120)}" verification="{_xml(str(item.local_verification), 80)}"><title>{_xml(item.title, 300)}</title><excerpt>{_xml(item.relevant_excerpt, 600)}</excerpt></external>'
@@ -400,20 +376,31 @@ def _render_visible_snapshot(
     lines = [f'<compaction_history_projection version="{snapshot.version}">']
     lines.extend(
         f'<historical_constraint constraint_id="{_xml(item.constraint_id, 120)}" />'
-        for item in snapshot.user_constraints if item.constraint_id not in constraint_ids
+        for item in snapshot.user_constraints
+        if item.constraint_id not in constraint_ids
     )
     lines.extend(
         f'<historical_fact claim_id="{_xml(item.claim_id, 120)}">{_xml(item.text, 500)}</historical_fact>'
-        for item in snapshot.confirmed_facts if item.claim_id not in claim_ids
+        for item in snapshot.confirmed_facts
+        if item.claim_id not in claim_ids
     )
     lines.extend(
         f'<historical_hypothesis hypothesis_id="{_xml(item.hypothesis_id, 120)}" state="{item.state}"><text>{_xml(item.text, 500)}</text><reason>{_xml(item.reason or "", 500)}</reason></historical_hypothesis>'
-        for item in [*snapshot.active_hypotheses, *snapshot.rejected_hypotheses, *snapshot.confirmed_hypotheses]
+        for item in [
+            *snapshot.active_hypotheses,
+            *snapshot.rejected_hypotheses,
+            *snapshot.confirmed_hypotheses,
+        ]
         if item.hypothesis_id not in hypothesis_ids
     )
     lines.extend(
         f'<historical_evidence evidence_id="{_xml(item.evidence_id, 120)}" />'
-        for item in [*snapshot.deterministic_evidence.tests, *snapshot.deterministic_evidence.files, *snapshot.deterministic_evidence.approvals, *snapshot.deterministic_evidence.research]
+        for item in [
+            *snapshot.deterministic_evidence.tests,
+            *snapshot.deterministic_evidence.files,
+            *snapshot.deterministic_evidence.approvals,
+            *snapshot.deterministic_evidence.research,
+        ]
         if item.evidence_id not in evidence_ids
     )
     lines.extend(

@@ -52,6 +52,7 @@ def test_lifecycle_excludes_agent_phases() -> None:
         "created",
         "running",
         "waiting_approval",
+        "waiting_input",
         "paused",
         "completed",
         "failed",

@@ -64,6 +64,15 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser = subparsers.add_parser("resume", help="恢复已有任务")
     resume_parser.add_argument("task_id", help="任务 ID")
     resume_parser.add_argument("message", nargs="?", help="补充给 Agent 的信息")
+    resume_parser.add_argument(
+        "--kind",
+        choices=("information", "control", "direction", "hypothesis", "constraint"),
+        default="information",
+        help="补充信息的类型",
+    )
+    resume_parser.add_argument("--supersedes", help="被本次补充替代的输入 ID")
+    new_parser.add_argument("--once", action="store_true", help="单次运行后交还终端")
+    resume_parser.add_argument("--once", action="store_true", help="单次运行后交还终端")
 
     subparsers.add_parser("list", help="列出最近任务")
     return parser
@@ -75,49 +84,77 @@ def run_interaction(
     *,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
+    once: bool = False,
 ) -> TaskRuntime:
-    while (
-        task.lifecycle is TaskLifecycleStatus.WAITING_APPROVAL
-        and task.pending_actions
-    ):
-        decisions: list[str] = []
-        for action in task.pending_actions:
-            risk = str(action.get("risk", "L2"))
-            name = str(action.get("name", "unknown"))
-            args = action.get("args", {})
-            args = args if isinstance(args, Mapping) else {}
-            summary = _action_summary(name, args)
-            reason = str(action.get("reason", action.get("description", "")))
-            policy_action = str(action.get("policy_action", "ask"))
-            output_fn(f"[{risk}] {name}: {summary}")
-            output_fn(f"原因: {reason or '未提供'}")
+    while True:
+        while (
+            task.lifecycle is TaskLifecycleStatus.WAITING_APPROVAL
+            and task.pending_actions
+        ):
+            decisions: list[str] = []
+            for action in task.pending_actions:
+                risk = str(action.get("risk", "L2"))
+                name = str(action.get("name", "unknown"))
+                args = action.get("args", {})
+                args = args if isinstance(args, Mapping) else {}
+                summary = _action_summary(name, args)
+                reason = str(action.get("reason", action.get("description", "")))
+                policy_action = str(action.get("policy_action", "ask"))
+                output_fn(f"[{risk}] {name}: {summary}")
+                output_fn(f"原因: {reason or '未提供'}")
 
-            if policy_action == "deny":
-                output_fn("策略判定为 L3，强制拒绝；不会提供批准选项。")
-                decisions.append("reject")
-                continue
-            if policy_action == "allow":
-                output_fn("策略允许，自动批准。")
-                decisions.append("approve")
-                continue
+                if policy_action == "deny":
+                    output_fn("策略判定为 L3，强制拒绝；不会提供批准选项。")
+                    decisions.append("reject")
+                    continue
+                if policy_action == "allow":
+                    output_fn("策略允许，自动批准。")
+                    decisions.append("approve")
+                    continue
 
-            while True:
-                choice = input_fn("选择 [a]批准 / [r]拒绝 / [q]暂停: ").strip().lower()
-                if choice == "q":
-                    return service.pause_task(task.task_id, "用户从终端暂停审批")
-                if choice in {"a", "r"}:
-                    decisions.append("approve" if choice == "a" else "reject")
-                    break
-                output_fn("无效选择，请输入 a、r 或 q。")
-        task = service.decide(task.task_id, decisions)
+                while True:
+                    try:
+                        choice = input_fn("选择 [a]批准 / [r]拒绝 / [q]暂停: ").strip().lower()
+                    except EOFError:
+                        output_fn("输入结束；任务已保留，可稍后使用 resume 继续。")
+                        return task
+                    if choice == "q":
+                        return service.pause_task(task.task_id, "用户从终端暂停审批")
+                    if choice in {"a", "r"}:
+                        decisions.append("approve" if choice == "a" else "reject")
+                        break
+                    output_fn("无效选择，请输入 a、r 或 q。")
+            task = service.decide(task.task_id, decisions)
 
-    output_fn(f"任务 ID: {task.task_id}")
-    repositories = getattr(service, "repositories", None)
-    if isinstance(repositories, DomainRepositories):
-        output_fn(render_report(build_task_report_view(repositories, task.task_id)))
-    elif task.lifecycle is TaskLifecycleStatus.PAUSED:
-        output_fn(f"任务已暂停: {task.pause_reason or '请提供更多信息'}")
-    return task
+        if task.lifecycle is TaskLifecycleStatus.WAITING_INPUT:
+            output_fn(f"任务 ID: {task.task_id}")
+            output_fn(f"等待用户补充（handoff）：{task.pause_reason or '请提供更多信息'}")
+            if once:
+                return task
+            try:
+                reply = input_fn("回复（/pause 暂停任务）: ").strip()
+            except EOFError:
+                output_fn("输入结束；任务已保留，可稍后使用 resume 继续。")
+                return task
+            if reply.lower() == "/pause":
+                return service.pause_task(task.task_id, "用户从终端暂停等待输入")
+            if not reply:
+                output_fn("未收到补充；任务已保留，可稍后使用 resume 继续。")
+                return task
+            task = service.continue_task(
+                task.task_id,
+                reply,
+                input_kind="information",
+            )
+            continue
+
+        output_fn(f"任务 ID: {task.task_id}")
+        repositories = getattr(service, "repositories", None)
+        if isinstance(repositories, DomainRepositories):
+            output_fn(render_report(build_task_report_view(repositories, task.task_id)))
+        elif task.lifecycle is TaskLifecycleStatus.PAUSED:
+            output_fn(f"任务已暂停: {task.pause_reason or '请提供更多信息'}")
+        return task
 
 
 def print_task_list(
@@ -225,7 +262,10 @@ def main(
             else:
                 assert stored_task is not None
                 runtime = service.get_runtime(stored_task.task_id)
-                task = _resume_from_cli(service, runtime, args.message, write_output)
+                task = _resume_from_cli(
+                    service, runtime, args.message, write_output,
+                    input_kind=args.kind, supersedes_input_id=args.supersedes,
+                )
                 if task is None:
                     return 2
             run_interaction(
@@ -233,6 +273,7 @@ def main(
                 task,
                 input_fn=read_input,
                 output_fn=write_output,
+                once=args.once,
             )
     return 0
 
@@ -284,6 +325,9 @@ def _resume_from_cli(
     task: TaskRuntime,
     message: str | None,
     output_fn: Callable[[str], None],
+    *,
+    input_kind: str = "information",
+    supersedes_input_id: str | None = None,
 ) -> TaskRuntime | None:
     if (
         task.lifecycle is TaskLifecycleStatus.WAITING_APPROVAL
@@ -296,12 +340,17 @@ def _resume_from_cli(
         and not message
     ):
         return service.continue_task(task.task_id)
-    if task.lifecycle is TaskLifecycleStatus.PAUSED and not message:
+    if task.lifecycle in {TaskLifecycleStatus.PAUSED, TaskLifecycleStatus.WAITING_INPUT} and not message:
         return task
     if not message or not message.strip():
         output_fn("恢复该任务需要提供 MESSAGE。")
         return None
-    return service.continue_task(task.task_id, message)
+    return service.continue_task(
+        task.task_id,
+        message,
+        input_kind=input_kind,
+        supersedes_input_id=supersedes_input_id,
+    )
 
 
 def _action_summary(name: str, args: Mapping[str, object]) -> str:

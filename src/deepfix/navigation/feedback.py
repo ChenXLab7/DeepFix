@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
@@ -14,6 +15,12 @@ from deepfix.domain_repositories.evidence import restore_deterministic_evidence
 from deepfix.verification import (
     VerificationPolicy,
     evaluate_required_oracles,
+)
+from deepfix.workspace import (
+    TaskWorkspace,
+    WorkspaceBaselineError,
+    WorkspaceFactory,
+    compute_code_state_hash,
 )
 
 
@@ -37,12 +44,16 @@ class NavigationFeedbackSource(Protocol):
 class RepositoryNavigationFeedbackSource:
     """Project advisory milestones from bounded domain authorities."""
 
-    def __init__(self, repositories: DomainRepositories) -> None:
+    def __init__(
+        self, repositories: DomainRepositories, *, workspace: TaskWorkspace | None = None
+    ) -> None:
         self.repositories = repositories
+        self.workspace = workspace
 
     def build(self, task_id: str) -> NavigationFeedback:
         """Read current stores once and return stable, non-persisted advice."""
 
+        workspace = self._workspace_for_task(task_id)
         hypotheses = self.repositories.investigation.list_hypotheses(task_id)
         evidence = [
             restore_deterministic_evidence(item)
@@ -62,9 +73,7 @@ class RepositoryNavigationFeedbackSource:
         for hypothesis in hypotheses:
             if hypothesis.state == "supported":
                 milestone_id = f"supported-hypothesis:{hypothesis.hypothesis_id}"
-                milestones[milestone_id] = (
-                    f"Supported hypothesis: {hypothesis.hypothesis_id}."
-                )
+                milestones[milestone_id] = f"Supported hypothesis: {hypothesis.hypothesis_id}."
         if integrity.incomplete_operation_ids or integrity.unknown_operation_ids:
             milestones["execution-recovery-pending"] = (
                 "Execution recovery is pending before further side effects."
@@ -78,7 +87,6 @@ class RepositoryNavigationFeedbackSource:
             }
         )
         tests = [item for item in evidence if isinstance(item, SystemTestEvidence)]
-        evaluation = evaluate_required_oracles(policy, tests) if policy is not None else None
         latest_successful_change = max(
             (
                 index
@@ -87,14 +95,33 @@ class RepositoryNavigationFeedbackSource:
             ),
             default=None,
         )
-        current_verification = evaluation is not None and evaluation.fixed_allowed and (
-            latest_successful_change is None
-            or _required_oracles_verified_after(
-                policy,
-                evidence,
-                latest_successful_change,
-            )
+        # Offline projections can only use ledger order to bound freshness.
+        # Live projections always compare with the actual workspace manifest.
+        current_tests = (
+            tests
+            if workspace is not None
+            else [
+                item
+                for index, item in enumerate(evidence)
+                if isinstance(item, SystemTestEvidence)
+                and (latest_successful_change is None or index > latest_successful_change)
+            ]
         )
+        evaluation = (
+            evaluate_required_oracles(
+                policy,
+                current_tests,
+                current_code_state_hash=compute_code_state_hash(workspace.root)
+                if workspace
+                else None,
+                workspace_baseline_id=workspace.baseline.baseline_id
+                if workspace
+                else None,
+            )
+            if policy is not None
+            else None
+        )
+        current_verification = evaluation is not None and evaluation.fixed_allowed
 
         if successful_paths and not current_verification:
             milestones["verification-pending"] = (
@@ -104,9 +131,7 @@ class RepositoryNavigationFeedbackSource:
             )
         if current_verification:
             passed_ids = ", ".join(sorted(evaluation.passed_required_oracle_ids))
-            milestones["required-oracles-satisfied"] = (
-                f"Required oracles satisfied: {passed_ids}."
-            )
+            milestones["required-oracles-satisfied"] = f"Required oracles satisfied: {passed_ids}."
         if (
             not successful_paths
             and policy is not None
@@ -122,6 +147,29 @@ class RepositoryNavigationFeedbackSource:
             lines=tuple(milestones[milestone_id] for milestone_id in milestone_ids),
             fingerprint=_fingerprint(milestone_ids),
         )
+
+    def _workspace_for_task(self, task_id: str) -> TaskWorkspace | None:
+        if self.workspace is not None:
+            if self.workspace.task_id != task_id:
+                raise ValueError("navigation workspace belongs to another task")
+            return self.workspace
+
+        try:
+            definition = self.repositories.tasks.get_definition(task_id)
+        except KeyError:
+            return None
+        if definition.workspace_baseline_id is None:
+            return None
+        try:
+            workspace = WorkspaceFactory(Path(definition.workspace_root).parent).load(task_id)
+        except (OSError, ValueError, WorkspaceBaselineError):
+            return None
+        if (
+            workspace.root != Path(definition.workspace_root).resolve()
+            or workspace.baseline.baseline_id != definition.workspace_baseline_id
+        ):
+            return None
+        return workspace
 
 
 def _has_matching_user_baseline_pass(
@@ -143,33 +191,6 @@ def _has_matching_user_baseline_pass(
         if matching and all(item.exit_code == oracle.expected_exit_code for item in matching):
             return True
     return False
-
-
-def _required_oracles_verified_after(
-    policy: VerificationPolicy,
-    evidence: list[object],
-    latest_successful_change: int,
-) -> bool:
-    """Require every oracle's expected result after the latest successful change."""
-
-    for oracle in policy.required_oracles:
-        if not any(
-            isinstance(item, SystemTestEvidence)
-            and index > latest_successful_change
-            and item.exit_code == oracle.expected_exit_code
-            and _normalize_command(item.command) == _normalize_command(oracle.command)
-            and _timing_satisfies(item.timing, oracle.required_timing)
-            for index, item in enumerate(evidence)
-        ):
-            return False
-    return bool(policy.required_oracles)
-
-
-def _timing_satisfies(actual: str, required: str) -> bool:
-    return actual == "baseline" if required == "baseline" else actual in {
-        "post_change",
-        "post_recovery",
-    }
 
 
 def _normalize_command(command: str) -> str:

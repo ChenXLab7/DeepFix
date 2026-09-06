@@ -15,7 +15,7 @@ class NarrativeEvidenceCandidate(StrictModel):
 class RepairOutcomeCandidate(StrictModel):
     """Model-authored narrative proposal; never an evidence authority."""
 
-    status: Literal["needs_input", "completed", "blocked"]
+    status: Literal["continue", "needs_input", "completed", "blocked"]
     resolution: Literal["fixed", "not_reproduced"] | None = None
     question: str | None = None
     summary: str = Field(min_length=1)

@@ -129,9 +129,7 @@ def test_repository_suite_is_required_when_user_did_not_name_a_test(
 
     policy = VerificationPolicyBuilder().build(task, task_workspace)
 
-    assert [item.command for item in policy.required_oracles] == [
-        "python -m pytest -q"
-    ]
+    assert [item.command for item in policy.required_oracles] == ["python -m pytest -q"]
 
 
 def test_required_unavailable_and_related_suite_failure_block_fixed(
@@ -167,9 +165,11 @@ def test_required_unavailable_and_related_suite_failure_block_fixed(
     assert conflict.conflicting_evidence_ids == ["suite-failure"]
 
 
+@pytest.mark.parametrize("exit_code", [2, 3, 4, 5, -1])
 def test_pytest_usage_error_keeps_required_oracle_unavailable(
     task_workspace,
     task,
+    exit_code,
 ):
     policy = VerificationPolicyBuilder().build(task, task_workspace)
     oracle = policy.required_oracles[0]
@@ -177,13 +177,9 @@ def test_pytest_usage_error_keeps_required_oracle_unavailable(
         oracle.command,
         origin="user_specified",
         scope="targeted",
-        exit_code=4,
+        exit_code=exit_code,
         evidence_id="pytest-usage-error",
-    ).model_copy(
-        update={
-            "summary": "pytest: error: unrecognized arguments: --timeout=5"
-        }
-    )
+    ).model_copy(update={"summary": "pytest: error: unrecognized arguments: --timeout=5"})
 
     evaluation = evaluate_required_oracles(policy, [usage_error])
 
@@ -192,9 +188,11 @@ def test_pytest_usage_error_keeps_required_oracle_unavailable(
     assert evaluation.fixed_allowed is False
 
 
+@pytest.mark.parametrize("exit_code", [2, 3, 4, 5, -1])
 def test_pytest_usage_error_is_not_a_repository_failure_conflict(
     task_workspace,
     task,
+    exit_code,
 ):
     policy = VerificationPolicyBuilder().build(task, task_workspace)
     oracle = policy.required_oracles[0]
@@ -209,7 +207,7 @@ def test_pytest_usage_error_is_not_a_repository_failure_conflict(
         "python -m pytest -q",
         origin="repository_existing",
         scope="full_suite",
-        exit_code=4,
+        exit_code=exit_code,
         evidence_id="suite-usage-error",
     )
 
@@ -220,6 +218,73 @@ def test_pytest_usage_error_is_not_a_repository_failure_conflict(
 
     assert evaluation.conflicting_evidence_ids == []
     assert evaluation.fixed_allowed is True
+
+
+@pytest.mark.parametrize(
+    ("current_hash", "baseline", "allowed"),
+    [
+        ("code-a", "baseline-a", True),
+        ("code-b", "baseline-a", False),
+        ("code-a", "baseline-b", False),
+    ],
+)
+def test_verification_is_bound_to_live_workspace(
+    task_workspace, task, current_hash, baseline, allowed
+):
+    policy = VerificationPolicyBuilder().build(task, task_workspace)
+    passing = _test_evidence(
+        policy.required_oracles[0].command,
+        origin="user_specified",
+        scope="targeted",
+        exit_code=0,
+        evidence_id="pass",
+    )
+    result = evaluate_required_oracles(
+        policy, [passing], current_code_state_hash=current_hash, workspace_baseline_id=baseline
+    )
+    assert result.fixed_allowed is allowed
+
+
+def test_old_repository_failure_does_not_block_current_pass(task_workspace, task):
+    policy = VerificationPolicyBuilder().build(task, task_workspace)
+    failure = _test_evidence(
+        "python -m pytest -q",
+        origin="repository_existing",
+        scope="full_suite",
+        exit_code=1,
+        evidence_id="old-fail",
+    )
+    passing = _test_evidence(
+        policy.required_oracles[0].command,
+        origin="user_specified",
+        scope="targeted",
+        exit_code=0,
+        evidence_id="current-pass",
+    ).model_copy(update={"code_state_hash": "code-b"})
+    result = evaluate_required_oracles(policy, [failure, passing], current_code_state_hash="code-b")
+    assert result.fixed_allowed
+    assert result.accepted_required_evidence_ids == ["current-pass"]
+
+
+def test_same_version_repository_failure_still_blocks_current_pass(task_workspace, task):
+    policy = VerificationPolicyBuilder().build(task, task_workspace)
+    failure = _test_evidence(
+        "python -m pytest -q",
+        origin="repository_existing",
+        scope="full_suite",
+        exit_code=1,
+        evidence_id="fail",
+    )
+    passing = _test_evidence(
+        policy.required_oracles[0].command,
+        origin="user_specified",
+        scope="targeted",
+        exit_code=0,
+        evidence_id="pass",
+    )
+    result = evaluate_required_oracles(policy, [failure, passing], current_code_state_hash="code-a")
+    assert not result.fixed_allowed
+    assert result.conflicting_evidence_ids == ["fail"]
 
 
 @pytest.mark.parametrize(

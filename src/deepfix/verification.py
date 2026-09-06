@@ -90,6 +90,7 @@ class VerificationPolicy(StrictModel):
 
 
 class OracleEvaluation(StrictModel):
+    accepted_required_evidence_ids: list[str] = Field(default_factory=list)
     passed_required_oracle_ids: list[str] = Field(default_factory=list)
     failed_required_oracle_ids: list[str] = Field(default_factory=list)
     unavailable_required_oracle_ids: list[str] = Field(default_factory=list)
@@ -103,9 +104,9 @@ def classify_pytest_result(
 ) -> Literal["passed", "test_failure", "infrastructure_error"]:
     if exit_code == 0:
         return "passed"
-    if exit_code == 4:
-        return "infrastructure_error"
-    return "test_failure"
+    if exit_code == 1:
+        return "test_failure"
+    return "infrastructure_error"
 
 
 def unavailable_required_oracle_paths(
@@ -138,8 +139,7 @@ class VerificationPolicyBuilder:
         required = [
             _oracle(command, "user_specified", "required")
             for command in extract_user_pytest_commands(
-                getattr(task, "original_problem", "")
-                or getattr(task, "user_problem", "")
+                getattr(task, "original_problem", "") or getattr(task, "user_problem", "")
             )
         ]
         supplemental: list[VerificationOracle] = []
@@ -168,9 +168,7 @@ class VerificationPolicyBuilder:
             conflict_rules=[
                 OracleConflictRule(
                     rule_id="related_repository_failure_blocks_fixed",
-                    description=(
-                        "同一代码状态下相关 module/full-suite 失败阻止 FIXED"
-                    ),
+                    description=("同一代码状态下相关 module/full-suite 失败阻止 FIXED"),
                     blocking_scopes=["module", "full_suite"],
                 )
             ],
@@ -180,7 +178,21 @@ class VerificationPolicyBuilder:
 def evaluate_required_oracles(
     policy: VerificationPolicy,
     evidence: list[SystemTestEvidence],
+    *,
+    current_code_state_hash: str | None = None,
+    workspace_baseline_id: str | None = None,
 ) -> OracleEvaluation:
+    """Evaluate trusted results for the supplied workspace version.
+
+    Omitting version context supports offline evidence inspection only; callers
+    deciding live completion must supply both the current hash and baseline.
+    """
+    evidence = [
+        item
+        for item in evidence
+        if (current_code_state_hash is None or item.code_state_hash == current_code_state_hash)
+        and (workspace_baseline_id is None or item.workspace_baseline_id == workspace_baseline_id)
+    ]
     passed: list[str] = []
     failed: list[str] = []
     unavailable: list[str] = []
@@ -193,33 +205,35 @@ def evaluate_required_oracles(
             and item.origin == oracle.origin
             and _timing_satisfies(item.timing, oracle.required_timing)
         ]
-        if not matches or (
-            classify_pytest_result(matches[-1].exit_code) == "infrastructure_error"
-        ):
+        if not matches or (classify_pytest_result(matches[-1].exit_code) == "infrastructure_error"):
             unavailable.append(oracle.oracle_id)
         elif matches[-1].exit_code == oracle.expected_exit_code:
             passed.append(oracle.oracle_id)
             accepted_evidence.append(matches[-1])
         else:
             failed.append(oracle.oracle_id)
-    blocking_scopes = {
-        scope for rule in policy.conflict_rules for scope in rule.blocking_scopes
+    blocking_scopes = {scope for rule in policy.conflict_rules for scope in rule.blocking_scopes}
+    accepted_hashes = {
+        (item.workspace_baseline_id, item.code_state_hash) for item in accepted_evidence
     }
-    accepted_hashes = {item.code_state_hash for item in accepted_evidence}
     conflicts = [
         item.evidence_id
         for item in evidence
-        if item.timing == "post_change"
+        if item.timing in {"post_change", "post_recovery"}
         and classify_pytest_result(item.exit_code) == "test_failure"
         and item.scope in blocking_scopes
         and item.origin == "repository_existing"
-        and (not accepted_hashes or item.code_state_hash in accepted_hashes)
+        and (
+            not accepted_hashes
+            or (item.workspace_baseline_id, item.code_state_hash) in accepted_hashes
+        )
     ]
     if len(accepted_hashes) > 1:
         conflicts.extend(item.evidence_id for item in accepted_evidence)
     conflicts = list(dict.fromkeys(conflicts))
     satisfied = bool(policy.required_oracles) and not failed and not unavailable
     return OracleEvaluation(
+        accepted_required_evidence_ids=[item.evidence_id for item in accepted_evidence],
         passed_required_oracle_ids=passed,
         failed_required_oracle_ids=failed,
         unavailable_required_oracle_ids=unavailable,
@@ -261,10 +275,7 @@ def classify_pytest_scope(command: str) -> Literal["targeted", "module", "full_s
 
 
 def pytest_target_paths(command: str) -> list[str]:
-    return [
-        _normalize_pytest_target(token)
-        for token in _pytest_positional_tokens(command)
-    ]
+    return [_normalize_pytest_target(token) for token in _pytest_positional_tokens(command)]
 
 
 def stable_verification_id(
@@ -292,8 +303,7 @@ def _oracle(
 ) -> VerificationOracle:
     normalized = _normalize_command(command)
     return VerificationOracle(
-        oracle_id="oracle_"
-        + hashlib.sha256(f"{origin}|{normalized}".encode()).hexdigest()[:32],
+        oracle_id="oracle_" + hashlib.sha256(f"{origin}|{normalized}".encode()).hexdigest()[:32],
         origin=origin,
         command=command,
         scope=classify_pytest_scope(command),
@@ -359,7 +369,6 @@ def _timing_satisfies(
 
 def _has_repository_tests(hashes: dict[str, str]) -> bool:
     return any(
-        path.startswith(("tests/", "test/"))
-        or Path(path).name.startswith("test_")
+        path.startswith(("tests/", "test/")) or Path(path).name.startswith("test_")
         for path in hashes
     )

@@ -61,13 +61,12 @@ def test_supported_hypothesis_records_stable_id_without_phase_navigation(tmp_pat
     assert first.hypothesis_id == replay.hypothesis_id
     assert first.hypothesis_id in coordinator.state("task-a").supported_hypothesis_ids
     assert all(
-        event.event_type != "phase_changed"
-        for event in coordinator.store.list_events("task-a")
+        event.event_type != "phase_changed" for event in coordinator.store.list_events("task-a")
     )
-    assert coordinator.state("task-a").diagnostic_decision_required is False
+    assert coordinator.authorize_tool("task-a", "read_file", {"file_path": "src/sign.py"}).allowed
 
 
-def test_failed_post_edit_test_cannot_resupport_same_hypothesis(tmp_path):
+def test_failed_patch_can_preserve_supported_root_cause(tmp_path):
     coordinator = coordinator_fixture(tmp_path)
     seed_evidence(coordinator.evidence_repository, "task-a", "evidence-a")
     seed_checked_location(coordinator.store, "task-a", "src/sign.py", 1, 20)
@@ -107,15 +106,16 @@ def test_failed_post_edit_test_cannot_resupport_same_hypothesis(tmp_path):
         update={"hypothesis_id": supported.hypothesis_id}
     )
 
-    with pytest.raises(ValueError, match="修改后验证失败"):
-        coordinator.record_hypothesis(
-            "task-a",
-            command,
-            source_id="tool-hyp-resupported",
-        )
+    reaffirmed = coordinator.record_hypothesis(
+        "task-a",
+        command,
+        source_id="tool-hyp-resupported",
+    )
+    assert reaffirmed.state == "supported"
+    assert coordinator.authorize_tool("task-a", "read_file", {"file_path": "src/sign.py"}).allowed
 
 
-def test_candidate_hypothesis_does_not_unlock_planning(tmp_path):
+def test_candidate_hypothesis_does_not_gate_investigation(tmp_path):
     coordinator = coordinator_fixture(tmp_path)
     coordinator.record_observation(
         "task-a",
@@ -137,7 +137,7 @@ def test_candidate_hypothesis_does_not_unlock_planning(tmp_path):
     coordinator.record_hypothesis("task-a", command, source_id="tool-hyp-1")
 
     assert coordinator.state("task-a").task_id == "task-a"
-    assert coordinator.state("task-a").diagnostic_decision_required is True
+    assert coordinator.authorize_tool("task-a", "read_file", {"file_path": "src/sign.py"}).allowed
 
 
 def test_repeated_candidate_without_evidence_reuses_semantic_identity(tmp_path):
@@ -158,9 +158,7 @@ def test_repeated_candidate_without_evidence_reuses_semantic_identity(tmp_path):
     version_after_first = coordinator.state("task-a").version
     replay = coordinator.record_hypothesis(
         "task-a",
-        command.model_copy(
-            update={"statement": "capacity=0 may expose a boundary bug"}
-        ),
+        command.model_copy(update={"statement": "capacity=0 may expose a boundary bug"}),
         source_id="candidate-call-2",
     )
     state = coordinator.state("task-a")
@@ -170,7 +168,7 @@ def test_repeated_candidate_without_evidence_reuses_semantic_identity(tmp_path):
     assert state.version == version_after_first
 
 
-def test_candidate_hypothesis_resets_diagnostic_test_counter(tmp_path):
+def test_candidate_after_diagnostic_tests_leaves_tools_available(tmp_path):
     coordinator = coordinator_fixture(tmp_path)
     for index in range(2):
         coordinator.record_observation(
@@ -192,12 +190,10 @@ def test_candidate_hypothesis_resets_diagnostic_test_counter(tmp_path):
 
     coordinator.record_hypothesis("task-a", command, source_id="tool-hyp-new")
 
-    state = coordinator.state("task-a")
-    assert state.diagnostic_test_count_since_decision == 0
-    assert state.diagnostic_decision_required is True
+    assert coordinator.authorize_tool("task-a", "read_file", {"file_path": "src/sign.py"}).allowed
 
 
-def test_user_information_clears_diagnostic_repair_checkpoint(tmp_path):
+def test_user_information_clears_reevaluation_advice(tmp_path):
     coordinator = coordinator_fixture(tmp_path)
     coordinator.record_observation(
         "task-a",
@@ -230,9 +226,7 @@ def test_user_information_clears_diagnostic_repair_checkpoint(tmp_path):
     coordinator.record_user_information("task-a", "user-message-2")
 
     state = coordinator.state("task-a")
-    assert state.diagnostic_test_count_since_decision == 0
-    assert state.diagnostic_decision_required is False
-    assert state.repair_reevaluation_required is False
+    assert state.reevaluation_required is False
 
 
 def test_state_read_failure_becomes_typed_recovery_error(tmp_path, monkeypatch):
@@ -358,13 +352,16 @@ def test_parallel_file_observations_retry_state_conflict_without_losing_updates(
         "python_programs/mergesort.py",
         "python_testcases/test_mergesort.py",
     }
-    assert len(
-        [
-            event
-            for event in coordinator.store.list_events("task-a")
-            if event.event_type == "file_checked"
-        ]
-    ) == 2
+    assert (
+        len(
+            [
+                event
+                for event in coordinator.store.list_events("task-a")
+                if event.event_type == "file_checked"
+            ]
+        )
+        == 2
+    )
     assert max(result.version for result in results) == final_state.version
 
 
@@ -714,9 +711,7 @@ def test_write_todos_remains_available_during_stagnation(tmp_path):
 
 def test_write_todos_is_authorized_during_stagnation(tmp_path, monkeypatch):
     coordinator = coordinator_fixture(tmp_path)
-    stagnated = coordinator.state("task-a").model_copy(
-        update={"stagnation_level": 1}
-    )
+    stagnated = coordinator.state("task-a").model_copy(update={"stagnation_level": 1})
     monkeypatch.setattr(coordinator, "state", lambda task_id: stagnated)
 
     authorization = coordinator.authorize_tool(
@@ -753,3 +748,37 @@ def test_error_artifact_tool_message_is_not_recorded_as_successful_retrieval(tmp
     )
 
     assert coordinator.store.list_events("task-a")[-1].event_type == "tool_completed"
+
+
+def test_stale_state_commit_cannot_overwrite_current_hypothesis_table(tmp_path):
+    coordinator = coordinator_fixture(tmp_path)
+    candidate = coordinator.record_hypothesis(
+        "task-a",
+        RecordHypothesisInput(
+            statement="sign is inverted twice",
+            target_state="candidate",
+            evidence_ids=[],
+            checked_locations=[],
+            reason="needs verification",
+        ),
+        source_id="candidate",
+    )
+    stale = coordinator.state("task-a")
+    seed_evidence(coordinator.evidence_repository, "task-a", "evidence-a")
+    supported = candidate.model_copy(update={"state": "supported", "evidence_ids": ["evidence-a"]})
+    coordinator.store.record_hypothesis("task-a", supported)
+    from deepfix.investigation.models import NewInvestigationEvent
+
+    committed = coordinator.store.commit(
+        stale.version,
+        [
+            NewInvestigationEvent(
+                task_id="task-a",
+                event_id="resume-stale",
+                event_type="task_resumed",
+            )
+        ],
+        stale,
+    )
+    assert committed.hypotheses == [supported]
+    assert coordinator.state("task-a").hypotheses == [supported]

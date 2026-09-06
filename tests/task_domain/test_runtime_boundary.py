@@ -92,7 +92,7 @@ def test_service_start_returns_runtime_projection_not_legacy_aggregate(
     result = service.start("parser fails")
 
     assert isinstance(result, TaskRuntime)
-    assert result.lifecycle is TaskLifecycleStatus.PAUSED
+    assert result.lifecycle is TaskLifecycleStatus.WAITING_INPUT
     assert result.pause_reason == "Which Python version?"
     assert tasks.get_definition(result.task_id).original_problem == "parser fails"
     with tasks.database.connection() as connection:

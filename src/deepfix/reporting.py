@@ -21,7 +21,13 @@ from deepfix.investigation.models import InvestigationHypothesis, UnresolvedQues
 from deepfix.operations import OperationJournalEntry
 from deepfix.research.models import ExternalEvidence
 from deepfix.research.reporting import render_external_evidence
-from deepfix.task_domain.models import AdjudicationDecision, TaskDefinition, TaskLifecycle
+from deepfix.task_domain.models import (
+    AdjudicationDecision,
+    TaskDefinition,
+    TaskInput,
+    TaskLifecycle,
+    TaskRun,
+)
 from deepfix.verification import (
     VerificationPolicy,
     classify_pytest_result,
@@ -50,6 +56,8 @@ class TaskReportView(StrictModel):
     history: HistorySummaryView
     context_telemetry: ContextTelemetry
     external_evidence: list[ExternalEvidence] = Field(default_factory=list)
+    inputs: list[TaskInput] = Field(default_factory=list)
+    runs: list[TaskRun] = Field(default_factory=list)
 
 
 def build_task_report_view(
@@ -86,6 +94,8 @@ def build_task_report_view(
         ),
         context_telemetry=repositories.history.context_telemetry(task_id),
         external_evidence=external,
+        inputs=repositories.tasks.list_inputs(task_id),
+        runs=repositories.tasks.list_runs(task_id),
     )
 
 
@@ -102,6 +112,7 @@ def _render_repository_report(view: TaskReportView) -> str:
     policy = view.verification_policy
     oracle = evaluate_required_oracles(policy, tests) if policy is not None else None
     metrics = view.context_telemetry
+    latest_run = view.runs[-1] if view.runs else None
     sections = [
         "# DeepFix 修复报告",
         "",
@@ -134,6 +145,14 @@ def _render_repository_report(view: TaskReportView) -> str:
         "## 审批记录",
         "",
         *_repository_approval_lines(view.approvals),
+        "",
+        "## 连续执行与用户补充",
+        "",
+        "最新运行："
+        + (f"{latest_run.run_id}（调用 {latest_run.invocations} 次）" if latest_run else "无"),
+        f"累计 Agent 调用：{sum(item.invocations for item in view.runs)}",
+        "用户贡献：",
+        *_repository_input_lines(view.inputs),
         "",
         "## 可信执行",
         "",
@@ -188,7 +207,7 @@ def _render_repository_report(view: TaskReportView) -> str:
         "",
         f"处理结果：{_repository_resolution_label(view)}",
         f"结论：{_repository_conclusion(view, changes, tests)}",
-        f"暂停原因：{view.lifecycle.reason or '无'}",
+        *_repository_handoff_lines(view),
         "残余风险：",
         *_list_or_none([item.text for item in view.unresolved_questions if item.status == "open"]),
         "未验证项：",
@@ -240,6 +259,25 @@ def _repository_unverified_lines(
     if view.execution_integrity.incomplete_operation_ids:
         values.append("存在未完成的副作用 Operation")
     return _list_or_none(list(dict.fromkeys(values)))
+
+
+def _repository_handoff_lines(view: TaskReportView) -> list[str]:
+    if view.lifecycle.status.value == "waiting_input":
+        return [
+            "交接状态：等待用户补充（handoff）",
+            f"等待输入问题：{view.lifecycle.reason or '请提供更多信息'}",
+        ]
+    return [f"暂停原因：{view.lifecycle.reason or '无'}"]
+
+
+def _repository_input_lines(items: list[TaskInput]) -> list[str]:
+    if not items:
+        return ["无"]
+    return [
+        f"- [{item.kind}] {item.text}"
+        + (f"（替代 {item.supersedes_input_id}）" if item.supersedes_input_id else "")
+        for item in items
+    ]
 
 
 def _repository_test_lines(items: list[SystemTestEvidence]) -> list[str]:

@@ -2,6 +2,7 @@ import asyncio
 import sys
 import time
 
+import pytest
 from deepagents.backends import CompositeBackend, LocalShellBackend
 
 from deepfix.backend import build_backend
@@ -77,9 +78,11 @@ def test_backend_activates_workspace_from_immutable_task_definition(
     assert backend.default.cwd == workspace.root
 
 
+@pytest.mark.parametrize("explicit", [False, True])
 def test_task_workspace_backend_runs_scoped_pytest_with_project_python(
     tmp_path,
     monkeypatch,
+    explicit,
 ):
     project = tmp_path / "project"
     project.mkdir()
@@ -92,8 +95,9 @@ def test_task_workspace_backend_runs_scoped_pytest_with_project_python(
     config = load_config(project, ApprovalMode.MANUAL)
     workspace = WorkspaceFactory(tmp_path / "workspaces").create("task-a", project)
 
+    executable = f'"{config.project_python}"' if explicit else "python"
     result = build_backend(config, workspace).execute(
-        "python -m pytest test_value.py -q"
+        f"{executable} -m pytest test_value.py -q"
     )
 
     assert result.exit_code == 0

@@ -88,7 +88,7 @@ def load_config(
         "DEEPFIX_COMPACTION_REQUEST_TIMEOUT_SECONDS",
         120,
     )
-    python_executable = Path(project_python or sys.executable).expanduser().resolve()
+    python_executable = interpreter_invocation_path(project_python or sys.executable)
     if not python_executable.is_file():
         raise ValueError(f"Python 解释器不存在: {python_executable}")
     search_provider = _load_search_provider()
@@ -130,6 +130,11 @@ def load_config(
         verification_timeout_seconds=verification_timeout_seconds,
         max_graph_steps=max_graph_steps,
     )
+
+
+def interpreter_invocation_path(value: str | Path) -> Path:
+    """Keep a venv's symlink entrypoint: resolving it can select base Python."""
+    return Path(os.path.abspath(Path(value).expanduser()))
 
 
 def _configured(name: str) -> str | None:

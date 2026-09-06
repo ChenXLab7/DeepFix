@@ -244,10 +244,6 @@ class InvestigationState(StrictModel):
     exploratory_without_progress: int = 0
     reevaluation_required: bool = False
     stagnation_level: Literal[0, 1, 2] = 0
-    diagnostic_decision_required: bool = False
-    diagnostic_test_count_since_decision: int = 0
-    repair_reevaluation_required: bool = False
-    decision_correction_used: bool = False
     last_execute_signature: str | None = None
     last_execute_generation: int | None = None
     duplicate_execute_correction_signature: str | None = None

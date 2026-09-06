@@ -97,6 +97,122 @@ def test_resume_command_requires_task_id():
     assert args.message is None
 
 
+def test_resume_command_accepts_structured_handoff_metadata():
+    args = build_parser().parse_args(
+        ["resume", "abc123", "环境仅为 Python 3.11", "--kind", "constraint", "--supersedes", "old"]
+    )
+
+    assert (args.message, args.kind, args.supersedes) == (
+        "环境仅为 Python 3.11", "constraint", "old",
+    )
+
+
+def test_once_can_leave_waiting_input_as_a_noninteractive_handoff(tmp_path):
+    service = CliServiceStub()
+    service.task = TaskRuntime(
+        task_id=f"task-{tmp_path.name}",
+        lifecycle=TaskLifecycleStatus.WAITING_INPUT,
+        pending_actions=[],
+        pause_reason="请提供复现命令",
+    )
+    output = []
+
+    result = run_interaction(
+        service, service.task, input_fn=lambda _prompt: pytest.fail("不应读取输入"),
+        output_fn=output.append, once=True,
+    )
+
+    assert result.lifecycle is TaskLifecycleStatus.WAITING_INPUT
+    assert any(service.task.task_id in line for line in output)
+    assert any("等待用户补充" in line for line in output)
+
+
+def test_waiting_input_displays_question_and_continues_with_reply(tmp_path):
+    class InputService(CliServiceStub):
+        def __init__(self):
+            super().__init__()
+            self.continue_calls = []
+
+        def continue_task(self, task_id, text, *, input_kind, supersedes_input_id=None):
+            self.continue_calls.append((task_id, text, input_kind, supersedes_input_id))
+            self.task = self.task.model_copy(update={"lifecycle": TaskLifecycleStatus.PAUSED})
+            return self.task
+
+    service = InputService()
+    service.task = TaskRuntime(
+        task_id=f"task-{tmp_path.name}", lifecycle=TaskLifecycleStatus.WAITING_INPUT,
+        pending_actions=[], pause_reason="请提供复现命令",
+    )
+    output = []
+
+    result = run_interaction(service, service.task, input_fn=lambda _prompt: "pytest tests/test_x.py", output_fn=output.append)
+
+    assert service.continue_calls == [(service.task.task_id, "pytest tests/test_x.py", "information", None)]
+    assert any("请提供复现命令" in line for line in output)
+    assert result.lifecycle is TaskLifecycleStatus.PAUSED
+
+
+def test_waiting_input_eof_preserves_task(tmp_path):
+    service = CliServiceStub()
+    service.task = TaskRuntime(
+        task_id=f"task-{tmp_path.name}", lifecycle=TaskLifecycleStatus.WAITING_INPUT,
+        pending_actions=[], pause_reason="请提供复现命令",
+    )
+    output = []
+
+    result = run_interaction(
+        service, service.task, input_fn=lambda _prompt: (_ for _ in ()).throw(EOFError), output_fn=output.append,
+    )
+
+    assert result.lifecycle is TaskLifecycleStatus.WAITING_INPUT
+    assert any("已保留" in line for line in output)
+
+
+def test_waiting_input_handles_many_replies_without_recursion(tmp_path):
+    class ManyReplyService(CliServiceStub):
+        def __init__(self):
+            super().__init__()
+            self.continues = 0
+
+        def continue_task(self, task_id, text, *, input_kind, supersedes_input_id=None):
+            self.continues += 1
+            lifecycle = (
+                TaskLifecycleStatus.PAUSED
+                if self.continues == 1_100
+                else TaskLifecycleStatus.WAITING_INPUT
+            )
+            self.task = self.task.model_copy(update={"lifecycle": lifecycle})
+            return self.task
+
+    service = ManyReplyService()
+    service.task = TaskRuntime(
+        task_id=f"task-{tmp_path.name}", lifecycle=TaskLifecycleStatus.WAITING_INPUT,
+        pending_actions=[], pause_reason="请继续提供线索",
+    )
+    replies = iter(["下一条线索"] * 1_100)
+
+    result = run_interaction(
+        service, service.task, input_fn=lambda _prompt: next(replies), output_fn=lambda _line: None,
+    )
+
+    assert service.continues == 1_100
+    assert result.lifecycle is TaskLifecycleStatus.PAUSED
+
+
+def test_approval_prompt_eof_preserves_task(tmp_path):
+    service = CliServiceStub()
+    service.task = waiting_task(tmp_path, "ask")
+    output = []
+
+    result = run_interaction(
+        service, service.task, input_fn=lambda _prompt: (_ for _ in ()).throw(EOFError), output_fn=output.append,
+    )
+
+    assert result.lifecycle is TaskLifecycleStatus.WAITING_APPROVAL
+    assert service.decisions == []
+    assert any("已保留" in line for line in output)
+
+
 def test_missing_subcommand_is_rejected():
     with pytest.raises(SystemExit):
         build_parser().parse_args([])

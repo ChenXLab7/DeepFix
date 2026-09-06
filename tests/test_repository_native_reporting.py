@@ -11,7 +11,9 @@ from deepfix.reporting import _repository_test_lines, build_task_report_view, re
 from deepfix.task_domain.models import (
     AdjudicationDecision,
     TaskDefinition,
+    TaskInput,
     TaskLifecycleStatus,
+    TaskRun,
 )
 from deepfix.verification import VerificationOracle, VerificationPolicy
 
@@ -82,7 +84,34 @@ def test_report_labels_pytest_usage_error_as_infrastructure_error() -> None:
     assert lines[0].startswith("- [基础设施错误]")
 
 
-def _seed_task(repositories: DomainRepositories) -> None:
+def test_report_shows_waiting_input_as_handoff_and_continuous_run_history(tmp_path: Path) -> None:
+    repositories = DomainRepositories.create(tmp_path / "deepfix.db")
+    _seed_task(repositories, completed=False)
+    repositories.tasks.record_input(TaskInput(
+        input_id="input-1", task_id=TASK_ID, text="Python 3.11 才失败", kind="constraint",
+        created_at="2026-08-31T01:01:00+00:00",
+    ))
+    repositories.tasks.start_run(TaskRun(
+        run_id="run-2", task_id=TASK_ID, input_id="input-1", invocations=0,
+        created_at="2026-08-31T01:01:00+00:00",
+    ))
+    lifecycle = repositories.tasks.get_lifecycle(TASK_ID)
+    repositories.tasks.transition_lifecycle(
+        TASK_ID, TaskLifecycleStatus.WAITING_INPUT, reason="请提供复现命令", expected_version=lifecycle.version,
+    )
+
+    view = build_task_report_view(repositories, TASK_ID)
+    assert view.lifecycle.reason == "请提供复现命令"
+    report = render_report(view)
+
+    assert "交接状态：等待用户补充（handoff）" in report
+    assert "等待输入问题：请提供复现命令" in report
+    assert "最新运行：run-2（调用 0 次）" in report
+    assert "累计 Agent 调用：0" in report
+    assert "[constraint] Python 3.11 才失败" in report
+
+
+def _seed_task(repositories: DomainRepositories, *, completed: bool = True) -> None:
     repositories.tasks.create_definition(
         TaskDefinition(
             task_id=TASK_ID,
@@ -181,21 +210,22 @@ def _seed_task(repositories: DomainRepositories) -> None:
         usage_ratio=0.42,
         zone="normal",
     )
-    repositories.tasks.transition_lifecycle(
-        TASK_ID,
-        TaskLifecycleStatus.COMPLETED,
-        expected_version=2,
-    )
-    repositories.tasks.record_adjudication(
-        AdjudicationDecision(
-            decision_id="adjudication-1",
-            task_id=TASK_ID,
-            outcome="fixed",
-            evidence_ids=["change-1", "test-pass"],
-            operation_ids=[],
-            decided_at="2026-08-31T01:00:00+00:00",
+    if completed:
+        repositories.tasks.transition_lifecycle(
+            TASK_ID,
+            TaskLifecycleStatus.COMPLETED,
+            expected_version=2,
         )
-    )
+        repositories.tasks.record_adjudication(
+            AdjudicationDecision(
+                decision_id="adjudication-1",
+                task_id=TASK_ID,
+                outcome="fixed",
+                evidence_ids=["change-1", "test-pass"],
+                operation_ids=[],
+                decided_at="2026-08-31T01:00:00+00:00",
+            )
+        )
 
 
 def _insert_stale_legacy_projection(repositories: DomainRepositories) -> None:

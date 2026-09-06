@@ -1,6 +1,8 @@
 # DeepFix Agent
 
-DeepFix 是一个基于 `deepagents` SDK 的 Python 代码缺陷修复 Agent。它从终端接收问题，调查项目、运行测试、提出最小修改，并在具有副作用的操作前执行风险审批。第一版坚持单 Agent：一个 Repair Agent 负责澄清、调查、修改、验证和报告，先把闭环可靠性做好，再考虑拆分多 Agent。
+DeepFix 是面向 Python 仓库的 Debug / Bug Fix 专用 Repository Agent。默认自主复现、调查、修复和验证，也支持复杂 Bug 的多轮用户引导、证据积累和任务恢复。不承接功能开发或开放式重构；生产执行保持单 Agent。
+
+持续任务的实现边界、验证与后续工作见 [Harness 实施记录](docs/guided-debugging.md)。
 
 ## 安装与首次运行
 
@@ -36,8 +38,8 @@ Shell 执行有两级不可突破的硬上限：普通诊断命令默认 10 秒�
 `exit_code=124` 和 `timed_out=true` 返回给 Agent，供其判断死循环或阻塞原因。
 
 单次 Agent Graph 执行默认最多 80 个步骤。Graph Step 包含模型、工具和状态节点，
-并不等于 LLM 调用次数。达到上限通常表示模型陷入重复工具调用，
-DeepFix 会暂停任务并保留恢复状态，而不是继续消耗模型调用。可以通过
+并不等于 LLM 调用次数。达到上限属于运行预算耗尽，不能据此推断 Bug 无法解决。
+DeepFix 会保留任务、证据与恢复状态。可以通过
 `DEEPFIX_MAX_GRAPH_STEPS` 调低或调高该上限。
 
 如果目标项目使用的不是当前终端里的 Python，显式传入它的解释器。DeepFix 会把该路径保存在任务中，恢复任务时继续使用同一个环境：
@@ -86,18 +88,20 @@ Terminal CLI
     │
     ▼
 BugfixService ─────────────── TaskRepository(SQLite)
-    │                              业务状态、审批、证据、报告指标
+    │                              任务、用户输入、运行身份与用量
     ▼
 Single Repair Agent ───────── LangGraph Checkpointer(SQLite)
     │                              消息历史与图恢复位置
     ├── read/search Tools
     ├── file/shell Tools + HITL
-    ├── research Tools ────── ResearchEvidenceStore(SQLite)
+    ├── research Tools ────── EvidenceRepository(SQLite)
     │                              查询、候选、验证状态；按 task_id 隔离
     │          └───────────── DEEPFIX_HOME/artifacts/research
     │                              清洗后的完整外部正文
-    ├── save_progress ─────── WorkingMemoryStore(SQLite)
-    │                              版本化事实、证据、假设、下一步
+    ├── record_hypothesis ─── InvestigationRepository(SQLite)
+    │                              当前假设、未解问题、调查记录
+    ├── Operation / Receipt ─ ExecutionRepository(SQLite)
+    │                              执行、审批、恢复完整性
     └── compact_conversation
              ├────────────── Compaction Model
              │                    仅提取结构化 CompactionDelta，无工具
@@ -108,30 +112,30 @@ Single Repair Agent ───────── LangGraph Checkpointer(SQLite)
 四层数据各自解决不同问题：
 
 - Checkpointer 保证多轮任务和审批中断可以恢复。
-- WorkingMemoryStore 保证有损摘要不会删除关键事实和下一步。
+- Domain Repositories 保存当前事实；Todo 只负责行动导航。
 - CompactionSnapshot 保存结构化压缩历史、来源和生命周期。
 - Conversation Artifact 保存被压缩消息的完整可恢复副本。
 
-主模型负责调查、工具调用、修复、验证和最终答复，也由它决定何时调用 `save_progress`；保存 Working
-Memory 不会额外调用模型。压缩模型只从完整 WorkUnit 提取不可信的结构化 `CompactionDelta`，没有工具，
+主模型负责调查、工具调用、修复、验证和轮次交接。压缩模型只从完整 WorkUnit 提取
+不可信的结构化 `CompactionDelta`，没有工具，
 不能修改项目、任务状态或系统确定性证据。
 
 ### 证据保真的上下文管理
 
-DeepFix 不再采用固定的“70% 时压缩、保留最近 15%”，也不依赖 Deep Agents 的自然语言摘要作为运行时记忆。每次模型调用都会动态注入三个不可压缩保护块：Task Anchor、完整 Working Memory 和系统确定性证据。测试退出码、文件操作、审批和研究验证状态分别来自对应 Store；模型只能生成带来源的语义事实候选和假设，不能覆盖这些权威记录。
+每次模型调用从当前领域记录构造目标、有效约束、用户输入、假设、证据和执行完整性投影。历史快照只表达当时的记录，不再混入当前假设。用户陈述与模型猜测不会自动成为已验证事实；控制指令也不会自动增加证据进展。
 
 预算分为四个区域：
 
 | 使用率 | 行为 |
 |---|---|
 | 0%～75% | 正常运行 |
-| >75%～82% | 观察区；Working Memory 覆盖过旧时提示保存 |
+| >75%～82% | 观察上下文预算 |
 | >82%～90% | 按完整工作单元执行普通压缩 |
 | >90% | 紧急压缩；无法安全准备时暂停任务 |
 
 一个工作单元包含操作目的、AI Tool Call、全部配对 ToolMessage，以及 Assistant 对结果的解释；并行 Tool Call 也属于同一单元。压缩时整个单元保留或整个进入 Snapshot，无法确认边界时优先保留。所有 Graph Message 都有稳定 ID：已有 `message.id` 原样复用，缺失 ID 根据任务、原始序号、消息类型、Tool Call ID 和规范化内容确定性生成。WorkUnit、来源、覆盖范围和 history 幂等都使用这些 ID。
 
-Agent 可以主动调用 `compact_conversation`，自动和主动入口共享 DeepFix Compaction Coordinator。协调器严格按“写入并回读完整 history artifact → 构造并校验 Snapshot → 保存 prepared Snapshot → 模型调用成功后提交 event”的顺序运行。Snapshot 具有 `prepared`、`active`、`abandoned` 生命周期；真正生效的版本始终由 `_deepfix_compaction_event.active_snapshot_version` 决定。后续压缩按字段合并旧 Snapshot、新工作单元、最新 Working Memory 和系统证据，不反复总结旧自然语言摘要。
+Agent 可以主动调用 `compact_conversation`，自动和主动入口共享 Compaction Coordinator。先保存并回读完整 history Artifact，再准备 Snapshot 和替换消息；Snapshot 保留 prepared、active、abandoned 生命周期，失败时保留可恢复消息。压缩历史不作为当前业务事实权威。
 
 普通压缩区的准备失败会保留原消息、记录失败，并允许原请求直通一次；主动压缩在非紧急区失败会返回 error ToolMessage。紧急区失败或一次最小安全上下文重试后仍然 Overflow 时，`BugfixService` 把任务转为 `PAUSED`，并保存 `context_recovery`（失败阶段、错误码、Snapshot/Artifact 引用及“原消息是否保留”）。恢复时继续使用原 task ID 和 checkpoint；恢复成功后才清除该字段。
 
@@ -203,7 +207,7 @@ DEEPFIX_HOME/artifacts/research/<task_id>/<evidence_id>.md
 
 ## 确定性完成条件
 
-模型说“已经修复”不能让任务完成。`BugfixService` 只根据真实 `execute` ToolMessage 中的 `exit_code` 接受测试证据；没有至少一次通过测试时，`completed` 会被改为 `PAUSED`。最终报告同样从任务状态、退出码、工作记忆版本和上下文指标渲染，不相信模型措辞。
+模型说“已经修复”不能让任务完成。验证裁决要求当前 Workspace 代码版本及 baseline 的必需测试满足，存在实际修改且无冲突。旧版本通过不能认证新版本。验证缺失会返回运行反馈并继续调查；只有具体用户信息缺失才进入 WAITING_INPUT。运行预算、环境或执行完整性问题仍可导致 PAUSED，原因会保留。报告从领域记录构造。
 
 ## 开发验证
 

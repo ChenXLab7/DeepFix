@@ -505,8 +505,11 @@ def test_runtime_does_not_expose_mutable_legacy_phase(config) -> None:
 
 
 def test_completed_outcome_records_adjudication_with_evidence_ids(config) -> None:
+    from deepfix.workspace import compute_code_state_hash
+
     service = service_for(config, FakeAgent(no_response()), workspace=True)
     task = service.start("验证当前实现，运行 python -m pytest -q")
+    definition = service.repository.get_definition(task.task_id)
     service.repositories.evidence.record_deterministic(
         task.task_id,
         SystemTestEvidence(
@@ -519,8 +522,8 @@ def test_completed_outcome_records_adjudication_with_evidence_ids(config) -> Non
             origin="user_specified",
             scope="targeted",
             timing="baseline",
-            workspace_baseline_id="baseline-1",
-            code_state_hash="code-state-1",
+            workspace_baseline_id=definition.workspace_baseline_id,
+            code_state_hash=compute_code_state_hash(definition.workspace_root),
         ),
         provenance_root_ids=["test-call"],
     )

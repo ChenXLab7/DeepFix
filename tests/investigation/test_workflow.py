@@ -12,7 +12,6 @@ from langchain_core.tools import StructuredTool
 
 from deepfix.domain_repositories.execution import ExecutionRepository
 from deepfix.investigation.errors import (
-    InvestigationStagnationError,
     InvestigationStateError,
 )
 from deepfix.investigation.middleware import InvestigationMiddleware
@@ -256,7 +255,7 @@ def test_bfs_repository_scan_is_advisory_not_a_hard_tool_gate(tmp_path: Path) ->
     assert state.stagnation_level == 1
 
 
-def test_gcd_exact_repeat_is_corrected_then_pauses_before_permit(tmp_path: Path) -> None:
+def test_gcd_exact_repeat_reevaluates_strategy_without_pausing(tmp_path: Path) -> None:
     harness = OfflineRepairHarness(tmp_path)
     hypothesis = harness.investigation.record_hypothesis(
         "task-a",
@@ -270,13 +269,12 @@ def test_gcd_exact_repeat_is_corrected_then_pauses_before_permit(tmp_path: Path)
         source_id="hyp-gcd-call",
     )
 
-    with pytest.raises(InvestigationStagnationError) as caught:
-        harness.run(_repeated_pytest_steps(hypothesis.hypothesis_id))
+    state = harness.run(_repeated_pytest_steps(hypothesis.hypothesis_id))
 
     events = harness.investigation.store.list_events("task-a")
     assert sum(event.event_type == "investigation_permit_granted" for event in events) == 0
     assert harness.execution_counts.total() == 1
-    assert caught.value.recovery.error_code == "duplicate_execute_ignored"
+    assert state.reevaluation_required is True
 
 
 def test_store_failure_after_tool_execution_does_not_rerun_tool(

@@ -66,6 +66,39 @@ def test_higher_authority_repository_conflict_blocks_fixed(tmp_path: Path) -> No
     assert result.blocking_evidence_ids == ["suite-failure"]
 
 
+def test_passing_previous_code_version_cannot_certify_changed_workspace(tmp_path):
+    evidence = EvidenceRepository(tmp_path / "deepfix.db")
+    _record(evidence, _change("change-1"))
+    _record(evidence, _test("old-pass", TARGET_COMMAND, exit_code=0))
+    value = _input(evidence, successful_change_evidence_ids=["change-1"])
+    value = OutcomeAdjudicationInput.model_validate(
+        {
+            **value.model_dump(),
+            "current_code_state_hash": "code-state-2",
+            "workspace_baseline_id": "baseline-1",
+        }
+    )
+    assert OutcomeAdjudicator().decide(value).outcome == "continue"
+
+
+def test_current_decision_cites_only_accepted_version(tmp_path):
+    evidence = EvidenceRepository(tmp_path / "deepfix.db")
+    _record(evidence, _change("change-1"))
+    _record(
+        evidence,
+        _test("current-pass", TARGET_COMMAND, exit_code=0).model_copy(
+            update={"code_state_hash": "code-state-2"}
+        ),
+    )
+    _record(evidence, _test("late-old-pass", TARGET_COMMAND, exit_code=0))
+    value = _input(evidence, successful_change_evidence_ids=["change-1"]).model_copy(
+        update={"current_code_state_hash": "code-state-2", "workspace_baseline_id": "baseline-1"}
+    )
+    result = OutcomeAdjudicator().decide(value)
+    assert result.outcome == "fixed"
+    assert result.decision.evidence_ids == ["change-1", "current-pass"]
+
+
 def test_agent_generated_test_or_executor_claim_cannot_create_fixed(
     tmp_path: Path,
 ) -> None:
@@ -148,13 +181,30 @@ def test_not_reproduced_requires_passing_user_baseline_and_no_change(
         ),
     )
 
-    result = OutcomeAdjudicator().decide(
-        _input(evidence, reproduction_state="not_reproduced")
-    )
+    result = OutcomeAdjudicator().decide(_input(evidence, reproduction_state="not_reproduced"))
 
     assert result.outcome == "not_reproduced"
     assert result.decision is not None
     assert result.decision.evidence_ids == ["baseline-pass"]
+
+
+def test_not_reproduced_rejects_stale_baseline_evidence(tmp_path: Path) -> None:
+    evidence = EvidenceRepository(tmp_path / "deepfix.db")
+    _record(
+        evidence,
+        _test(
+            "stale-baseline-pass",
+            TARGET_COMMAND,
+            exit_code=0,
+            timing="baseline",
+        ),
+    )
+
+    value = _input(evidence, reproduction_state="not_reproduced").model_copy(
+        update={"current_code_state_hash": "code-state-2", "workspace_baseline_id": "baseline-1"}
+    )
+
+    assert OutcomeAdjudicator().decide(value).outcome == "continue"
 
 
 def _input(

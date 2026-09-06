@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import threading
+from copy import copy
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -15,6 +16,7 @@ from deepagents.backends.protocol import ExecuteResponse
 
 from deepfix.backend import GuardedLocalShellBackend
 from deepfix.compaction.models import StrictModel
+from deepfix.config import interpreter_invocation_path
 from deepfix.workspace import TaskWorkspace, WorkspacePathPolicy, WorkspaceScopeError
 
 _SHELL_OPERATORS = re.compile(r"(?:&&|\|\||[\r\n|;&<>()`])")
@@ -60,9 +62,12 @@ class ApprovalGrant(StrictModel):
 
 
 class WorkspaceCommandPolicy:
-    def __init__(self, workspace: TaskWorkspace) -> None:
+    def __init__(
+        self, workspace: TaskWorkspace, *, project_python: str | Path = sys.executable
+    ) -> None:
         self.workspace = workspace
         self.paths = WorkspacePathPolicy(workspace.root)
+        self.project_python = interpreter_invocation_path(project_python)
 
     def evaluate(self, command: str) -> CommandDecision:
         if not isinstance(command, str) or not command.strip():
@@ -79,6 +84,11 @@ class WorkspaceCommandPolicy:
             return self._deny("command must be a non-empty string")
 
         if Path(tokens[0]).is_absolute() or "/" in tokens[0] or "\\" in tokens[0]:
+            # Compare invocation paths, not resolved targets or basenames. Two
+            # venv symlinks may target the same interpreter but select different envs.
+            candidate = Path(tokens[0])
+            if candidate.is_absolute() and candidate == self.project_python:
+                return self._evaluate_python(tokens)
             return self._deny("explicit executable paths are not allowed")
         executable = tokens[0].lower()
         if executable in _SHELL_MUTATORS:
@@ -149,12 +159,17 @@ class WorkspaceCommandRunner:
         workspace: TaskWorkspace,
         policy: WorkspaceCommandPolicy,
         *,
-        project_python: str | Path = sys.executable,
+        project_python: str | Path | None = None,
         max_output_bytes: int = 100_000,
     ) -> None:
         self.workspace = workspace
-        self.policy = policy
-        self.project_python = Path(project_python).expanduser().resolve(strict=True)
+        self.policy = copy(policy)
+        self.project_python = interpreter_invocation_path(
+            project_python if project_python is not None else policy.project_python
+        )
+        if not self.project_python.is_file():
+            raise ValueError(f"Python interpreter does not exist: {self.project_python}")
+        self.policy.project_python = self.project_python
         self._used_grant_ids: set[str] = set()
         self._grant_lock = threading.Lock()
         self._environment = task_scoped_environment(workspace, self.project_python)

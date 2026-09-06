@@ -253,7 +253,7 @@ class InvestigationMiddleware(AgentMiddleware):
                     ),
                     None,
                 )
-            return task_id, None, _decision_correction_message(task_id, call_id), None
+            raise ValueError(f"Unknown investigation correction: {authorization.correction_kind}")
         if operation is None:
             operation = self._prepare_operation(task_id, request)
         return task_id, None, None, operation
@@ -519,6 +519,13 @@ def render_investigation_state(
         for item in state.hypotheses[-8:]
     )
     lines.append("</current_hypotheses>")
+    if state.reevaluation_required:
+        lines.append(
+            "<strategy_feedback>Recent actions did not resolve the evidence gap. "
+            "Review the results and choose a different targeted read, experiment, or patch. "
+            "A failed patch does not by itself refute its root-cause hypothesis."
+            "</strategy_feedback>"
+        )
     lines.append("</deepfix_investigation_state>")
     return "\n".join(lines)
 
@@ -626,27 +633,6 @@ def _diagnostic_artifact_redirect(
             "result_type": "diagnostic_artifact_redirect",
             "error_code": "use_diagnostic_artifact_tools",
             "operation": "read_file",
-        },
-    )
-
-
-def _decision_correction_message(task_id: str, call_id: str) -> ToolMessage:
-    return ToolMessage(
-        id=stable_generated_message_id(
-            task_id,
-            call_id,
-            "diagnostic_decision_correction",
-        ),
-        content=(
-            "当前处于诊断决策检查点，不能继续读取或执行。"
-            "请根据现有证据调用 record_hypothesis；"
-            "若证据不足，先记录 candidate，并更新 Todo 选择一次定向调查。"
-        ),
-        tool_call_id=call_id,
-        status="error",
-        artifact={
-            "result_type": "diagnostic_decision_correction",
-            "error_code": "diagnostic_decision_required",
         },
     )
 

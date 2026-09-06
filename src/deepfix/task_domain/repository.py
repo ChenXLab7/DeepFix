@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -15,9 +16,11 @@ from deepfix.task_domain.models import (
     AdjudicationDecisionConflict,
     TaskDefinition,
     TaskDefinitionConflict,
+    TaskInput,
     TaskLifecycle,
     TaskLifecycleConflict,
     TaskLifecycleStatus,
+    TaskRun,
     validate_lifecycle_transition,
 )
 
@@ -44,6 +47,38 @@ class TaskRepository:
     def checkpoint_connection(self) -> Iterator[sqlite3.Connection]:
         with self.database.connection() as connection:
             yield connection
+
+    @contextmanager
+    def execution_lock(self, task_id: str) -> Iterator[None]:
+        """OS-owned lock: released on process exit, no stale lease state to reconcile."""
+        directory = self.database_path.parent / "task-locks"
+        directory.mkdir(parents=True, exist_ok=True)
+        lock_path = directory / (hashlib.sha256(task_id.encode()).hexdigest() + ".lock")
+        with lock_path.open("a+b") as handle:
+            handle.seek(0, 2)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise TaskLifecycleConflict("task is already running in another caller") from exc
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def create_definition(self, definition: TaskDefinition) -> TaskDefinition:
         try:
@@ -177,6 +212,89 @@ class TaskRepository:
             operation_ids=json.loads(str(row[3])),
             decided_at=str(row[4]),
         )
+
+    def record_input(self, item: TaskInput, *, run: TaskRun | None = None) -> None:
+        with self.database.unit_of_work(immediate=True) as connection:
+            if run is not None and (run.task_id != item.task_id or run.input_id != item.input_id):
+                raise ValueError("run must reference the supplied task input")
+            if self._get_definition(connection, item.task_id) is None:
+                raise KeyError(item.task_id)
+            if item.supersedes_input_id:
+                old = connection.execute(
+                    "SELECT payload FROM task_inputs WHERE task_id = ? AND input_id = ?",
+                    (item.task_id, item.supersedes_input_id),
+                ).fetchone()
+                if old is None or TaskInput.model_validate_json(old[0]).kind != item.kind:
+                    raise ValueError("superseded input must exist in this task with the same kind")
+            existing = connection.execute(
+                "SELECT payload FROM task_inputs WHERE input_id = ?",
+                (item.input_id,),
+            ).fetchone()
+            if existing:
+                if TaskInput.model_validate_json(existing[0]) != item:
+                    raise ValueError("input identity conflict")
+            else:
+                connection.execute(
+                    "INSERT INTO task_inputs(input_id, task_id, payload) VALUES (?, ?, ?)",
+                    (item.input_id, item.task_id, item.model_dump_json()),
+                )
+            if run is not None:
+                self._insert_run(connection, run)
+
+    def list_inputs(self, task_id: str) -> list[TaskInput]:
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM task_inputs WHERE task_id = ? ORDER BY rowid",
+                (task_id,),
+            ).fetchall()
+        return [TaskInput.model_validate_json(row[0]) for row in rows]
+
+    def start_run(self, item: TaskRun) -> None:
+        with self.database.unit_of_work(immediate=True) as connection:
+            self._insert_run(connection, item)
+
+    @staticmethod
+    def _insert_run(connection: sqlite3.Connection, item: TaskRun) -> None:
+        owned_input = connection.execute(
+            "SELECT 1 FROM task_inputs WHERE input_id = ? AND task_id = ?",
+            (item.input_id, item.task_id),
+        ).fetchone()
+        if owned_input is None:
+            raise ValueError("run input does not belong to this task")
+        connection.execute(
+            "INSERT INTO task_runs(run_id, task_id, input_id, invocations, created_at) "
+            "VALUES (?, ?, ?, 0, ?)",
+            (item.run_id, item.task_id, item.input_id, item.created_at),
+        )
+
+    def list_runs(self, task_id: str) -> list[TaskRun]:
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                "SELECT run_id, task_id, input_id, invocations, created_at "
+                "FROM task_runs WHERE task_id = ? ORDER BY rowid",
+                (task_id,),
+            ).fetchall()
+        return [
+            TaskRun(run_id=r[0], task_id=r[1], input_id=r[2], invocations=r[3], created_at=r[4])
+            for r in rows
+        ]
+
+    def consume_invocation(self, task_id: str, limit: int) -> bool:
+        with self.database.unit_of_work(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT run_id, invocations FROM task_runs WHERE task_id = ? "
+                "ORDER BY rowid DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("task has no active run")
+            if row[1] >= limit:
+                return False
+            connection.execute(
+                "UPDATE task_runs SET invocations = invocations + 1 WHERE run_id = ?",
+                (row[0],),
+            )
+            return True
 
     def initialize_token_budget(
         self,
@@ -379,6 +497,15 @@ class TaskRepository:
     def _initialize_schema(self) -> None:
         with self.database.unit_of_work() as connection:
             connection.execute(
+                "CREATE TABLE IF NOT EXISTS task_inputs (input_id TEXT PRIMARY KEY, "
+                "task_id TEXT NOT NULL, payload TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS task_runs (run_id TEXT PRIMARY KEY, "
+                "task_id TEXT NOT NULL, input_id TEXT NOT NULL, invocations INTEGER NOT NULL, "
+                "created_at TEXT NOT NULL)"
+            )
+            connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS task_definitions (
                     task_id TEXT PRIMARY KEY,
@@ -547,7 +674,12 @@ class TaskRepository:
         paused_from = current.status if next_status is TaskLifecycleStatus.PAUSED else None
         next_reason = (
             reason
-            if next_status in {TaskLifecycleStatus.PAUSED, TaskLifecycleStatus.FAILED}
+            if next_status
+            in {
+                TaskLifecycleStatus.PAUSED,
+                TaskLifecycleStatus.FAILED,
+                TaskLifecycleStatus.WAITING_INPUT,
+            }
             else None
         )
         updated_at = _now()

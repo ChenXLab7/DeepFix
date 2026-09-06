@@ -4,7 +4,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from langchain_core.messages import ToolMessage
@@ -23,7 +23,6 @@ from deepfix.investigation.classification import (
 )
 from deepfix.investigation.errors import (
     InvestigationCoordinationError,
-    InvestigationStagnationError,
     InvestigationStateError,
 )
 from deepfix.investigation.identity import stable_investigation_id
@@ -43,6 +42,7 @@ from deepfix.investigation.models import (
 from deepfix.investigation.progress import ProgressEvaluator
 from deepfix.investigation.stagnation import StagnationDetector
 from deepfix.persistence import TaskRepository
+from deepfix.workspace import compute_code_state_hash
 
 
 @dataclass(frozen=True)
@@ -146,7 +146,7 @@ class InvestigationCoordinator:
         call_id = str(call.get("id", "")).strip()
         args_value = call.get("args", {})
         args = args_value if isinstance(args_value, Mapping) else {}
-        signature = tool_signature(name, args)
+        signature = self._tool_signature(task_id, name, args)
         fingerprint = result_fingerprint(result)
         artifact = result.artifact if isinstance(result.artifact, Mapping) else {}
         tool_payload = {
@@ -359,61 +359,12 @@ class InvestigationCoordinator:
                 updated,
                 effective_observation,
             )
-        if observation.event_type is InvestigationEventType.TEST_OBSERVED:
-            diagnostic_tests = (
-                state.diagnostic_test_count_since_decision + 1 if observation.exit_code != 0 else 0
-            )
-            updated = updated.model_copy(
-                update={
-                    "diagnostic_test_count_since_decision": diagnostic_tests,
-                    "diagnostic_decision_required": diagnostic_tests >= 2,
-                    "decision_correction_used": False,
-                }
-            )
         if (
             observation.event_type is InvestigationEventType.POST_EDIT_TEST_OBSERVED
             and observation.exit_code != 0
         ):
-            updated = updated.model_copy(
-                update={
-                    "diagnostic_decision_required": True,
-                    "diagnostic_test_count_since_decision": 0,
-                    "repair_reevaluation_required": True,
-                    "decision_correction_used": False,
-                    "reevaluation_required": False,
-                    "stagnation_level": 0,
-                }
-            )
-        elif observation.event_type is InvestigationEventType.ARTIFACT_READ:
-            updated = updated.model_copy(
-                update={
-                    "diagnostic_decision_required": True,
-                    "decision_correction_used": False,
-                    "reevaluation_required": False,
-                    "stagnation_level": 0,
-                }
-            )
-        elif observation.event_type is InvestigationEventType.HYPOTHESIS_RECORDED:
-            if state.diagnostic_decision_required:
-                updated = updated.model_copy(
-                    update={
-                        "diagnostic_decision_required": True,
-                        "diagnostic_test_count_since_decision": 0,
-                        "decision_correction_used": False,
-                    }
-                )
-        elif observation.event_type in {
-            InvestigationEventType.HYPOTHESIS_REJECTED,
-            InvestigationEventType.HYPOTHESIS_SUPPORTED,
-        }:
-            updated = updated.model_copy(
-                update={
-                    "diagnostic_decision_required": False,
-                    "diagnostic_test_count_since_decision": 0,
-                    "repair_reevaluation_required": False,
-                    "decision_correction_used": False,
-                }
-            )
+            # A failed patch asks for a strategy review, not rejection of its root cause.
+            updated = updated.model_copy(update={"reevaluation_required": True})
         if (
             observation.payload.get("tool_name") == "execute"
             and observation.payload.get("result_type") != "duplicate_execute_correction"
@@ -436,8 +387,7 @@ class InvestigationCoordinator:
     ) -> InvestigationHypothesis:
         state = self.state(task_id)
         evidence_ids = {
-            item.evidence_id
-            for item in self.evidence_repository.list_deterministic(task_id)
+            item.evidence_id for item in self.evidence_repository.list_deterministic(task_id)
         }
         if not set(command.evidence_ids) <= evidence_ids:
             raise ValueError("假设证据不属于当前任务")
@@ -459,13 +409,6 @@ class InvestigationCoordinator:
             raise ValueError("hypothesis_id 不存在于当前任务")
         if existing is not None and _semantic_statement(existing.statement) != semantic_statement:
             raise ValueError("hypothesis_id 不能更换假设陈述")
-        if (
-            state.repair_reevaluation_required
-            and existing is not None
-            and existing.state == "supported"
-            and command.target_state == "supported"
-        ):
-            raise ValueError("修改后验证失败，不能再次支持同一假设；请先排除旧假设或建立新假设")
         record = InvestigationHypothesis(
             hypothesis_id=hypothesis_id,
             statement=semantic_statement,
@@ -513,10 +456,6 @@ class InvestigationCoordinator:
                 "exploratory_without_progress": 0,
                 "reevaluation_required": False,
                 "stagnation_level": 0,
-                "diagnostic_decision_required": False,
-                "diagnostic_test_count_since_decision": 0,
-                "repair_reevaluation_required": False,
-                "decision_correction_used": False,
             }
         )
         return self._record_lifecycle(
@@ -549,7 +488,14 @@ class InvestigationCoordinator:
         state = self.state(task_id)
         return self._record_lifecycle(
             state,
-            state,
+            state.model_copy(
+                update={
+                    "duplicate_read_correction_signatures": [],
+                    "duplicate_hypothesis_correction_ids": [],
+                    "duplicate_execute_correction_signature": None,
+                    "stagnation_level": min(state.stagnation_level, 1),
+                }
+            ),
             InvestigationEventType.TASK_RESUMED,
             source_id,
         )
@@ -600,7 +546,7 @@ class InvestigationCoordinator:
     ) -> ToolAuthorization:
         state = self.state(task_id)
         normalized_tool = tool_name.strip().lower()
-        signature = tool_signature(normalized_tool, arguments)
+        signature = self._tool_signature(task_id, normalized_tool, arguments)
         duplicate_hypothesis_id = _duplicate_candidate_id(
             task_id,
             normalized_tool,
@@ -608,17 +554,6 @@ class InvestigationCoordinator:
             state,
         )
         if duplicate_hypothesis_id is not None:
-            if duplicate_hypothesis_id in state.duplicate_hypothesis_correction_ids:
-                raise InvestigationStagnationError(
-                    self.recovery(
-                        task_id,
-                        "duplicate_hypothesis_ignored",
-                        state=state,
-                        tool_call_id=tool_call_id,
-                        checkpoint_available=True,
-                        recovery_action="pause_and_change_investigation_action",
-                    )
-                )
             source_id = tool_call_id or stable_investigation_id(
                 "duplicate-hypothesis-correction",
                 task_id,
@@ -628,6 +563,7 @@ class InvestigationCoordinator:
                 state,
                 state.model_copy(
                     update={
+                        "reevaluation_required": True,
                         "duplicate_hypothesis_correction_ids": list(
                             dict.fromkeys(
                                 [
@@ -635,7 +571,7 @@ class InvestigationCoordinator:
                                     duplicate_hypothesis_id,
                                 ]
                             )
-                        )[-16:]
+                        )[-16:],
                     }
                 ),
                 InvestigationEventType.REEVALUATION_REQUIRED,
@@ -652,17 +588,6 @@ class InvestigationCoordinator:
             and state.last_execute_signature == signature
             and state.last_execute_generation == state.progress_generation
         ):
-            if state.duplicate_execute_correction_signature == signature:
-                raise InvestigationStagnationError(
-                    self.recovery(
-                        task_id,
-                        "duplicate_execute_ignored",
-                        state=state,
-                        tool_call_id=tool_call_id,
-                        checkpoint_available=True,
-                        recovery_action="pause_and_change_investigation_action",
-                    )
-                )
             source_id = tool_call_id or stable_investigation_id(
                 "duplicate-execute-correction",
                 task_id,
@@ -670,7 +595,12 @@ class InvestigationCoordinator:
             )
             self._record_lifecycle(
                 state,
-                state.model_copy(update={"duplicate_execute_correction_signature": signature}),
+                state.model_copy(
+                    update={
+                        "duplicate_execute_correction_signature": signature,
+                        "reevaluation_required": True,
+                    }
+                ),
                 InvestigationEventType.REEVALUATION_REQUIRED,
                 source_id,
             )
@@ -679,21 +609,9 @@ class InvestigationCoordinator:
                 correction_required=True,
                 correction_kind="duplicate_execute",
             )
-        if (
-            normalized_tool in _REPEAT_GUARDED_READ_TOOLS
-            and _has_recent_tool_signature(state, signature)
+        if normalized_tool in _REPEAT_GUARDED_READ_TOOLS and _has_recent_tool_signature(
+            state, signature
         ):
-            if signature in state.duplicate_read_correction_signatures:
-                raise InvestigationStagnationError(
-                    self.recovery(
-                        task_id,
-                        "duplicate_read_ignored",
-                        state=state,
-                        tool_call_id=tool_call_id,
-                        checkpoint_available=True,
-                        recovery_action="pause_and_change_investigation_action",
-                    )
-                )
             source_id = tool_call_id or stable_investigation_id(
                 "duplicate-read-correction",
                 task_id,
@@ -703,6 +621,7 @@ class InvestigationCoordinator:
                 state,
                 state.model_copy(
                     update={
+                        "reevaluation_required": True,
                         "duplicate_read_correction_signatures": list(
                             dict.fromkeys(
                                 [
@@ -710,7 +629,7 @@ class InvestigationCoordinator:
                                     signature,
                                 ]
                             )
-                        )[-16:]
+                        )[-16:],
                     }
                 ),
                 InvestigationEventType.REEVALUATION_REQUIRED,
@@ -725,6 +644,22 @@ class InvestigationCoordinator:
         # Receipt/Journal recovery, experiment scope, and duplicate-side-effect
         # checks remain authoritative; legacy phase/stagnation state cannot gate tools.
         return ToolAuthorization(allowed=True)
+
+    def _tool_signature(
+        self,
+        task_id: str,
+        name: str,
+        arguments: Mapping[str, object],
+    ) -> str:
+        signature = tool_signature(name, arguments)
+        if name not in _REPEAT_GUARDED_READ_TOOLS:
+            return signature
+        workspace = self.tasks.get_definition(task_id).workspace_root
+        if not workspace or not Path(workspace).is_dir():
+            return signature
+        # Include external edits and command side effects as well as tracked file changes.
+        revision = compute_code_state_hash(workspace)
+        return f"{signature}@{revision}"
 
     def recovery(
         self,

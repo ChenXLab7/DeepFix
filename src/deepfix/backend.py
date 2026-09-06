@@ -300,7 +300,7 @@ def _build_project_backend(
             task_scoped_environment,
         )
 
-        policy = WorkspaceCommandPolicy(workspace)
+        policy = WorkspaceCommandPolicy(workspace, project_python=config.project_python)
         shell_environment = task_scoped_environment(
             workspace,
             config.project_python,

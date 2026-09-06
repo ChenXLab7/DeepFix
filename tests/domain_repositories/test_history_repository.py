@@ -164,7 +164,7 @@ def test_unverified_artifact_prevents_prepared_record(tmp_path: Path) -> None:
     assert repository.list_for_task("task-1") == []
 
 
-def test_current_investigation_record_overrides_stale_history_item(
+def test_current_investigation_record_does_not_override_historical_item(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "deepfix.db"
@@ -213,11 +213,11 @@ def test_current_investigation_record_overrides_stale_history_item(
     ]
 
     assert [(item.hypothesis_id, item.text) for item in hypotheses] == [
-        ("h-1", "current parser hypothesis")
+        ("h-1", "old parser hypothesis")
     ]
 
 
-def test_current_evidence_claim_overrides_stale_history_claim(tmp_path: Path) -> None:
+def test_current_evidence_claim_does_not_override_historical_claim(tmp_path: Path) -> None:
     database = tmp_path / "deepfix.db"
     stale = ProvenancedClaim(
         claim_id="claim-1",
@@ -252,11 +252,11 @@ def test_current_evidence_claim_overrides_stale_history_claim(tmp_path: Path) ->
     )
 
     assert [(item.claim_id, item.text) for item in projected.confirmed_facts] == [
-        ("claim-1", "current parser fact")
+        ("claim-1", "old parser fact")
     ]
 
 
-def test_resolved_current_question_suppresses_stale_history_question(
+def test_resolved_current_question_does_not_suppress_historical_question(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "deepfix.db"
@@ -309,7 +309,7 @@ def test_resolved_current_question_suppresses_stale_history_question(
         investigation=investigation,
     )
 
-    assert projected.unresolved_questions == []
+    assert projected.unresolved_questions == [stale]
 
 
 def test_history_migration_backfills_snapshot_failure_and_event_without_mutating_legacy(
@@ -436,7 +436,9 @@ def test_history_migration_backfills_snapshot_failure_and_event_without_mutating
         evidence=EvidenceRepository(database),
         investigation=InvestigationRepository(database),
     )
-    assert projected.deterministic_evidence.tests == []
+    assert [item.evidence_id for item in projected.deterministic_evidence.tests] == [
+        "legacy-test-1"
+    ]
     assert history.list_failures("task-1") == [failure]
     assert history.migrated_event("task-1") == event
     with database.connection() as connection:

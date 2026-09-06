@@ -67,22 +67,41 @@ class InvestigationRepository:
     def load(self, task_id: str) -> InvestigationState | None:
         with self.database.connection() as connection:
             state = self._load_state(connection, task_id)
-        if state is None:
-            return None
-        current = {item.hypothesis_id: item for item in self.list_hypotheses(task_id)}
-        if not current:
-            return state
-        merged = {item.hypothesis_id: item for item in state.hypotheses}
-        merged.update(current)
-        hypotheses = list(merged.values())[-64:]
+            return self._with_current_hypotheses(connection, state) if state else None
+
+    @staticmethod
+    def _with_current_hypotheses(
+        connection: sqlite3.Connection,
+        state: InvestigationState,
+    ) -> InvestigationState:
+        rows = connection.execute(
+            "SELECT payload FROM hypotheses WHERE task_id = ? ORDER BY created_at, hypothesis_id",
+            (state.task_id,),
+        ).fetchall()
+        hypotheses = [InvestigationHypothesis.model_validate_json(str(row[0])) for row in rows][
+            -64:
+        ]
         return state.model_copy(
             update={
                 "hypotheses": hypotheses,
                 "supported_hypothesis_ids": [
                     item.hypothesis_id for item in hypotheses if item.state == "supported"
-                ][-64:],
+                ],
             }
         )
+
+    def _commit_hypothesis_changes(
+        self,
+        connection: sqlite3.Connection,
+        current: InvestigationState | None,
+        next_state: InvestigationState,
+    ) -> InvestigationState:
+        # A state snapshot is a projection. Only explicitly changed beliefs may write
+        # to the current table; unrelated lifecycle commits cannot replay stale beliefs.
+        prior = {item.hypothesis_id: item for item in current.hypotheses} if current else {}
+        changes = [item for item in next_state.hypotheses if prior.get(item.hypothesis_id) != item]
+        self.project_hypotheses(connection, next_state.task_id, changes)
+        return self._with_current_hypotheses(connection, next_state)
 
     def ensure_started(self, task_id: str) -> InvestigationState:
         existing = self.load(task_id)
@@ -113,12 +132,12 @@ class InvestigationRepository:
                 self._validate_replay(events, existing)
                 if current is None:
                     raise InvestigationStateConflict("重放事件缺少物化状态")
-                return current
+                return self._with_current_hypotheses(connection, current)
             if existing or current_version != expected_version:
                 raise InvestigationStateConflict("investigation state 版本冲突")
             committed = next_state.model_copy(update={"version": current_version + 1})
             self._insert_events(connection, events)
-            self.project_hypotheses(connection, committed.task_id, committed.hypotheses)
+            committed = self._commit_hypothesis_changes(connection, current, committed)
             self._upsert_state(connection, committed)
             return committed
 
@@ -166,7 +185,7 @@ class InvestigationRepository:
                     raise InvestigationStateConflict("相同 experiment event_id 的内容冲突")
                 if current is None:
                     raise InvestigationStateConflict("重放缺少物化状态")
-                return current
+                return self._with_current_hypotheses(connection, current)
             if current_version != expected_version:
                 raise InvestigationStateConflict("investigation state 版本冲突")
             committed = next_state.model_copy(update={"version": current_version + 1})
@@ -203,7 +222,7 @@ class InvestigationRepository:
                     created_at,
                 ),
             )
-            self.project_hypotheses(connection, committed.task_id, committed.hypotheses)
+            committed = self._commit_hypothesis_changes(connection, current, committed)
             self._upsert_state(connection, committed)
             return committed
 
@@ -311,9 +330,7 @@ class InvestigationRepository:
                 """,
                 (_required(task_id, "task_id"),),
             ).fetchall()
-        return [
-            InvestigationHypothesis.model_validate_json(str(row[0])) for row in rows
-        ]
+        return [InvestigationHypothesis.model_validate_json(str(row[0])) for row in rows]
 
     def missing_current_evidence_ids(
         self,
@@ -345,9 +362,7 @@ class InvestigationRepository:
             if row is not None:
                 existing = UnresolvedQuestion.model_validate_json(str(row[0]))
                 if existing != question:
-                    raise QuestionIdentityConflict(
-                        "相同 question_id 的内容不一致"
-                    )
+                    raise QuestionIdentityConflict("相同 question_id 的内容不一致")
                 return existing
             connection.execute(
                 """
@@ -379,9 +394,7 @@ class InvestigationRepository:
             dict.fromkeys(_required(item, "evidence_id") for item in evidence_ids)
         )
         if not normalized_evidence_ids:
-            raise InvestigationEvidenceMissing(
-                "解决 unresolved question 至少需要一个当前 Evidence"
-            )
+            raise InvestigationEvidenceMissing("解决 unresolved question 至少需要一个当前 Evidence")
         with self.database.unit_of_work(immediate=True) as connection:
             self._require_current_evidence(
                 connection,
@@ -541,9 +554,7 @@ class InvestigationRepository:
             )
             return hypothesis
         if existing.statement != hypothesis.statement:
-            raise HypothesisIdentityConflict(
-                "相同 hypothesis_id 不能更换假设陈述"
-            )
+            raise HypothesisIdentityConflict("相同 hypothesis_id 不能更换假设陈述")
         if existing == hypothesis:
             return existing
         if existing.state != "candidate" or hypothesis.state not in {
@@ -591,8 +602,7 @@ class InvestigationRepository:
                 (task_id,),
             ).fetchall()
             if any(
-                _normalize_statement(str(row[1]))
-                == _normalize_statement(hypothesis.statement)
+                _normalize_statement(str(row[1])) == _normalize_statement(hypothesis.statement)
                 for row in rejected_rows
             ):
                 raise HypothesisTransitionError(
@@ -631,11 +641,7 @@ class InvestigationRepository:
             """,
             (task_id, hypothesis_id),
         ).fetchone()
-        return (
-            None
-            if row is None
-            else InvestigationHypothesis.model_validate_json(str(row[0]))
-        )
+        return None if row is None else InvestigationHypothesis.model_validate_json(str(row[0]))
 
     @staticmethod
     def _require_current_evidence(
@@ -645,9 +651,7 @@ class InvestigationRepository:
     ) -> None:
         normalized = list(dict.fromkeys(evidence_ids))
         if not normalized:
-            raise InvestigationEvidenceMissing(
-                "状态迁移至少需要一个当前 Evidence"
-            )
+            raise InvestigationEvidenceMissing("状态迁移至少需要一个当前 Evidence")
         missing = InvestigationRepository._missing_current_evidence_ids(
             connection,
             task_id,
@@ -919,6 +923,10 @@ def _canonical_event(event: NewInvestigationEvent) -> str:
 def _legacy_state_payload(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(payload)
     for field in (
+        "diagnostic_decision_required",
+        "diagnostic_test_count_since_decision",
+        "repair_reevaluation_required",
+        "decision_correction_used",
         "agent_phase",
         "paused_agent_phase",
         "permit",

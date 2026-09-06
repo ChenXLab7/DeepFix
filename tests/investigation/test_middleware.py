@@ -17,7 +17,6 @@ from langgraph.types import Command
 
 from deepfix.domain_repositories.execution import ExecutionRepository
 from deepfix.investigation.errors import (
-    InvestigationStagnationError,
     InvestigationStateError,
 )
 from deepfix.investigation.identity import stable_investigation_id
@@ -537,7 +536,7 @@ def test_pytest_usage_error_is_feedback_not_bug_reproduction(tmp_path):
     assert result.artifact["error_code"] == "pytest_usage_error"
     assert "测试断言尚未执行" in str(result.content)
     assert events[-1].event_type == "tool_completed"
-    assert state.diagnostic_test_count_since_decision == 0
+    assert state.test_evidence_ids == []
 
 
 def test_missing_timeout_plugin_explains_isolated_environment_recovery(tmp_path):
@@ -545,12 +544,7 @@ def test_missing_timeout_plugin_explains_isolated_environment_recovery(tmp_path)
     request = tool_request(
         "execute",
         "pytest-timeout-missing",
-        {
-            "command": (
-                "python -m pytest python_testcases/test_find_in_sorted.py "
-                "-q --timeout=5"
-            )
-        },
+        {"command": ("python -m pytest python_testcases/test_find_in_sorted.py -q --timeout=5")},
     )
     raw_result = ToolMessage(
         id="msg-pytest-timeout-missing",
@@ -581,7 +575,7 @@ def test_post_edit_failure_records_fact_but_does_not_gate_tools(tmp_path):
     )
 
     state = middleware.coordinator.state("task-a")
-    assert state.repair_reevaluation_required is True
+    assert state.reevaluation_required is True
     captured = capture_model_request(
         middleware,
         model_request(tools=all_test_tools()),
@@ -608,8 +602,7 @@ def test_two_diagnostic_pytest_runs_record_checkpoint_without_gating(tmp_path):
         )
 
     state = middleware.coordinator.state("task-a")
-    assert state.diagnostic_test_count_since_decision == 2
-    assert state.diagnostic_decision_required is True
+    assert len(state.test_evidence_ids) == 2
     captured = capture_model_request(
         middleware,
         model_request(tools=all_test_tools()),
@@ -617,7 +610,7 @@ def test_two_diagnostic_pytest_runs_record_checkpoint_without_gating(tmp_path):
     assert {tool.name for tool in captured.tools} == {tool.name for tool in all_test_tools()}
 
 
-def test_duplicate_execute_is_corrected_once_then_pauses(tmp_path):
+def test_duplicate_execute_keeps_returning_strategy_feedback(tmp_path):
     middleware = middleware_fixture(tmp_path, phase="investigating")
     executions = 0
 
@@ -641,15 +634,16 @@ def test_duplicate_execute_is_corrected_once_then_pauses(tmp_path):
     assert isinstance(correction, ToolMessage)
     assert correction.artifact["result_type"] == "duplicate_execute_correction"
 
-    with pytest.raises(InvestigationStagnationError) as caught:
-        middleware.wrap_tool_call(tool_request("execute", "probe-3", command), handler)
-
+    for index in range(3, 8):
+        correction = middleware.wrap_tool_call(
+            tool_request("execute", f"probe-{index}", command), handler
+        )
+        assert correction.artifact["result_type"] == "duplicate_execute_correction"
     assert executions == 1
-    assert caught.value.recovery.error_code == "duplicate_execute_ignored"
 
 
 @pytest.mark.parametrize("tool_name", ["grep", "read_file"])
-def test_duplicate_read_only_call_is_corrected_once_then_pauses(
+def test_duplicate_read_feedback_allows_different_read_progression(
     tmp_path,
     tool_name,
 ):
@@ -669,9 +663,7 @@ def test_duplicate_read_only_call_is_corrected_once_then_pauses(
         )
 
     arguments = (
-        {"pattern": "custom_repr"}
-        if tool_name == "grep"
-        else {"file_path": "/pysnooper/tracer.py"}
+        {"pattern": "custom_repr"} if tool_name == "grep" else {"file_path": "/pysnooper/tracer.py"}
     )
     middleware.wrap_tool_call(
         tool_request(tool_name, f"{tool_name}-1", arguments),
@@ -690,14 +682,18 @@ def test_duplicate_read_only_call_is_corrected_once_then_pauses(
     else:
         assert "offset" in correction.content
 
-    with pytest.raises(InvestigationStagnationError) as caught:
-        middleware.wrap_tool_call(
-            tool_request(tool_name, f"{tool_name}-3", arguments),
+    for index in range(3, 8):
+        correction = middleware.wrap_tool_call(
+            tool_request(tool_name, f"{tool_name}-{index}", arguments),
             handler,
         )
-
-    assert executions == 1
-    assert caught.value.recovery.error_code == "duplicate_read_ignored"
+        assert correction.artifact["result_type"] == "duplicate_read_correction"
+    result = middleware.wrap_tool_call(
+        tool_request("read_file", "different-read", {"file_path": "/src/sign.py"}),
+        handler,
+    )
+    assert result.status == "success"
+    assert executions == 2
 
 
 def test_windows_unix_pipeline_is_blocked_before_execution(tmp_path, monkeypatch):
@@ -789,7 +785,7 @@ def test_model_prompt_exposes_current_hypothesis_ids_and_states(tmp_path):
     assert 'state="candidate"' in captured.system_message.text
 
 
-def test_alternating_duplicate_candidates_are_each_corrected_once_then_pause(tmp_path):
+def test_alternating_duplicate_candidates_keep_returning_feedback(tmp_path):
     middleware = middleware_fixture(tmp_path)
     statement = "capacity=0 may expose a boundary bug"
     existing = middleware.coordinator.record_hypothesis(
@@ -856,17 +852,11 @@ def test_alternating_duplicate_candidates_are_each_corrected_once_then_pause(tmp
 
     assert other_correction.artifact["hypothesis_id"] == other.hypothesis_id
 
-    with pytest.raises(InvestigationStagnationError) as captured:
-        middleware.wrap_tool_call(
-            tool_request(
-                "record_hypothesis",
-                "candidate-duplicate-2",
-                arguments,
-            ),
-            handler,
-        )
-
-    assert captured.value.recovery.error_code == "duplicate_hypothesis_ignored"
+    correction = middleware.wrap_tool_call(
+        tool_request("record_hypothesis", "candidate-duplicate-2", arguments),
+        handler,
+    )
+    assert correction.artifact["hypothesis_id"] == existing.hypothesis_id
     assert handler_called is False
 
 
@@ -1129,3 +1119,55 @@ def test_two_parallel_read_files_commit_both_receipts_and_observations(tmp_path)
         "src/code.py",
         "tests/test_code.py",
     }
+
+
+@pytest.mark.parametrize("tool_name", ["grep", "read_file"])
+def test_read_after_external_file_modification_is_not_stale_duplicate(tmp_path, tool_name):
+    middleware = middleware_fixture(tmp_path)
+    target = tmp_path / "changed.py"
+    target.write_text("before", encoding="utf-8")
+    arguments = {"file_path": "/changed.py"} if tool_name == "read_file" else {"pattern": "after"}
+
+    def handler(request):
+        return ToolMessage(
+            content=target.read_text(encoding="utf-8"),
+            tool_call_id=request.tool_call["id"],
+            name=tool_name,
+        )
+
+    middleware.wrap_tool_call(tool_request(tool_name, "before", arguments), handler)
+    target.write_text("after", encoding="utf-8")
+    result = middleware.wrap_tool_call(tool_request(tool_name, "after", arguments), handler)
+    assert result.status == "success"
+    assert result.content == "after"
+
+
+def test_resume_clears_stale_corrections_without_inventing_evidence(tmp_path):
+    middleware = middleware_fixture(tmp_path)
+    coordinator = middleware.coordinator
+    state = coordinator.state("task-a")
+    coordinator.store.commit(
+        state.version,
+        [
+            NewInvestigationEvent(
+                event_id="old-correction",
+                task_id="task-a",
+                event_type="reevaluation_required",
+            )
+        ],
+        state.model_copy(
+            update={
+                "duplicate_read_correction_signatures": ["stale"],
+                "duplicate_hypothesis_correction_ids": ["stale"],
+                "duplicate_execute_correction_signature": "stale",
+                "stagnation_level": 2,
+            }
+        ),
+    )
+    before = coordinator.state("task-a")
+    resumed = coordinator.record_resumed("task-a", "continue")
+    assert resumed.duplicate_read_correction_signatures == []
+    assert resumed.duplicate_hypothesis_correction_ids == []
+    assert resumed.duplicate_execute_correction_signature is None
+    assert resumed.progress_generation == before.progress_generation
+    assert resumed.last_progress_event_id == before.last_progress_event_id

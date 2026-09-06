@@ -131,3 +131,92 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def test_configured_wrapper_uses_same_policy_as_python_alias(workspace):
+    wrapper = workspace.root.parent / "Python Runtime" / "pytest-wrapper.exe"
+    policy = WorkspaceCommandPolicy(workspace, project_python=wrapper)
+    for arguments in (
+        "-m pytest test_value.py -q",
+        "-m pytest ../outside.py",
+        "-m pip install demo",
+        '-c "print(1)"',
+        "-m pytest test_value.py | more",
+    ):
+        assert policy.evaluate(f'"{wrapper}" {arguments}') == policy.evaluate(
+            f"python {arguments}"
+        )
+    assert policy.evaluate(f'"{wrapper}" -m pytest test_value.py').allowed
+    assert not policy.evaluate(f'"{wrapper.parent / "other.exe"}" -m pytest').allowed
+
+
+def test_runner_accepts_explicit_configured_interpreter(workspace):
+    (workspace.root / "test_value.py").write_text("def test_value(): assert True\n")
+    command = f'"{sys.executable}" -m pytest test_value.py -q'
+    runner = WorkspaceCommandRunner(
+        workspace, WorkspaceCommandPolicy(workspace), project_python=sys.executable
+    )
+    grant = ApprovalGrant(
+        grant_id="explicit", task_id=workspace.task_id,
+        command_hash=normalized_command_hash(command), source="approval_record",
+    )
+    result = runner.execute(command, timeout=30, approval_grant=grant)
+    assert result.exit_code == 0, result.output
+
+
+def test_runner_keeps_configured_symlink_path(workspace, monkeypatch):
+    # Simulate a venv symlink on Windows without requiring symlink privileges.
+    configured = workspace.root / "venv" / "bin" / "python"
+    configured.parent.mkdir(parents=True)
+    configured.touch()
+    original_resolve = Path.resolve
+    monkeypatch.setattr(Path, "resolve", lambda path, **kw: (
+        Path(sys.executable) if path == configured else original_resolve(path, **kw)
+    ))
+    runner = WorkspaceCommandRunner(
+        workspace, WorkspaceCommandPolicy(workspace), project_python=configured
+    )
+    assert runner.project_python == configured
+
+
+def test_runner_defaults_to_policy_interpreter_without_mutating_policy(workspace):
+    configured = workspace.root / "wrapper"
+    configured.touch()
+    policy = WorkspaceCommandPolicy(workspace, project_python=configured)
+    runner = WorkspaceCommandRunner(workspace, policy)
+    assert runner.project_python == configured
+    WorkspaceCommandRunner(workspace, policy, project_python=sys.executable)
+    assert policy.project_python == configured
+
+
+@pytest.mark.parametrize("arguments", [
+    "-m pytest ../outside.py", "-m pip install demo",
+    "-m pytest test_value.py && echo unsafe",
+])
+def test_approval_cannot_override_configured_interpreter_denials(workspace, arguments):
+    command = f'"{sys.executable}" {arguments}'
+    runner = WorkspaceCommandRunner(workspace, WorkspaceCommandPolicy(workspace))
+    grant = ApprovalGrant(
+        grant_id="denied", task_id=workspace.task_id,
+        command_hash=normalized_command_hash(command), source="approval_record",
+    )
+    result = runner.execute(command, timeout=30, approval_grant=grant)
+    assert result.exit_code == 126
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX venv symlink integration")
+def test_runner_invokes_venv_symlink_without_switching_to_base_python(workspace):
+    import subprocess
+
+    from deepfix.execution import _bind_project_python
+
+    venv = workspace.root / "venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
+    configured = venv / "bin" / "python"
+    runner = WorkspaceCommandRunner(
+        workspace, WorkspaceCommandPolicy(workspace), project_python=configured,
+    )
+    command = _bind_project_python('python -c "import sys; print(sys.prefix)"',
+                                   runner.project_python)
+    result = subprocess.run(command, shell=True, capture_output=True, text=True, check=True)
+    assert Path(result.stdout.strip()) == venv

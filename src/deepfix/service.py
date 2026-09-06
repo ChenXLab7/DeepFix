@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 
@@ -32,7 +33,7 @@ from deepfix.investigation.models import InvestigationRecoveryMetadata
 from deepfix.operations import OperationReconciler
 from deepfix.persistence import TaskRepository
 from deepfix.task_domain.adjudication import OutcomeAdjudicationInput, OutcomeAdjudicator
-from deepfix.task_domain.models import TaskDefinition, TaskLifecycleStatus
+from deepfix.task_domain.models import TaskDefinition, TaskInput, TaskLifecycleStatus, TaskRun
 from deepfix.task_domain.outcome import RepairOutcomeCandidate
 from deepfix.task_domain.runtime import TaskRuntime
 from deepfix.verification import (
@@ -40,7 +41,12 @@ from deepfix.verification import (
     classify_pytest_result,
     unavailable_required_oracle_paths,
 )
-from deepfix.workspace import WorkspaceFactory
+from deepfix.workspace import WorkspaceFactory, compute_code_state_hash
+
+
+@dataclass(frozen=True)
+class _ContinueRun:
+    value: object
 
 
 class BugfixService:
@@ -70,7 +76,6 @@ class BugfixService:
             self.repositories.database,
             artifact_root=config.artifacts_path,
         )
-        self._agent_invocations: dict[str, int] = {}
 
     def start(self, problem: str) -> TaskRuntime:
         normalized_problem = problem.strip()
@@ -109,6 +114,7 @@ class BugfixService:
         if workspace is not None:
             verification = VerificationPolicyBuilder().build(definition, workspace)
         self.repository.create_definition(definition)
+        self._begin_run(task_id, normalized_problem, "problem", input_id=message_id)
         if verification is not None:
             self.repository.save_verification_policy(verification)
         self.repository.transition_lifecycle(
@@ -119,10 +125,11 @@ class BugfixService:
         migration_failure = self._guard_task_authority_migration(task_id)
         if migration_failure is not None:
             return migration_failure
-        return self._invoke_authorities(
-            task_id,
-            {"messages": [HumanMessage(id=message_id, content=normalized_problem)]},
-        )
+        with self.repository.execution_lock(task_id):
+            return self._invoke_authorities(
+                task_id,
+                {"messages": [HumanMessage(id=message_id, content=normalized_problem)]},
+            )
 
     def _runtime_from_authorities(
         self,
@@ -158,6 +165,25 @@ class BugfixService:
         self,
         task_id: str,
         user_message: str | None = None,
+        *,
+        input_kind: str = "information",
+        supersedes_input_id: str | None = None,
+    ) -> TaskRuntime:
+        with self.repository.execution_lock(task_id):
+            return self._continue_task(
+                task_id,
+                user_message,
+                input_kind=input_kind,
+                supersedes_input_id=supersedes_input_id,
+            )
+
+    def _continue_task(
+        self,
+        task_id: str,
+        user_message: str | None = None,
+        *,
+        input_kind: str = "information",
+        supersedes_input_id: str | None = None,
     ) -> TaskRuntime:
         migration_failure = self._guard_task_authority_migration(task_id)
         if migration_failure is not None:
@@ -192,34 +218,62 @@ class BugfixService:
             )
         if not user_message or not user_message.strip():
             raise ValueError("继续任务需要用户消息")
-        resumed_from_pause = lifecycle.status is TaskLifecycleStatus.PAUSED
+        resumed_from_pause = lifecycle.status in {
+            TaskLifecycleStatus.PAUSED,
+            TaskLifecycleStatus.WAITING_INPUT,
+        }
+        content = user_message.strip()
+        message_id = self._begin_run(
+            task_id,
+            content,
+            input_kind,
+            supersedes_input_id=supersedes_input_id,
+        )
         if resumed_from_pause:
             lifecycle = self.repository.transition_lifecycle(
                 task_id,
                 TaskLifecycleStatus.RUNNING,
                 expected_version=lifecycle.version,
             )
-        content = user_message.strip()
-        message_id = stable_conversation_message_id(
-            task_id,
-            self._graph_message_count(task_id),
-            "user",
-            content,
-        )
         if resumed_from_pause and not self._record_lifecycle_authority(
             task_id,
             lambda: self.investigation.record_resumed(task_id, message_id),
-        ):
-            return self.get_runtime(task_id)
-        if not self._record_lifecycle_authority(
-            task_id,
-            lambda: self.investigation.record_user_information(task_id, message_id),
         ):
             return self.get_runtime(task_id)
         return self._invoke_authorities(
             task_id,
             {"messages": [HumanMessage(id=message_id, content=content)]},
         )
+
+    def _begin_run(
+        self,
+        task_id: str,
+        text: str,
+        kind: str,
+        *,
+        input_id: str | None = None,
+        supersedes_input_id: str | None = None,
+    ) -> str:
+        if kind == "information" and text.strip().lower() in {"继续", "continue", "resume"}:
+            kind = "control"
+        item = TaskInput(
+            input_id=input_id or uuid4().hex,
+            task_id=task_id,
+            text=text,
+            kind=kind,
+            supersedes_input_id=supersedes_input_id,
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        self.repository.record_input(
+            item,
+            run=TaskRun(
+                run_id=uuid4().hex,
+                task_id=task_id,
+                input_id=item.input_id,
+                created_at=item.created_at,
+            ),
+        )
+        return item.input_id
 
     def pending_actions(self, task_id: str) -> list[dict[str, object]]:
         get_state = getattr(self.agent, "get_state", None)
@@ -231,7 +285,7 @@ class BugfixService:
             for graph_task in getattr(snapshot, "tasks", ())
             for interrupt in getattr(graph_task, "interrupts", ())
         ]
-        return self._normalize_actions(interrupts)
+        return self._normalize_actions(interrupts, task_id)
 
     def pause_task(self, task_id: str, reason: str = "用户暂停任务") -> TaskRuntime:
         migration_failure = self._guard_task_authority_migration(task_id)
@@ -254,6 +308,10 @@ class BugfixService:
         return self.get_runtime(task_id)
 
     def decide(self, task_id: str, decisions: list[str]) -> TaskRuntime:
+        with self.repository.execution_lock(task_id):
+            return self._decide(task_id, decisions)
+
+    def _decide(self, task_id: str, decisions: list[str]) -> TaskRuntime:
         migration_failure = self._guard_task_authority_migration(task_id)
         if migration_failure is not None:
             return migration_failure
@@ -263,6 +321,13 @@ class BugfixService:
         return self._resume_actions_authority(task_id, decisions)
 
     def _invoke_authorities(self, task_id: str, value: object) -> TaskRuntime:
+        while True:
+            result = self._invoke_once(task_id, value)
+            if isinstance(result, TaskRuntime):
+                return result
+            value = result.value
+
+    def _invoke_once(self, task_id: str, value: object) -> TaskRuntime | _ContinueRun:
         definition = self.repository.get_definition(task_id)
         activate = getattr(self.execution_backend, "activate_workspace", None)
         if callable(activate):
@@ -306,10 +371,10 @@ class BugfixService:
                     task_id,
                     "Required Oracle 路径不可用：" + ", ".join(unavailable_paths),
                 )
-        invocation_count = self._agent_invocations.get(task_id, 0)
-        if invocation_count >= self.config.max_agent_invocations:
-            return self._pause_authority(task_id, "已达到 Agent 最大调用次数")
-        self._agent_invocations[task_id] = invocation_count + 1
+        if not self.repository.list_runs(task_id):
+            self._begin_run(task_id, "恢复已有任务", "control")
+        if not self.repository.consume_invocation(task_id, self.config.max_agent_invocations):
+            return self._pause_authority(task_id, "本轮 Agent 调用预算耗尽；任务与证据已保留")
         graph_config = {
             "configurable": {
                 "thread_id": task_id,
@@ -353,10 +418,6 @@ class BugfixService:
 
         messages = ensure_message_ids(task_id, result.get("messages", [])).messages
         EvidenceCollector(self.repositories.evidence).collect(task_id, messages, definition)
-        if self._consecutive_post_change_failures(task_id) >= (
-            self.config.max_consecutive_test_failures
-        ):
-            return self._pause_authority(task_id, "已达到最大连续测试失败次数")
         interrupts = result.get("__interrupt__", ())
         if interrupts:
             return self._handle_interrupts_authority(task_id, interrupts)
@@ -374,8 +435,8 @@ class BugfixService:
         self,
         task_id: str,
         interrupts: object,
-    ) -> TaskRuntime:
-        actions = self._normalize_actions(interrupts)
+    ) -> TaskRuntime | _ContinueRun:
+        actions = self._normalize_actions(interrupts, task_id)
         prior_shell_calls = sum(
             item.operation == "execute"
             for item in self.repositories.execution.list_approvals(task_id)
@@ -396,6 +457,7 @@ class BugfixService:
             return self._resume_actions_authority(
                 task_id,
                 ["approve"] * len(actions),
+                invoke=False,
             )
         return self._runtime_from_authorities(task_id, pending_actions=actions)
 
@@ -403,7 +465,9 @@ class BugfixService:
         self,
         task_id: str,
         choices: list[str],
-    ) -> TaskRuntime:
+        *,
+        invoke: bool = True,
+    ) -> TaskRuntime | _ContinueRun:
         actions = self.pending_actions(task_id)
         if len(choices) != len(actions):
             raise ValueError("审批决定数量与待审批操作数量不一致")
@@ -413,11 +477,11 @@ class BugfixService:
             name = str(action["name"])
             args = action["args"]
             assert isinstance(args, Mapping)
-            policy = self.policy.evaluate(name, args)
-            if policy.action is PolicyAction.DENY:
+            policy_action = action["policy_action"]
+            if policy_action == PolicyAction.DENY.value:
                 final_choice = "reject"
-                reason = policy.reason
-            elif policy.action is PolicyAction.ALLOW:
+                reason = str(action["reason"])
+            elif policy_action == PolicyAction.ALLOW.value:
                 final_choice = "approve"
                 reason = ""
             else:
@@ -456,7 +520,7 @@ class BugfixService:
                     task_id=task_id,
                     operation=name,
                     decision=final_choice,
-                    risk=policy.risk.value,
+                    risk=str(action["risk"]),
                     source_tool_call_id=source_id,
                 )
             )
@@ -473,43 +537,58 @@ class BugfixService:
             TaskLifecycleStatus.RUNNING,
             expected_version=lifecycle.version,
         )
-        return self._invoke_authorities(
-            task_id,
-            Command(resume={"decisions": graph_decisions}),
-        )
+        value = Command(resume={"decisions": graph_decisions})
+        return self._invoke_authorities(task_id, value) if invoke else _ContinueRun(value)
 
     def _apply_outcome_authority(
         self,
         task_id: str,
         outcome: RepairOutcomeCandidate,
-    ) -> TaskRuntime:
+    ) -> TaskRuntime | _ContinueRun:
         if outcome.status == "needs_input":
-            runtime = self._pause_authority(
+            lifecycle = self.repository.get_lifecycle(task_id)
+            self.repository.transition_lifecycle(
                 task_id,
-                outcome.question or outcome.summary,
+                TaskLifecycleStatus.WAITING_INPUT,
+                reason=outcome.question or outcome.summary,
+                expected_version=lifecycle.version,
             )
-            self._record_lifecycle_authority(
-                task_id,
-                lambda: self.investigation.record_needs_input(
-                    task_id,
-                    f"agent-invocation-{self._agent_invocations.get(task_id, 0)}",
-                ),
-            )
-            return runtime
+            return self.get_runtime(task_id)
         if outcome.status == "blocked":
-            return self._pause_authority(task_id, outcome.summary)
+            if outcome.question:
+                return self._apply_outcome_authority(
+                    task_id,
+                    outcome.model_copy(update={"status": "needs_input"}),
+                )
+            return self._continue_investigation(
+                task_id,
+                "请重评估已有证据、未验证假设和可行调查路径。"
+                "如果需要用户介入，请提出具体问题，说明答案将改变哪个下一步。",
+            )
+        if outcome.status == "continue":
+            return self._continue_investigation(task_id, outcome.summary)
         verification = self.repositories.evidence.verification_view(task_id)
+        definition = self.repository.get_definition(task_id)
+        current_hash = compute_code_state_hash(definition.workspace_root)
+        current_tests = [
+            item
+            for item in verification.test_evidence
+            if item.code_state_hash == current_hash
+            and (
+                not definition.workspace_baseline_id
+                or item.workspace_baseline_id == definition.workspace_baseline_id
+            )
+        ]
         successful_changes = [
             item.evidence_id
             for item in verification.file_change_evidence
             if item.status == "succeeded"
         ]
         if successful_changes or any(
-            classify_pytest_result(item.exit_code) == "test_failure"
-            for item in verification.test_evidence
+            classify_pytest_result(item.exit_code) == "test_failure" for item in current_tests
         ):
             reproduction_state = "reproduced"
-        elif any(item.exit_code == 0 for item in verification.test_evidence):
+        elif any(item.exit_code == 0 for item in current_tests):
             reproduction_state = "not_reproduced"
         else:
             reproduction_state = "unknown"
@@ -523,6 +602,8 @@ class BugfixService:
                 successful_change_evidence_ids=successful_changes,
                 scope_violation_evidence_ids=[],
                 reproduction_state=reproduction_state,
+                current_code_state_hash=current_hash,
+                workspace_baseline_id=definition.workspace_baseline_id,
             )
         )
         if assessment.decision is None or assessment.outcome not in {
@@ -534,6 +615,11 @@ class BugfixService:
                 if assessment.reason == "required verification is incomplete"
                 else assessment.reason
             )
+            if assessment.outcome == "continue":
+                return self._continue_investigation(
+                    task_id,
+                    reason + "。请执行缺失验证或继续调查；只有明确缺少用户信息时才提问。",
+                )
             return self._pause_authority(task_id, reason)
         lifecycle = self.repository.get_lifecycle(task_id)
         self.repository.transition_lifecycle(
@@ -543,6 +629,18 @@ class BugfixService:
         )
         self.repository.record_adjudication(assessment.decision)
         return self.get_runtime(task_id)
+
+    def _continue_investigation(self, task_id: str, reason: str) -> _ContinueRun:
+        return _ContinueRun(
+            {
+                "messages": [
+                    SystemMessage(
+                        id=uuid4().hex,
+                        content="DeepFix 运行反馈（不是新证据）：" + reason,
+                    )
+                ]
+            }
+        )
 
     def _pause_authority(self, task_id: str, reason: str) -> TaskRuntime:
         lifecycle = self.repository.get_lifecycle(task_id)
@@ -615,7 +713,11 @@ class BugfixService:
                 count += 1
         return count
 
-    def _normalize_actions(self, interrupts: object) -> list[dict[str, object]]:
+    def _normalize_actions(
+        self,
+        interrupts: object,
+        task_id: str | None = None,
+    ) -> list[dict[str, object]]:
         normalized: list[dict[str, object]] = []
         for interrupt in interrupts:
             interrupt_id = str(getattr(interrupt, "id", "")).strip()
@@ -629,14 +731,29 @@ class BugfixService:
                 raw_args = request.get("args", {})
                 args = dict(raw_args) if isinstance(raw_args, Mapping) else {}
                 decision = self.policy.evaluate(name, args)
+                action = decision.action.value
+                reason = decision.reason
+                if task_id and name == "execute":
+                    definition = self.repository.get_definition(task_id)
+                    if definition.workspace_baseline_id:
+                        from deepfix.backend import _task_workspace
+                        from deepfix.execution import WorkspaceCommandPolicy
+
+                        executable = WorkspaceCommandPolicy(
+                            _task_workspace(definition),
+                            project_python=definition.project_python,
+                        ).evaluate(str(args.get("command", "")))
+                        if not executable.allowed:
+                            action = PolicyAction.DENY.value
+                            reason = executable.reason
                 normalized.append(
                     {
                         "name": name,
                         "args": args,
                         "description": str(request.get("description", "")),
                         "risk": decision.risk.value,
-                        "policy_action": decision.action.value,
-                        "reason": decision.reason,
+                        "policy_action": action,
+                        "reason": reason,
                         "interrupt_id": interrupt_id,
                         "interrupt_action_index": action_index,
                     }
@@ -774,6 +891,5 @@ def _is_model_provider_error(error: Exception) -> bool:
         ("openai", "APIError"),
     }
     return any(
-        (base.__module__, base.__name__) in recoverable_bases
-        for base in type(error).__mro__
+        (base.__module__, base.__name__) in recoverable_bases for base in type(error).__mro__
     )

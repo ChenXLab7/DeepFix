@@ -145,7 +145,7 @@ def test_load_config_uses_current_interpreter_by_default(tmp_path, monkeypatch):
 
     config = load_isolated(tmp_path, ApprovalMode.MANUAL, tmp_path)
 
-    assert config.project_python == Path(sys.executable).resolve()
+    assert config.project_python == Path(sys.executable).absolute()
 
 
 def test_load_config_resolves_explicit_project_interpreter(tmp_path, monkeypatch):
@@ -175,6 +175,20 @@ def test_load_config_rejects_missing_project_interpreter(tmp_path, monkeypatch):
             tmp_path,
             project_python=tmp_path / "missing-python",
         )
+
+
+def test_load_config_preserves_interpreter_invocation_path(tmp_path, monkeypatch):
+    configured = tmp_path / "venv" / "bin" / "python"
+    configured.parent.mkdir(parents=True)
+    configured.touch()
+    original_resolve = Path.resolve
+    monkeypatch.setattr(Path, "resolve", lambda path, **kw: (
+        Path(sys.executable) if path == configured else original_resolve(path, **kw)
+    ))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = load_isolated(tmp_path, ApprovalMode.MANUAL, tmp_path,
+                           project_python=configured)
+    assert config.project_python == configured
 
 
 def test_load_config_enables_tavily_only_when_key_exists(tmp_path, monkeypatch):

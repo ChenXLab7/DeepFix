@@ -2,7 +2,9 @@ from deepfix.compaction.models import FileChangeEvidence, SystemTestEvidence
 from deepfix.domain_repositories import DomainRepositories
 from deepfix.investigation.models import InvestigationHypothesis
 from deepfix.navigation.feedback import RepositoryNavigationFeedbackSource
+from deepfix.task_domain.models import TaskDefinition
 from deepfix.verification import VerificationOracle, VerificationPolicy
+from deepfix.workspace import WorkspaceFactory, compute_code_state_hash
 
 
 def _stores(tmp_path):
@@ -105,9 +107,7 @@ def test_baseline_pass_without_change_reports_not_reproduced(tmp_path):
     policy = _policy().model_copy(
         update={
             "required_oracles": [
-                _policy().required_oracles[0].model_copy(
-                    update={"required_timing": "baseline"}
-                )
+                _policy().required_oracles[0].model_copy(update={"required_timing": "baseline"})
             ]
         }
     )
@@ -116,3 +116,85 @@ def test_baseline_pass_without_change_reports_not_reproduced(tmp_path):
         "task-a", _test_evidence("baseline"), provenance_root_ids=["call-baseline"]
     )
     assert "baseline-not-reproduced" in source.build("task-a").milestone_ids
+
+
+def test_navigation_rechecks_live_workspace_after_passing_test(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "value.py").write_text("VALUE = 1\n")
+    workspace = WorkspaceFactory(tmp_path / "workspaces").create("task-a", project)
+    repositories, _ = _stores(tmp_path)
+    source = RepositoryNavigationFeedbackSource(repositories, workspace=workspace)
+    repositories.tasks.save_verification_policy(_policy())
+    passing = _test_evidence().model_copy(
+        update={
+            "code_state_hash": compute_code_state_hash(workspace.root),
+            "workspace_baseline_id": workspace.baseline.baseline_id,
+        }
+    )
+    repositories.evidence.record_deterministic("task-a", passing, provenance_root_ids=["call-pass"])
+    assert "required-oracles-satisfied" in source.build("task-a").milestone_ids
+    (workspace.root / "value.py").write_text("VALUE = 2\n")
+    assert "required-oracles-satisfied" not in source.build("task-a").milestone_ids
+
+
+def test_navigation_resolves_live_workspace_from_task_definition(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "value.py").write_text("VALUE = 1\n")
+    workspace = WorkspaceFactory(tmp_path / "workspaces").create("task-a", project)
+    repositories, source = _stores(tmp_path)
+    repositories.tasks.create_definition(
+        TaskDefinition(
+            task_id="task-a",
+            original_message_id="message-a",
+            original_problem="fix value",
+            approval_mode="review",
+            source_project_root=str(project),
+            workspace_root=str(workspace.root),
+            workspace_baseline_id=workspace.baseline.baseline_id,
+            project_python="python",
+            confinement_level="guarded_local",
+            created_at="2026-09-06T00:00:00+00:00",
+        )
+    )
+    repositories.tasks.save_verification_policy(_policy())
+    repositories.evidence.record_deterministic(
+        "task-a",
+        _test_evidence().model_copy(
+            update={
+                "code_state_hash": compute_code_state_hash(workspace.root),
+                "workspace_baseline_id": workspace.baseline.baseline_id,
+            }
+        ),
+        provenance_root_ids=["call-pass"],
+    )
+
+    assert "required-oracles-satisfied" in source.build("task-a").milestone_ids
+    (workspace.root / "value.py").write_text("VALUE = 2\n")
+    assert "required-oracles-satisfied" not in source.build("task-a").milestone_ids
+
+
+def test_offline_navigation_does_not_use_generated_test_to_refresh_old_pass(tmp_path):
+    repositories, source = _stores(tmp_path)
+    repositories.tasks.save_verification_policy(_policy())
+    repositories.evidence.record_deterministic(
+        "task-a", _test_evidence(), provenance_root_ids=["old-pass"]
+    )
+    repositories.evidence.record_deterministic(
+        "task-a",
+        FileChangeEvidence(
+            evidence_id="change", path="value.py", operation="edit", status="succeeded"
+        ),
+        provenance_root_ids=["change"],
+    )
+    repositories.evidence.record_deterministic(
+        "task-a",
+        _test_evidence().model_copy(
+            update={"evidence_id": "generated-pass", "origin": "agent_generated"}
+        ),
+        provenance_root_ids=["generated-pass"],
+    )
+    feedback = source.build("task-a")
+    assert "required-oracles-satisfied" not in feedback.milestone_ids
+    assert "verification-pending" in feedback.milestone_ids
