@@ -4,7 +4,6 @@ import hashlib
 import json
 
 import pytest
-from investigation.helpers import coordinator_fixture
 from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool
@@ -152,9 +151,8 @@ def read_call(call_id: str = "read-1"):
 
 def test_tool_schemas_hide_runtime_task_messages_and_backend_path(tmp_path):
     service = ServiceStub()
-    coordinator = coordinator_fixture(tmp_path)
-    search = build_search_diagnostic_artifacts_tool(service, coordinator)
-    read = build_read_diagnostic_artifact_tool(service, coordinator)
+    search = build_search_diagnostic_artifacts_tool(service)
+    read = build_read_diagnostic_artifact_tool(service)
 
     assert set(search.args) == {"query", "artifact_kinds", "max_matches"}
     assert set(read.args) == {"artifact_id", "start_line", "line_count"}
@@ -164,7 +162,6 @@ def test_search_returns_stable_safe_tool_message(tmp_path):
     service = ServiceStub()
     tool = build_search_diagnostic_artifacts_tool(
         service,
-        coordinator_fixture(tmp_path),
     )
 
     result = invoke_tool(tool, search_call())
@@ -202,7 +199,6 @@ def test_read_returns_stable_safe_tool_message(tmp_path):
     service = ServiceStub()
     tool = build_read_diagnostic_artifact_tool(
         service,
-        coordinator_fixture(tmp_path),
     )
 
     result = invoke_tool(tool, read_call())
@@ -237,14 +233,13 @@ def test_final_tool_content_never_exceeds_character_budget(tmp_path):
             return result.model_copy(update={"content": "界" * 12_000})
 
     service = LongService()
-    coordinator = coordinator_fixture(tmp_path)
 
     search_result = invoke_tool(
-        build_search_diagnostic_artifacts_tool(service, coordinator),
+        build_search_diagnostic_artifacts_tool(service),
         search_call(),
     )
     read_result = invoke_tool(
-        build_read_diagnostic_artifact_tool(service, coordinator),
+        build_read_diagnostic_artifact_tool(service),
         read_call(),
     )
 
@@ -262,7 +257,6 @@ def test_recoverable_service_error_returns_bounded_stable_error(tmp_path):
     )
     tool = build_search_diagnostic_artifacts_tool(
         service,
-        coordinator_fixture(tmp_path),
     )
 
     result = invoke_tool(tool, search_call("search-error"))
@@ -286,7 +280,6 @@ def test_missing_runtime_task_returns_stable_error_without_service_call(tmp_path
     service = ServiceStub()
     tool = build_search_diagnostic_artifacts_tool(
         service,
-        coordinator_fixture(tmp_path),
     )
 
     runtime = ToolRuntime(
@@ -332,9 +325,7 @@ def test_system_error_converts_to_investigation_recovery(
         "diagnostic_artifact_backend_read_failed",
         "backend_read",
     )
-    coordinator = coordinator_fixture(tmp_path)
-    status_before = coordinator.tasks.get_lifecycle("task-a").status
-    tool = builder(service, coordinator)
+    tool = builder(service)
 
     with pytest.raises(InvestigationStateError) as caught:
         invoke_tool(tool, call)
@@ -347,4 +338,3 @@ def test_system_error_converts_to_investigation_recovery(
     assert caught.value.recovery.recovery_action == (
         "pause_and_retry_diagnostic_artifact_read"
     )
-    assert coordinator.tasks.get_lifecycle("task-a").status is status_before

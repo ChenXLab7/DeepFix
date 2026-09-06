@@ -27,10 +27,6 @@ from deepfix.compaction.middleware import (
     DeepFixCompactionMiddleware,
     MessageIdentityMiddleware,
 )
-from deepfix.compaction.migration import (
-    LegacyContextMigrationMiddleware,
-    LegacyContextStores,
-)
 from deepfix.compaction.snapshot import (
     CompactionDeltaGenerator,
     CompactionSnapshotBuilder,
@@ -44,21 +40,7 @@ from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.experiments import ExecutorNarrativeResult
 from deepfix.investigation.loop import EXPERIMENT_EXECUTOR_SYSTEM_PROMPT
 from deepfix.investigation.middleware import InvestigationMiddleware
-from deepfix.investigation.migration import (
-    InvestigationMigrationMiddleware,
-    InvestigationMigrator,
-)
-from deepfix.investigation.models import InvestigationCapability
 from deepfix.investigation.receipts import ToolResultArtifactStorage
-from deepfix.investigation.tools import (
-    build_record_hypothesis_tool,
-)
-from deepfix.navigation.feedback import RepositoryNavigationFeedbackSource
-from deepfix.navigation.middleware import TodoNavigationMiddleware
-from deepfix.navigation.prompts import (
-    DEEPFIX_TODO_SYSTEM_PROMPT,
-    DEEPFIX_TODO_TOOL_DESCRIPTION,
-)
 from deepfix.persistence import TaskRepository
 from deepfix.prompting import PromptPolicyMiddleware
 from deepfix.prompts import CORE_REPAIR_PROMPT
@@ -124,16 +106,6 @@ def build_agent(
         repositories.tasks if repositories is not None else TaskRepository(config.database_path)
     )
     evidence_collector = EvidenceCollector(repositories.evidence)
-    investigation_store = (
-        investigation.store if investigation is not None else repositories.investigation
-    )
-    investigation = investigation or InvestigationCoordinator(
-        store=investigation_store,
-        tasks=tasks,
-        evidence_repository=repositories.evidence,
-        evidence_collector=evidence_collector,
-    )
-    navigation_feedback = RepositoryNavigationFeedbackSource(repositories)
     protected_builder = ProtectedContextBuilder(repositories)
     budget_monitor = ContextBudgetMonitor()
     coordinator = CompactionCoordinator(
@@ -142,13 +114,11 @@ def build_agent(
         snapshot_builder=CompactionSnapshotBuilder(),
         history_repository=repositories.history,
         evidence_repository=repositories.evidence,
-        investigation_repository=repositories.investigation,
         budget_monitor=budget_monitor,
         protected_builder=protected_builder,
         model=compaction_model,
     )
     compact_conversation = build_compact_conversation_tool(coordinator)
-    record_hypothesis = build_record_hypothesis_tool(investigation)
     artifact_collector = ArtifactReferenceCollector(repositories.history, resolved_backend)
     artifact_service = DiagnosticArtifactService(
         tasks,
@@ -157,11 +127,9 @@ def build_agent(
     )
     search_diagnostic_artifacts = build_search_diagnostic_artifacts_tool(
         artifact_service,
-        investigation,
     )
     read_diagnostic_artifact = build_read_diagnostic_artifact_tool(
         artifact_service,
-        investigation,
     )
     core_tool_names = {
         "ls",
@@ -173,7 +141,6 @@ def build_agent(
         "grep",
         "execute",
         "compact_conversation",
-        "record_hypothesis",
         "search_diagnostic_artifacts",
         "read_diagnostic_artifact",
         "write_todos",
@@ -183,26 +150,6 @@ def build_agent(
         existing_tool_names=core_tool_names,
         allowed_skill_roots=tuple(allowed_skill_roots),
     )
-    capabilities = {
-        "ls": InvestigationCapability.READ,
-        "read_file": InvestigationCapability.READ,
-        "write_file": InvestigationCapability.MODIFY,
-        "edit_file": InvestigationCapability.MODIFY,
-        "delete": InvestigationCapability.MODIFY,
-        "glob": InvestigationCapability.SEARCH,
-        "grep": InvestigationCapability.SEARCH,
-        "execute": InvestigationCapability.EXECUTE,
-        "compact_conversation": InvestigationCapability.COMPACTION,
-        "record_hypothesis": InvestigationCapability.META,
-        "search_diagnostic_artifacts": InvestigationCapability.READ,
-        "read_diagnostic_artifact": InvestigationCapability.READ,
-        "write_todos": InvestigationCapability.META,
-        **{
-            item.tool.name: item.investigation_capability
-            for item in resolved.tools
-            if item.investigation_capability is not None
-        },
-    }
     core_interrupts = {
         "write_file": True,
         "edit_file": True,
@@ -218,38 +165,19 @@ def build_agent(
         ),
         tools=[
             compact_conversation,
-            record_hypothesis,
             search_diagnostic_artifacts,
             read_diagnostic_artifact,
             *(item.tool for item in resolved.tools),
         ],
         middleware=[
             MessageIdentityMiddleware(),
-            TodoListMiddleware(
-                system_prompt=DEEPFIX_TODO_SYSTEM_PROMPT,
-                tool_description=DEEPFIX_TODO_TOOL_DESCRIPTION,
-            ),
-            TodoNavigationMiddleware(navigation_feedback, reminder_rounds=3),
-            LegacyContextMigrationMiddleware(
-                LegacyContextStores(
-                    tasks,
-                    repositories,
-                ),
-                DeepAgentsArtifactAdapter(resolved_backend),
-            ),
-            InvestigationMigrationMiddleware(
-                InvestigationMigrator(
-                    tasks=tasks,
-                    store=investigation_store,
-                    evidence_repository=repositories.evidence,
-                )
-            ),
+            TodoListMiddleware(),
             HumanInTheLoopMiddleware(interrupt_on=approval_interrupts),
             InvestigationMiddleware(
-                investigation,
+                tasks,
                 repositories.execution,
                 ToolResultArtifactStorage(config.artifacts_path / "investigation_receipts"),
-                capabilities,
+                evidence_collector,
             ),
             *prompt_policy_middleware,
             DeepFixCompactionMiddleware(

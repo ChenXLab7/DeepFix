@@ -34,7 +34,7 @@ def test_report_is_reconstructed_from_authoritative_repositories(
     assert view.definition.original_problem == "修复 value.py 中的边界错误"
     assert view.decision is not None
     assert view.decision.evidence_ids == ["change-1", "test-pass"]
-    assert "当前根因：边界条件使用了错误比较符" in report
+    assert view.hypotheses == []
     assert "value.py" in report
     assert "[通过] `python -m pytest tests/test_value.py -q`" in report
     assert "[L1] edit_file：approve" in report

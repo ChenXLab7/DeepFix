@@ -21,14 +21,6 @@ from deepfix.investigation.errors import (
 )
 from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.middleware import InvestigationMiddleware
-from deepfix.investigation.models import (
-    InvestigationCapability,
-    InvestigationHypothesis,
-    InvestigationRecoveryMetadata,
-    NewInvestigationEvent,
-    RecordHypothesisInput,
-    ToolObservation,
-)
 from deepfix.investigation.receipts import ToolResultArtifactStorage
 from deepfix.operations import OperationStatus
 from investigation.helpers import coordinator_fixture
@@ -215,201 +207,27 @@ def all_test_tools() -> list[BaseTool]:
 
 
 def middleware_fixture(
-    tmp_path: Path,
-    *,
-    phase: str = "investigating",
-    stagnation_level: int = 0,
-    fail_next_event_commit: bool = False,
-    with_journal: bool = False,
+    tmp_path: Path, *, phase="investigating", stagnation_level=0,
+    fail_next_event_commit=False, with_journal=False,
 ) -> InvestigationMiddleware:
-    del phase  # compatibility input proving phase labels no longer affect tools
     coordinator = coordinator_fixture(tmp_path)
-    del with_journal  # ExecutionRepository journal is always authoritative
-    state = coordinator.store.ensure_started("task-a")
-    candidate = InvestigationHypothesis(
-        hypothesis_id="hyp-1",
-        statement="sign flips in helper",
-        state="candidate",
-        evidence_ids=[],
-        checked_locations=[],
-        reason="candidate",
-    )
-    state = coordinator.store.commit(
-        state.version,
-        [
-            NewInvestigationEvent(
-                event_id=stable_investigation_id("event", "task-a", "middleware-fixture"),
-                task_id="task-a",
-                event_type="hypothesis_recorded",
-            )
-        ],
-        state.model_copy(
-            update={
-                "hypotheses": [candidate],
-                "stagnation_level": stagnation_level,
-                "reevaluation_required": stagnation_level > 0,
-            }
-        ),
-    )
+    collector = coordinator.evidence_collector
     if fail_next_event_commit:
-        original_record = coordinator.record_tool_result
+        original = collector.collect_pair
         failed = False
-
-        def fail_once(task_id, tool_call, result):
+        def fail_once(*args, **kwargs):
             nonlocal failed
             if not failed:
                 failed = True
-                current = coordinator.state(task_id)
-                raise InvestigationStateError(
-                    InvestigationRecoveryMetadata(
-                        task_id=task_id,
-                        error_code="investigation_event_commit_failed",
-                        state_version=current.version,
-                        last_event_sequence=coordinator.store.last_sequence(task_id),
-                        tool_call_id=str(tool_call["id"]),
-                        checkpoint_available=True,
-                        recovery_action="replay_event_commit_without_rerunning_tool",
-                    )
-                )
-            return original_record(task_id, tool_call, result)
-
-        coordinator.record_tool_result = fail_once
-    capabilities = {
-        "read_file": InvestigationCapability.READ,
-        "grep": InvestigationCapability.SEARCH,
-        "execute": InvestigationCapability.EXECUTE,
-        "edit_file": InvestigationCapability.MODIFY,
-        "record_hypothesis": InvestigationCapability.META,
-        "continue_investigation": InvestigationCapability.META,
-        "search_diagnostic_artifacts": InvestigationCapability.READ,
-        "read_diagnostic_artifact": InvestigationCapability.READ,
-        "compact_conversation": InvestigationCapability.COMPACTION,
-    }
+                raise OSError("simulated evidence commit failure")
+            return original(*args, **kwargs)
+        collector.collect_pair = fail_once
     return InvestigationMiddleware(
-        coordinator,
+        coordinator.tasks,
         ExecutionRepository(coordinator.evidence_repository.database),
         ToolResultArtifactStorage(tmp_path / "artifacts" / "investigation_receipts"),
-        capabilities,
+        collector,
     )
-
-
-def test_experiment_capability_boundary_blocks_tool_before_execution(tmp_path):
-    middleware = middleware_fixture(tmp_path)
-    request = tool_request(
-        "edit_file",
-        "blocked-edit",
-        {"file_path": "target.py", "old_string": "a", "new_string": "b"},
-        allowed_capabilities=["read", "search"],
-    )
-    executed = False
-
-    def handler(_request):
-        nonlocal executed
-        executed = True
-        return ToolMessage(
-            content="edited",
-            name="edit_file",
-            tool_call_id="blocked-edit",
-        )
-
-    result = middleware.wrap_tool_call(request, handler)
-
-    assert executed is False
-    assert result.status == "error"
-    assert "not allowed by this experiment" in result.content
-
-
-def test_phase_does_not_hide_tools_and_renders_bounded_state(tmp_path):
-    middleware = middleware_fixture(tmp_path, phase="diagnosing")
-    request = model_request(tools=named_tools("read_file", "edit_file", "record_hypothesis"))
-
-    captured = capture_model_request(middleware, request)
-
-    assert [tool.name for tool in captured.tools] == [
-        "read_file",
-        "edit_file",
-        "record_hypothesis",
-    ]
-    assert "<phase>" not in captured.system_message.text
-    assert "<deepfix_investigation_state>" in captured.system_message.text
-    assert '<hypothesis id="hyp-1" state="candidate">' in (captured.system_message.text)
-
-
-def test_stagnation_level_does_not_hide_tools(tmp_path):
-    middleware = middleware_fixture(tmp_path, stagnation_level=1)
-
-    captured = capture_model_request(
-        middleware,
-        model_request(tools=all_test_tools()),
-    )
-
-    assert {tool.name for tool in captured.tools} == {tool.name for tool in all_test_tools()}
-
-
-def test_normal_investigation_exposes_diagnostic_artifact_tools(tmp_path):
-    middleware = middleware_fixture(tmp_path)
-
-    captured = capture_model_request(
-        middleware,
-        model_request(tools=all_test_tools()),
-    )
-
-    assert {
-        "search_diagnostic_artifacts",
-        "read_diagnostic_artifact",
-    } <= {tool.name for tool in captured.tools}
-
-
-def test_diagnostic_checkpoint_is_advisory_and_does_not_hide_tools(
-    tmp_path,
-):
-    middleware = middleware_fixture(tmp_path, phase="diagnosing")
-    middleware.coordinator.record_observation(
-        "task-a",
-        ToolObservation(
-            event_type="artifact_read",
-            tool_call_id="artifact-read",
-            result_fingerprint="artifact-result",
-            payload={
-                "artifact_id": "artifact_" + "a" * 32,
-                "start_line": 10,
-                "end_line": 20,
-            },
-        ),
-    )
-
-    captured = capture_model_request(
-        middleware,
-        model_request(tools=all_test_tools()),
-    )
-
-    assert {tool.name for tool in captured.tools} == {tool.name for tool in all_test_tools()}
-    assert "<diagnostic_decision_checkpoint>" not in captured.system_message.text
-
-
-def test_decision_checkpoint_does_not_block_tool_execution(tmp_path):
-    middleware = middleware_fixture(tmp_path, phase="diagnosing")
-    middleware.coordinator.record_observation(
-        "task-a",
-        ToolObservation(
-            event_type="artifact_read",
-            tool_call_id="artifact-read",
-            result_fingerprint="artifact-result",
-            payload={"artifact_id": "artifact_" + "a" * 32},
-        ),
-    )
-    called = False
-
-    def handler(request):
-        nonlocal called
-        called = True
-        return read_result()
-
-    correction = middleware.wrap_tool_call(read_request(), handler)
-
-    assert called is True
-    assert isinstance(correction, ToolMessage)
-    assert correction.status == "success"
 
 
 def test_direct_read_of_offloaded_result_routes_to_diagnostic_tools(tmp_path):
@@ -435,9 +253,6 @@ def test_direct_read_of_offloaded_result_routes_to_diagnostic_tools(tmp_path):
         "operation": "read_file",
     }
     assert "search_diagnostic_artifacts" in result.content
-    state = middleware.coordinator.state("task-a")
-    assert all("large_tool_results" not in item.path for item in state.checked_files)
-    assert middleware.coordinator.store.list_events("task-a")[-1].event_type == ("tool_completed")
 
 
 def test_async_direct_read_of_offloaded_result_skips_handler(tmp_path):
@@ -461,36 +276,6 @@ def test_async_direct_read_of_offloaded_result_skips_handler(tmp_path):
     assert result.status == "error"
 
 
-def test_stagnation_does_not_change_visible_tools(tmp_path):
-    middleware = middleware_fixture(tmp_path, stagnation_level=1)
-
-    before = capture_model_request(
-        middleware,
-        model_request(tools=all_test_tools()),
-    )
-    assert {tool.name for tool in before.tools} == {tool.name for tool in all_test_tools()}
-
-    request = tool_request(
-        "search_diagnostic_artifacts",
-        "artifact-search-1",
-        {"query": "  AssertionError  "},
-    )
-    middleware.wrap_tool_call(
-        request,
-        lambda _: ToolMessage(
-            content="match",
-            tool_call_id="artifact-search-1",
-            name="search_diagnostic_artifacts",
-        ),
-    )
-
-    after = capture_model_request(
-        middleware,
-        model_request(tools=all_test_tools()),
-    )
-    assert {tool.name for tool in after.tools} == {tool.name for tool in all_test_tools()}
-
-
 def test_unexpected_inner_interrupt_preserves_started_operation_for_recovery(tmp_path):
     middleware = middleware_fixture(tmp_path, phase="editing")
 
@@ -506,37 +291,6 @@ def test_unexpected_inner_interrupt_preserves_started_operation_for_recovery(tmp
     )
     assert operation is not None
     assert operation.status is OperationStatus.STARTED
-    assert middleware.coordinator.state("task-a").task_id == "task-a"
-
-
-def test_real_pytest_tool_message_records_failure_without_phase_events(tmp_path):
-    middleware = middleware_fixture(tmp_path, phase="editing")
-
-    result = middleware.wrap_tool_call(
-        pytest_tool_request(),
-        lambda request: pytest_result(exit_code=1),
-    )
-
-    events = middleware.coordinator.store.list_events("task-a")
-    assert events[-1].event_type == "test_observed"
-    assert result.artifact["exit_code"] == 1
-
-
-def test_pytest_usage_error_is_feedback_not_bug_reproduction(tmp_path):
-    middleware = middleware_fixture(tmp_path, phase="investigating")
-
-    result = middleware.wrap_tool_call(
-        pytest_tool_request(),
-        lambda request: pytest_result(exit_code=4),
-    )
-
-    events = middleware.coordinator.store.list_events("task-a")
-    state = middleware.coordinator.state("task-a")
-    assert result.artifact["result_type"] == "pytest_infrastructure_error"
-    assert result.artifact["error_code"] == "pytest_usage_error"
-    assert "测试断言尚未执行" in str(result.content)
-    assert events[-1].event_type == "tool_completed"
-    assert state.test_evidence_ids == []
 
 
 def test_missing_timeout_plugin_explains_isolated_environment_recovery(tmp_path):
@@ -560,140 +314,6 @@ def test_missing_timeout_plugin_explains_isolated_environment_recovery(tmp_path)
     assert "pytest-timeout" in feedback
     assert "独立虚拟环境" in feedback
     assert "--python" in feedback
-
-
-def test_post_edit_failure_records_fact_but_does_not_gate_tools(tmp_path):
-    middleware = middleware_fixture(tmp_path, phase="planning")
-    middleware.wrap_tool_call(
-        edit_request(call_id="edit-artifactless"),
-        lambda request: artifactless_edit_result("edit-artifactless"),
-    )
-
-    middleware.wrap_tool_call(
-        pytest_tool_request(),
-        lambda request: pytest_result(exit_code=1),
-    )
-
-    state = middleware.coordinator.state("task-a")
-    assert state.reevaluation_required is True
-    captured = capture_model_request(
-        middleware,
-        model_request(tools=all_test_tools()),
-    )
-    assert {tool.name for tool in captured.tools} == {tool.name for tool in all_test_tools()}
-    assert "修改后验证失败" not in captured.system_message.text
-
-
-def test_two_diagnostic_pytest_runs_record_checkpoint_without_gating(tmp_path):
-    middleware = middleware_fixture(tmp_path, phase="investigating")
-    for call_id, command in (
-        ("pytest-diagnostic-1", "python -m pytest -q"),
-        ("pytest-diagnostic-2", "python -m pytest -q -x"),
-    ):
-        middleware.wrap_tool_call(
-            tool_request("execute", call_id, {"command": command}),
-            lambda request, call_id=call_id: ToolMessage(
-                id=f"msg-{call_id}",
-                content="1 failed",
-                name="execute",
-                tool_call_id=call_id,
-                artifact={"exit_code": 1},
-            ),
-        )
-
-    state = middleware.coordinator.state("task-a")
-    assert len(state.test_evidence_ids) == 2
-    captured = capture_model_request(
-        middleware,
-        model_request(tools=all_test_tools()),
-    )
-    assert {tool.name for tool in captured.tools} == {tool.name for tool in all_test_tools()}
-
-
-def test_duplicate_execute_keeps_returning_strategy_feedback(tmp_path):
-    middleware = middleware_fixture(tmp_path, phase="investigating")
-    executions = 0
-
-    def handler(request):
-        nonlocal executions
-        executions += 1
-        call_id = str(request.tool_call["id"])
-        return ToolMessage(
-            id=f"msg-{call_id}",
-            content="probe complete",
-            name="execute",
-            tool_call_id=call_id,
-            artifact={"exit_code": 0},
-        )
-
-    command = {"command": 'python -c "print(1)"'}
-    middleware.wrap_tool_call(tool_request("execute", "probe-1", command), handler)
-    correction = middleware.wrap_tool_call(tool_request("execute", "probe-2", command), handler)
-
-    assert executions == 1
-    assert isinstance(correction, ToolMessage)
-    assert correction.artifact["result_type"] == "duplicate_execute_correction"
-
-    for index in range(3, 8):
-        correction = middleware.wrap_tool_call(
-            tool_request("execute", f"probe-{index}", command), handler
-        )
-        assert correction.artifact["result_type"] == "duplicate_execute_correction"
-    assert executions == 1
-
-
-@pytest.mark.parametrize("tool_name", ["grep", "read_file"])
-def test_duplicate_read_feedback_allows_different_read_progression(
-    tmp_path,
-    tool_name,
-):
-    middleware = middleware_fixture(tmp_path, phase="investigating")
-    executions = 0
-
-    def handler(request):
-        nonlocal executions
-        executions += 1
-        call_id = str(request.tool_call["id"])
-        return ToolMessage(
-            id=f"msg-{call_id}",
-            content="same bounded result",
-            name=tool_name,
-            tool_call_id=call_id,
-            status="success",
-        )
-
-    arguments = (
-        {"pattern": "custom_repr"} if tool_name == "grep" else {"file_path": "/pysnooper/tracer.py"}
-    )
-    middleware.wrap_tool_call(
-        tool_request(tool_name, f"{tool_name}-1", arguments),
-        handler,
-    )
-    correction = middleware.wrap_tool_call(
-        tool_request(tool_name, f"{tool_name}-2", arguments),
-        handler,
-    )
-
-    assert executions == 1
-    assert isinstance(correction, ToolMessage)
-    assert correction.artifact["result_type"] == "duplicate_read_correction"
-    if tool_name == "grep":
-        assert 'output_mode="content"' in correction.content
-    else:
-        assert "offset" in correction.content
-
-    for index in range(3, 8):
-        correction = middleware.wrap_tool_call(
-            tool_request(tool_name, f"{tool_name}-{index}", arguments),
-            handler,
-        )
-        assert correction.artifact["result_type"] == "duplicate_read_correction"
-    result = middleware.wrap_tool_call(
-        tool_request("read_file", "different-read", {"file_path": "/src/sign.py"}),
-        handler,
-    )
-    assert result.status == "success"
-    assert executions == 2
 
 
 def test_windows_unix_pipeline_is_blocked_before_execution(tmp_path, monkeypatch):
@@ -759,118 +379,6 @@ def test_redirected_pytest_is_corrected_then_clean_command_executes(tmp_path, mo
 
     assert result.artifact["exit_code"] == 0
     assert executions == 1
-
-
-def test_model_prompt_exposes_current_hypothesis_ids_and_states(tmp_path):
-    middleware = middleware_fixture(tmp_path)
-    hypothesis = middleware.coordinator.record_hypothesis(
-        "task-a",
-        RecordHypothesisInput(
-            statement="capacity=0 may expose a boundary bug",
-            evidence_ids=[],
-            checked_locations=[],
-            target_state="candidate",
-            reason="needs a targeted test",
-        ),
-        source_id="candidate-call",
-    )
-
-    captured = capture_model_request(
-        middleware,
-        model_request(tools=all_test_tools()),
-    )
-
-    assert "<current_hypotheses>" in captured.system_message.text
-    assert f'id="{hypothesis.hypothesis_id}"' in captured.system_message.text
-    assert 'state="candidate"' in captured.system_message.text
-
-
-def test_alternating_duplicate_candidates_keep_returning_feedback(tmp_path):
-    middleware = middleware_fixture(tmp_path)
-    statement = "capacity=0 may expose a boundary bug"
-    existing = middleware.coordinator.record_hypothesis(
-        "task-a",
-        RecordHypothesisInput(
-            statement=statement,
-            evidence_ids=[],
-            checked_locations=[],
-            target_state="candidate",
-            reason="needs a targeted test",
-        ),
-        source_id="candidate-original",
-    )
-    other_statement = "empty items may expose a boundary bug"
-    other = middleware.coordinator.record_hypothesis(
-        "task-a",
-        RecordHypothesisInput(
-            statement=other_statement,
-            evidence_ids=[],
-            checked_locations=[],
-            target_state="candidate",
-            reason="needs a targeted test",
-        ),
-        source_id="candidate-other",
-    )
-    arguments = {
-        "statement": statement,
-        "evidence_ids": [],
-        "checked_locations": [],
-        "target_state": "candidate",
-        "reason": "needs a targeted test",
-    }
-    other_arguments = {**arguments, "statement": other_statement}
-    handler_called = False
-
-    def handler(request):
-        nonlocal handler_called
-        handler_called = True
-        raise AssertionError("duplicate candidate must not reach the tool")
-
-    correction = middleware.wrap_tool_call(
-        tool_request(
-            "record_hypothesis",
-            "candidate-duplicate-1",
-            arguments,
-        ),
-        handler,
-    )
-
-    assert handler_called is False
-    assert correction.status == "error"
-    assert correction.artifact["result_type"] == "duplicate_hypothesis_correction"
-    assert correction.artifact["hypothesis_id"] == existing.hypothesis_id
-    assert "Todo" in correction.text
-
-    other_correction = middleware.wrap_tool_call(
-        tool_request(
-            "record_hypothesis",
-            "candidate-other-duplicate-1",
-            other_arguments,
-        ),
-        handler,
-    )
-
-    assert other_correction.artifact["hypothesis_id"] == other.hypothesis_id
-
-    correction = middleware.wrap_tool_call(
-        tool_request("record_hypothesis", "candidate-duplicate-2", arguments),
-        handler,
-    )
-    assert correction.artifact["hypothesis_id"] == existing.hypothesis_id
-    assert handler_called is False
-
-
-def test_level_two_does_not_block_before_handler_execution(tmp_path):
-    middleware = middleware_fixture(tmp_path, stagnation_level=2)
-    called = False
-
-    def handler(request):
-        nonlocal called
-        called = True
-        return read_result()
-
-    middleware.wrap_tool_call(read_request(), handler)
-    assert called is True
 
 
 def test_committed_tool_receipt_prevents_side_effect_reexecution(tmp_path):
@@ -1115,10 +623,6 @@ def test_two_parallel_read_files_commit_both_receipts_and_observations(tmp_path)
     assert [result.status for result in results] == ["success", "success"]
     assert middleware.execution.load_receipt("task-a", "read-source") is not None
     assert middleware.execution.load_receipt("task-a", "read-test") is not None
-    assert {item.path for item in middleware.coordinator.state("task-a").checked_files} >= {
-        "src/code.py",
-        "tests/test_code.py",
-    }
 
 
 @pytest.mark.parametrize("tool_name", ["grep", "read_file"])
@@ -1140,34 +644,3 @@ def test_read_after_external_file_modification_is_not_stale_duplicate(tmp_path, 
     result = middleware.wrap_tool_call(tool_request(tool_name, "after", arguments), handler)
     assert result.status == "success"
     assert result.content == "after"
-
-
-def test_resume_clears_stale_corrections_without_inventing_evidence(tmp_path):
-    middleware = middleware_fixture(tmp_path)
-    coordinator = middleware.coordinator
-    state = coordinator.state("task-a")
-    coordinator.store.commit(
-        state.version,
-        [
-            NewInvestigationEvent(
-                event_id="old-correction",
-                task_id="task-a",
-                event_type="reevaluation_required",
-            )
-        ],
-        state.model_copy(
-            update={
-                "duplicate_read_correction_signatures": ["stale"],
-                "duplicate_hypothesis_correction_ids": ["stale"],
-                "duplicate_execute_correction_signature": "stale",
-                "stagnation_level": 2,
-            }
-        ),
-    )
-    before = coordinator.state("task-a")
-    resumed = coordinator.record_resumed("task-a", "continue")
-    assert resumed.duplicate_read_correction_signatures == []
-    assert resumed.duplicate_hypothesis_correction_ids == []
-    assert resumed.duplicate_execute_correction_signature is None
-    assert resumed.progress_generation == before.progress_generation
-    assert resumed.last_progress_event_id == before.last_progress_event_id

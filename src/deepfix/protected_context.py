@@ -88,24 +88,8 @@ class ProtectedContextBuilder:
                     task_id,
                     active_record.version,
                     evidence=self.repositories.evidence,
-                    investigation=self.repositories.investigation,
                 )
             envelopes = self.repositories.evidence.list_for_task(task_id)
-            hypotheses = tuple(
-                _hypothesis_record(item, active_record.version if active_record else 0)
-                for item in self.repositories.investigation.list_hypotheses(task_id)
-            )
-            questions = tuple(
-                ProvenancedText(
-                    text=item.text,
-                    sources=[
-                        ProvenanceRef(kind="snapshot_record", ref_id=source_id)
-                        for source_id in item.source_ids
-                    ],
-                )
-                for item in self.repositories.investigation.list_questions(task_id)
-                if item.status == "open"
-            )
             integrity = self.repositories.execution.integrity_view(task_id)
             execution_approvals = self.repositories.execution.list_approvals(task_id)
             inputs = self.repositories.tasks.list_inputs(task_id)
@@ -190,8 +174,8 @@ class ProtectedContextBuilder:
             ),
             deterministic_evidence=block,
             confirmed_facts=current_facts,
-            hypotheses=hypotheses,
-            unresolved_questions=questions,
+            hypotheses=(),
+            unresolved_questions=(),
             execution_integrity=integrity,
             external_evidence=external,
             active_snapshot=active_snapshot,

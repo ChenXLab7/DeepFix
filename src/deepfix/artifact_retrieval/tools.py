@@ -18,8 +18,8 @@ from deepfix.artifact_retrieval.models import (
 )
 from deepfix.artifact_retrieval.service import DiagnosticArtifactService
 from deepfix.compaction.identity import stable_generated_message_id
-from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import InvestigationStateError
+from deepfix.investigation.models import InvestigationRecoveryMetadata
 
 _MAX_CONTENT_CHARACTERS = 12_000
 _MAX_ERROR_CHARACTERS = 300
@@ -27,7 +27,6 @@ _MAX_ERROR_CHARACTERS = 300
 
 def build_search_diagnostic_artifacts_tool(
     service: DiagnosticArtifactService,
-    coordinator: InvestigationCoordinator,
 ) -> BaseTool:
     def search_diagnostic_artifacts(
         query: str,
@@ -55,7 +54,7 @@ def build_search_diagnostic_artifacts_tool(
                 "search_diagnostic_artifacts",
             )
         except DiagnosticArtifactSystemError as exc:
-            raise _recovery_error(coordinator, task_id, call_id, exc) from exc
+            raise _recovery_error(task_id, call_id, exc) from exc
         return _search_message(task_id, call_id, result)
 
     return StructuredTool.from_function(
@@ -70,7 +69,6 @@ def build_search_diagnostic_artifacts_tool(
 
 def build_read_diagnostic_artifact_tool(
     service: DiagnosticArtifactService,
-    coordinator: InvestigationCoordinator,
 ) -> BaseTool:
     def read_diagnostic_artifact(
         artifact_id: str,
@@ -98,7 +96,7 @@ def build_read_diagnostic_artifact_tool(
                 "read_diagnostic_artifact",
             )
         except DiagnosticArtifactSystemError as exc:
-            raise _recovery_error(coordinator, task_id, call_id, exc) from exc
+            raise _recovery_error(task_id, call_id, exc) from exc
         return _read_message(task_id, call_id, result)
 
     return StructuredTool.from_function(
@@ -251,15 +249,16 @@ def _error_message(
 
 
 def _recovery_error(
-    coordinator: InvestigationCoordinator,
     task_id: str,
     call_id: str,
     error: DiagnosticArtifactSystemError,
 ) -> InvestigationStateError:
     return InvestigationStateError(
-        coordinator.recovery(
-            task_id,
-            error.error_code,
+        InvestigationRecoveryMetadata(
+            task_id=task_id,
+            error_code=error.error_code,
+            state_version=0,
+            last_event_sequence=0,
             tool_call_id=call_id,
             checkpoint_available=True,
             recovery_action="pause_and_retry_diagnostic_artifact_read",

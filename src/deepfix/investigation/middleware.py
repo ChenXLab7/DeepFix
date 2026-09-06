@@ -3,31 +3,27 @@ from __future__ import annotations
 import hashlib
 import os
 from collections.abc import Awaitable, Callable, Mapping
-from html import escape
 from pathlib import Path
 from typing import Any
 
 from langchain.agents.middleware import (
     AgentMiddleware,
-    ModelRequest,
-    ModelResponse,
     ToolCallRequest,
 )
-from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.identity import (
     stable_generated_message_id,
 )
 from deepfix.compaction.models import ArtifactReference
 from deepfix.domain_repositories.execution import ExecutionRepository
 from deepfix.investigation.classification import is_pytest_verification
-from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.errors import InvestigationStateError
 from deepfix.investigation.identity import stable_investigation_id
 from deepfix.investigation.models import (
-    InvestigationCapability,
-    InvestigationState,
+    InvestigationRecoveryMetadata,
 )
 from deepfix.investigation.receipts import (
     ToolExecutionReceipt,
@@ -42,7 +38,7 @@ from deepfix.operations import (
     OperationStateSnapshot,
     OperationStatus,
 )
-from deepfix.prompting import model_request_task_id
+from deepfix.persistence import TaskRepository
 from deepfix.verification import classify_pytest_result
 from deepfix.workspace import WorkspacePathPolicy, compute_code_state_hash
 
@@ -58,29 +54,15 @@ _SIDE_EFFECT_KINDS = {
 class InvestigationMiddleware(AgentMiddleware):
     def __init__(
         self,
-        coordinator: InvestigationCoordinator,
+        tasks: TaskRepository,
         execution: ExecutionRepository,
         artifacts: ToolResultArtifactStorage,
-        capabilities: Mapping[str, InvestigationCapability],
+        evidence_collector: EvidenceCollector,
     ) -> None:
-        self.coordinator = coordinator
+        self.tasks = tasks
+        self.evidence_collector = evidence_collector
         self.execution = execution
         self.artifacts = artifacts
-        self.capabilities = dict(capabilities)
-
-    def wrap_model_call(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], ModelResponse],
-    ) -> ModelResponse:
-        return handler(self._model_request(request))
-
-    async def awrap_model_call(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
-    ) -> ModelResponse:
-        return await handler(self._model_request(request))
 
     def wrap_tool_call(
         self,
@@ -120,18 +102,6 @@ class InvestigationMiddleware(AgentMiddleware):
         else:
             result = receipt.tool_message
         return self._finish_tool(task_id, request, result, receipt, operation)
-
-    def _model_request(self, request: ModelRequest) -> ModelRequest:
-        task_id = model_request_task_id(request)
-        if not task_id:
-            return request
-        state = self.coordinator.state(task_id)
-        block = render_investigation_state(state)
-        original = request.system_message.text if request.system_message else ""
-        content = f"{original}\n\n{block}" if original else block
-        return request.override(
-            system_message=SystemMessage(content=content),
-        )
 
     def _prepare_tool(
         self,
@@ -196,64 +166,14 @@ class InvestigationMiddleware(AgentMiddleware):
                 "inspect_workspace_and_reconcile_operation_without_reexecution",
             )
 
-        experiment_allowed = _experiment_allowed_capabilities(request)
-        capability = self.capabilities.get(name)
-        if (
-            experiment_allowed is not None
-            and capability is not None
-            and capability not in experiment_allowed
-        ):
-            return (
-                task_id,
-                None,
-                ToolMessage(
-                    content=(
-                        f"Tool '{name}' is not allowed by this experiment; "
-                        "return this constraint to the Experiment Planner."
-                    ),
-                    name=name,
-                    tool_call_id=call_id,
-                    status="error",
-                ),
-                None,
-            )
-
         shell_correction = _windows_shell_correction(
             task_id,
             request,
-            self.coordinator.project_python(task_id),
+            self.tasks.get_definition(task_id).project_python,
         )
         if shell_correction is not None:
             return task_id, None, shell_correction, None
 
-        authorization = self.coordinator.authorize_tool(
-            task_id,
-            name,
-            _tool_arguments(request.tool_call),
-            tool_call_id=call_id,
-        )
-        if authorization.correction_required:
-            if authorization.correction_kind == "duplicate_execute":
-                return task_id, None, _duplicate_execute_message(task_id, call_id), None
-            if authorization.correction_kind == "duplicate_read":
-                return (
-                    task_id,
-                    None,
-                    _duplicate_read_message(task_id, call_id, name),
-                    None,
-                )
-            if authorization.correction_kind == "duplicate_hypothesis":
-                return (
-                    task_id,
-                    None,
-                    _duplicate_hypothesis_message(
-                        task_id,
-                        call_id,
-                        authorization.correction_ref_id or "unknown",
-                    ),
-                    None,
-                )
-            raise ValueError(f"Unknown investigation correction: {authorization.correction_kind}")
         if operation is None:
             operation = self._prepare_operation(task_id, request)
         return task_id, None, None, operation
@@ -287,7 +207,7 @@ class InvestigationMiddleware(AgentMiddleware):
             task_id,
             request,
             result,
-            self.coordinator.project_python(task_id),
+            self.tasks.get_definition(task_id).project_python,
         )
         artifact_references: list[ArtifactReference] = (
             self.execution.load_artifact_references(operation.operation_id)
@@ -344,7 +264,15 @@ class InvestigationMiddleware(AgentMiddleware):
                     "do_not_retry_tool_without_operation_reconciliation",
                     cause=exc,
                 ) from exc
-        self.coordinator.record_tool_result(task_id, request.tool_call, result)
+        try:
+            self.evidence_collector.collect_pair(
+                task_id, request.tool_call, result, self.tasks.get_definition(task_id)
+            )
+        except Exception as exc:
+            raise self._state_error(
+                task_id, "tool_evidence_commit_failed", call_id,
+                "retry_evidence_commit_from_receipt_without_reexecution", cause=exc,
+            ) from exc
         if operation is not None:
             self.execution.commit(operation.operation_id)
         return result
@@ -368,7 +296,7 @@ class InvestigationMiddleware(AgentMiddleware):
         if name not in _SIDE_EFFECT_KINDS:
             return None
         call_id = str(request.tool_call.get("id", "")).strip()
-        task = self.coordinator.tasks.get_definition(task_id)
+        task = self.tasks.get_definition(task_id)
         if not task.workspace_root or not task.workspace_baseline_id:
             raise self._state_error(
                 task_id,
@@ -411,7 +339,7 @@ class InvestigationMiddleware(AgentMiddleware):
             if isinstance(value, str):
                 content = value
         elif name == "edit_file" and pre_state.target_path:
-            task = self.coordinator.tasks.get_definition(task_id)
+            task = self.tasks.get_definition(task_id)
             target = Path(task.workspace_root) / pre_state.target_path
             old = arguments.get("old_string")
             new = arguments.get("new_string")
@@ -438,7 +366,7 @@ class InvestigationMiddleware(AgentMiddleware):
         *,
         result: ToolMessage | None = None,
     ) -> OperationStateSnapshot:
-        task = self.coordinator.tasks.get_definition(task_id)
+        task = self.tasks.get_definition(task_id)
         workspace = Path(task.workspace_root)
         name = str(request.tool_call.get("name", "")).strip()
         arguments = _tool_arguments(request.tool_call)
@@ -482,9 +410,11 @@ class InvestigationMiddleware(AgentMiddleware):
                 error_detail,
             )
         return InvestigationStateError(
-            self.coordinator.recovery(
-                task_id,
-                error_code,
+            InvestigationRecoveryMetadata(
+                task_id=task_id,
+                error_code=error_code,
+                state_version=0,
+                last_event_sequence=0,
                 tool_call_id=tool_call_id,
                 checkpoint_available=True,
                 recovery_action=recovery_action,
@@ -493,41 +423,6 @@ class InvestigationMiddleware(AgentMiddleware):
                 error_fingerprint=error_fingerprint,
             )
         )
-
-
-def render_investigation_state(
-    state: InvestigationState,
-) -> str:
-    lines = [
-        "<deepfix_investigation_state>",
-        f"<progress_generation>{state.progress_generation}</progress_generation>",
-        "<checked_paths>",
-    ]
-    lines.extend(f"<path>{escape(item.path[:500])}</path>" for item in state.checked_files[-8:])
-    lines.extend(("</checked_paths>", "<recent_tool_signatures>"))
-    lines.extend(
-        f"<signature>{escape(item[:160])}</signature>" for item in state.recent_tool_signatures[-8:]
-    )
-    lines.append("</recent_tool_signatures>")
-    lines.append("<current_hypotheses>")
-    lines.extend(
-        (
-            f'<hypothesis id="{escape(item.hypothesis_id, quote=True)}" '
-            f'state="{escape(item.state, quote=True)}">'
-            f"{escape(item.statement[:500])}</hypothesis>"
-        )
-        for item in state.hypotheses[-8:]
-    )
-    lines.append("</current_hypotheses>")
-    if state.reevaluation_required:
-        lines.append(
-            "<strategy_feedback>Recent actions did not resolve the evidence gap. "
-            "Review the results and choose a different targeted read, experiment, or patch. "
-            "A failed patch does not by itself refute its root-cause hypothesis."
-            "</strategy_feedback>"
-        )
-    lines.append("</deepfix_investigation_state>")
-    return "\n".join(lines)
 
 
 def _runtime_task_id(request: ToolCallRequest) -> str:
@@ -582,15 +477,6 @@ def _classify_pytest_infrastructure_result(
     )
 
 
-def _experiment_allowed_capabilities(
-    request: ToolCallRequest,
-) -> set[InvestigationCapability] | None:
-    raw = request.runtime.config.get("configurable", {}).get("allowed_capabilities")
-    if raw is None:
-        return None
-    return {InvestigationCapability(item) for item in raw}
-
-
 def _tool_arguments(tool_call: Mapping[str, Any]) -> Mapping[str, object]:
     value = tool_call.get("args", {})
     return value if isinstance(value, Mapping) else {}
@@ -633,87 +519,6 @@ def _diagnostic_artifact_redirect(
             "result_type": "diagnostic_artifact_redirect",
             "error_code": "use_diagnostic_artifact_tools",
             "operation": "read_file",
-        },
-    )
-
-
-def _duplicate_execute_message(task_id: str, call_id: str) -> ToolMessage:
-    return ToolMessage(
-        id=stable_generated_message_id(
-            task_id,
-            call_id,
-            "duplicate_execute_correction",
-        ),
-        content=(
-            "该 execute 命令已在当前进展代次执行，重复执行不会产生新证据。"
-            "请分析已有结果、更新假设，或改用能区分候选根因的定向命令。"
-        ),
-        tool_call_id=call_id,
-        name="execute",
-        status="error",
-        artifact={
-            "result_type": "duplicate_execute_correction",
-            "error_code": "duplicate_execute_in_progress_generation",
-        },
-    )
-
-
-def _duplicate_read_message(
-    task_id: str,
-    call_id: str,
-    tool_name: str,
-) -> ToolMessage:
-    next_action = (
-        'grep 默认只返回文件名；需要定位命中行时，请改用 output_mode="content"，'
-        "或选择已命中的生产文件继续 read_file。"
-        if tool_name == "grep"
-        else "若文件尚未读完，请根据上次结果中的剩余行提示增加 offset，读取下一个未检查区间。"
-    )
-    return ToolMessage(
-        id=stable_generated_message_id(
-            task_id,
-            call_id,
-            "duplicate_read_correction",
-        ),
-        content=(
-            "相同的只读工具调用已在当前进展代次完成，已有结果不会因原样重试而改变。"
-            f"{next_action}"
-            "请分析现有结果；若目标符号只存在于测试而不存在于生产代码，"
-            "应把‘功能尚未实现’作为候选根因，并读取相关入口或调用点。"
-            "否则请更改路径、范围或搜索目标以获得可区分的新证据。"
-        ),
-        tool_call_id=call_id,
-        name=tool_name,
-        status="error",
-        artifact={
-            "result_type": "duplicate_read_correction",
-            "error_code": "duplicate_read_in_progress_generation",
-        },
-    )
-
-
-def _duplicate_hypothesis_message(
-    task_id: str,
-    call_id: str,
-    hypothesis_id: str,
-) -> ToolMessage:
-    return ToolMessage(
-        id=stable_generated_message_id(
-            task_id,
-            call_id,
-            "duplicate_hypothesis_correction",
-        ),
-        content=(
-            f"相同 candidate 已存在：hypothesis_id={hypothesis_id}。"
-            "不要再次创建该假设；若需要验证它，请更新 Todo 并引用这个 hypothesis_id。"
-        ),
-        tool_call_id=call_id,
-        name="record_hypothesis",
-        status="error",
-        artifact={
-            "result_type": "duplicate_hypothesis_correction",
-            "error_code": "duplicate_hypothesis_candidate",
-            "hypothesis_id": hypothesis_id,
         },
     )
 

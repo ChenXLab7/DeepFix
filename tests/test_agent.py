@@ -30,29 +30,8 @@ from deepfix.extensions import (
     build_research_extensions,
 )
 from deepfix.investigation.models import InvestigationCapability
-from deepfix.navigation.middleware import TodoNavigationMiddleware
 from deepfix.prompting import PromptPolicyMiddleware
 from deepfix.task_domain.outcome import RepairOutcomeCandidate
-
-EXPECTED_TODO_SYSTEM_PROMPT = """## Bug-repair task navigation
-
-Use the native `write_todos` tool to keep a short plan for this bug-repair task.
-Create the plan before starting a multi-step investigation. Keep at most one item
-`in_progress`, mark it `completed` as soon as its work is actually done, and move the
-next item to `in_progress`. Re-check the plan when new evidence changes the strategy.
-
-Todo is navigation, not proof. A Todo status cannot establish a root cause, prove that
-a file changed, prove that a test passed, authorize a tool, or declare the task fixed.
-Use tool results and DeepFix's trusted evidence for those conclusions.
-"""
-
-EXPECTED_TODO_TOOL_DESCRIPTION = """Create or update a short Todo plan for this bug-repair task.
-
-Keep at most one item `in_progress`. If any item is unfinished, exactly one item must
-be `in_progress`; mark finished work `completed` promptly and advance the next item.
-
-Todo is navigation only. Todo content or status cannot prove a root cause, file change,
-test result, or repair outcome, and cannot authorize any tool."""
 
 
 @pytest.fixture
@@ -74,6 +53,7 @@ def agent(config):
 def test_agent_exposes_repair_tools_without_subagent_task_tool(agent):
     tools = agent.nodes["tools"].bound.tools_by_name
 
+    assert "record_hypothesis" not in tools
     assert "task" not in tools
     assert {
         "ls",
@@ -85,7 +65,6 @@ def test_agent_exposes_repair_tools_without_subagent_task_tool(agent):
         "grep",
         "execute",
         "compact_conversation",
-        "record_hypothesis",
         "search_diagnostic_artifacts",
         "read_diagnostic_artifact",
         "write_todos",
@@ -198,12 +177,9 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
     assert tool_names.count("search_technical_sources") == 1
     assert tool_names.count("fetch_external_evidence") == 1
     assert tool_names.count("link_external_evidence") == 1
-    assert middleware_names[:9] == [
+    assert middleware_names[:6] == [
         "MessageIdentityMiddleware",
         "TodoListMiddleware",
-        "TodoNavigationMiddleware",
-        "LegacyContextMigrationMiddleware",
-        "InvestigationMigrationMiddleware",
         "HumanInTheLoopMiddleware",
         "InvestigationMiddleware",
         "PromptPolicyMiddleware",
@@ -215,16 +191,8 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
         "ContextMemoryMiddleware",
         "ResearchEvidenceMiddleware",
     } & set(middleware_names)
-    identity, todo_list, todo_navigation, migration, _, approval, _, prompt, compaction = (
-        middleware[:9]
-    )
+    identity, _todo, approval, _, prompt, compaction = middleware[:6]
     assert isinstance(identity, MessageIdentityMiddleware)
-    assert isinstance(todo_list, TodoListMiddleware)
-    assert todo_list.system_prompt == EXPECTED_TODO_SYSTEM_PROMPT
-    assert isinstance(todo_navigation, TodoNavigationMiddleware)
-    assert todo_navigation.reminder_rounds == 3
-    assert type(todo_navigation.feedback_source).__name__ == ("RepositoryNavigationFeedbackSource")
-    assert type(migration).__name__ == "LegacyContextMigrationMiddleware"
     assert isinstance(approval, HumanInTheLoopMiddleware)
     assert isinstance(prompt, PromptPolicyMiddleware)
     assert isinstance(compaction, DeepFixCompactionMiddleware)
@@ -243,13 +211,6 @@ def test_agent_assembles_research_extensions_without_changing_core_guards(
         investigation_middleware.artifacts.root_dir
         == (config.artifacts_path / "investigation_receipts").resolve()
     )
-    assert investigation_middleware.capabilities["search_diagnostic_artifacts"] is (
-        InvestigationCapability.READ
-    )
-    assert investigation_middleware.capabilities["read_diagnostic_artifact"] is (
-        InvestigationCapability.READ
-    )
-    assert investigation_middleware.capabilities["write_todos"] is (InvestigationCapability.META)
     assert captured["subagents"] == []
     assert captured["skills"] == []
     assert captured["interrupt_on"] is None
@@ -287,7 +248,7 @@ def test_agent_investigation_middleware_uses_shared_execution_repository(
     assert middleware.execution is repositories.execution
 
 
-def test_agent_configures_write_todos_with_deepfix_navigation_contract(
+def test_agent_leaves_todo_management_to_deepagents(
     config,
     monkeypatch,
 ):
@@ -306,12 +267,8 @@ def test_agent_configures_write_todos_with_deepfix_navigation_contract(
         checkpointer=InMemorySaver(),
     )
 
-    todo_list = next(
-        item for item in captured["middleware"] if isinstance(item, TodoListMiddleware)
-    )
-    write_todos = next(tool for tool in todo_list.tools if tool.name == "write_todos")
-    assert todo_list.tool_description == EXPECTED_TODO_TOOL_DESCRIPTION
-    assert write_todos.description == EXPECTED_TODO_TOOL_DESCRIPTION
+    todo = next(item for item in captured["middleware"] if isinstance(item, TodoListMiddleware))
+    assert todo.system_prompt == TodoListMiddleware().system_prompt
 
 
 def test_experiment_builder_is_opt_in_and_legacy_builder_defaults_are_unchanged(

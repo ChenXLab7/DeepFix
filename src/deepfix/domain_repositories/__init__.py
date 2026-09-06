@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 from deepfix.database import SQLiteDatabase
@@ -36,9 +37,13 @@ class DomainRepositories:
     database: SQLiteDatabase
     tasks: TaskRepository
     evidence: EvidenceRepository
-    investigation: InvestigationRepository
     execution: ExecutionRepository
     history: HistoryRepository
+
+    @cached_property
+    def investigation(self) -> InvestigationRepository:
+        """Legacy/evaluation access; production does not initialize this store."""
+        return InvestigationRepository(self.database)
 
     @classmethod
     def create(
@@ -50,7 +55,6 @@ class DomainRepositories:
             database=resolved,
             tasks=TaskRepository(resolved),
             evidence=EvidenceRepository(resolved),
-            investigation=InvestigationRepository(resolved),
             execution=ExecutionRepository(resolved),
             history=HistoryRepository(resolved),
         )

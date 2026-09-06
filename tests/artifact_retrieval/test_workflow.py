@@ -20,13 +20,11 @@ from deepfix.artifact_retrieval.tools import (
 )
 from deepfix.backend import build_backend
 from deepfix.compaction.adapter import DeepAgentsArtifactAdapter
-from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.identity import ensure_message_ids
 from deepfix.compaction.models import DeepFixCompactionEvent
 from deepfix.config import ApprovalMode, load_config
 from deepfix.domain_repositories import DomainRepositories
 from deepfix.domain_repositories.history import history_record_from_snapshot
-from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.task_domain.models import TaskDefinition
 
 
@@ -131,22 +129,14 @@ def _environment(tmp_path, monkeypatch):
                 created_at="2026-08-29T00:00:00+00:00",
             )
         )
-    coordinator = InvestigationCoordinator(
-        store=repositories.investigation,
-        tasks=tasks,
-        evidence_repository=repositories.evidence,
-        evidence_collector=EvidenceCollector(repositories.evidence),
-    )
     service = DiagnosticArtifactService(
-        tasks,
-        ArtifactReferenceCollector(repositories.history, backend),
-        backend,
+        tasks, ArtifactReferenceCollector(repositories.history, backend), backend
     )
     return (
         backend,
         repositories.history,
-        build_search_diagnostic_artifacts_tool(service, coordinator),
-        build_read_diagnostic_artifact_tool(service, coordinator),
+        build_search_diagnostic_artifacts_tool(service),
+        build_read_diagnostic_artifact_tool(service),
     )
 
 

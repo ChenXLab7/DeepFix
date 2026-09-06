@@ -68,7 +68,6 @@ class BugfixService:
         self.policy = policy
         self.config = config
         self.repositories = repositories or DomainRepositories.create(repository.database)
-        self.investigation = investigation
         self.operation_reconciler = operation_reconciler
         self.workspace_factory = workspace_factory
         self.execution_backend = execution_backend
@@ -235,11 +234,6 @@ class BugfixService:
                 TaskLifecycleStatus.RUNNING,
                 expected_version=lifecycle.version,
             )
-        if resumed_from_pause and not self._record_lifecycle_authority(
-            task_id,
-            lambda: self.investigation.record_resumed(task_id, message_id),
-        ):
-            return self.get_runtime(task_id)
         return self._invoke_authorities(
             task_id,
             {"messages": [HumanMessage(id=message_id, content=content)]},
@@ -562,8 +556,7 @@ class BugfixService:
                 )
             return self._continue_investigation(
                 task_id,
-                "请重评估已有证据、未验证假设和可行调查路径。"
-                "如果需要用户介入，请提出具体问题，说明答案将改变哪个下一步。",
+                "任务尚未满足完成验证要求。",
             )
         if outcome.status == "continue":
             return self._continue_investigation(task_id, outcome.summary)
@@ -618,7 +611,7 @@ class BugfixService:
             if assessment.outcome == "continue":
                 return self._continue_investigation(
                     task_id,
-                    reason + "。请执行缺失验证或继续调查；只有明确缺少用户信息时才提问。",
+                    reason,
                 )
             return self._pause_authority(task_id, reason)
         lifecycle = self.repository.get_lifecycle(task_id)
@@ -651,14 +644,6 @@ class BugfixService:
                 reason=reason,
                 expected_version=lifecycle.version,
             )
-        if self.investigation is not None:
-            try:
-                self.investigation.record_paused(task_id, reason)
-            except InvestigationCoordinationError as exc:
-                if exc.recovery.task_id == task_id:
-                    self._record_investigation_recovery(
-                        self._sanitize_investigation_recovery(exc.recovery)
-                    )
         return self.get_runtime(task_id)
 
     def _fail_authority(self, task_id: str, reason: str) -> TaskRuntime:
@@ -670,24 +655,6 @@ class BugfixService:
             expected_version=lifecycle.version,
         )
         return self.get_runtime(task_id)
-
-    def _record_lifecycle_authority(self, task_id: str, operation) -> bool:
-        if self.investigation is None:
-            return True
-        try:
-            operation()
-            return True
-        except InvestigationCoordinationError as exc:
-            if exc.recovery.task_id != task_id:
-                self._fail_authority(task_id, "调查生命周期返回了其他任务的恢复信息")
-                return False
-            recovery = self._sanitize_investigation_recovery(exc.recovery)
-            self._record_investigation_recovery(recovery)
-            self._pause_authority(
-                task_id,
-                f"调查生命周期需要恢复：{recovery.error_code}",
-            )
-            return False
 
     def _graph_message_count(self, task_id: str) -> int:
         get_state = getattr(self.agent, "get_state", None)
@@ -764,10 +731,8 @@ class BugfixService:
         migrations = (
             ("evidence", self.domain_migrator.migrate_deterministic_evidence),
             ("research", self.domain_migrator.migrate_research),
-            ("investigation", self.domain_migrator.migrate_investigation),
             ("execution", self.domain_migrator.migrate_execution),
             ("history", self.domain_migrator.migrate_history),
-            ("working_memory", self.domain_migrator.migrate_working_memory),
         )
         for domain, migrate in migrations:
             try:

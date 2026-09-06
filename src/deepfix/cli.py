@@ -10,15 +10,12 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from deepfix.agent import build_agent
 from deepfix.approval import ApprovalPolicy
 from deepfix.backend import build_backend
-from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.config import ApprovalMode, load_config, state_database_path
 from deepfix.database import SQLiteDatabase
 from deepfix.domain_repositories import DomainRepositories
 from deepfix.domain_repositories.evidence import EvidenceRepository
 from deepfix.extensions import AgentExtensions, build_research_extensions
-from deepfix.investigation.coordinator import InvestigationCoordinator
 from deepfix.investigation.receipts import ToolResultArtifactStorage
-from deepfix.investigation.token_budget import TokenBudgetStore
 from deepfix.operations import OperationReconciler
 from deepfix.persistence import TaskRepository
 from deepfix.reporting import build_task_report_view, render_report
@@ -211,12 +208,6 @@ def main(
         )
 
     research_evidence_store = repositories.evidence
-    investigation = InvestigationCoordinator(
-        store=repositories.investigation,
-        tasks=repository,
-        evidence_repository=repositories.evidence,
-        evidence_collector=EvidenceCollector(repositories.evidence),
-    )
     artifact_backend = build_backend(config)
     result_artifacts = ToolResultArtifactStorage(
         config.artifacts_path / "investigation_receipts"
@@ -224,7 +215,6 @@ def main(
     workspace_factory = WorkspaceFactory(
         config.workspaces_path or config.database_path.parent / "workspaces"
     )
-    _token_budget_store = TokenBudgetStore(database=database)
     with build_research_client() as client:
         extensions = build_cli_research_extensions(
             config,
@@ -239,7 +229,6 @@ def main(
                 checkpointer,
                 task_repository=repository,
                 extensions=extensions,
-                investigation=investigation,
                 backend=artifact_backend,
                 repositories=repositories,
             )
@@ -248,7 +237,6 @@ def main(
                 repository,
                 ApprovalPolicy(config.approval_mode),
                 config,
-                investigation=investigation,
                 operation_reconciler=OperationReconciler(
                     repositories.execution,
                     result_artifacts,

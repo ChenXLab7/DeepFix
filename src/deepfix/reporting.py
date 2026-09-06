@@ -79,8 +79,6 @@ def build_task_report_view(
         definition=repositories.tasks.get_definition(task_id),
         lifecycle=repositories.tasks.get_lifecycle(task_id),
         decision=repositories.tasks.latest_adjudication(task_id),
-        hypotheses=repositories.investigation.list_hypotheses(task_id),
-        unresolved_questions=repositories.investigation.list_questions(task_id),
         evidence=evidence,
         operations=repositories.execution.list_operations(task_id),
         approvals=repositories.execution.list_approvals(task_id),

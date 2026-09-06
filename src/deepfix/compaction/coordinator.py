@@ -107,7 +107,7 @@ class CompactionCoordinator:
         snapshot_builder: CompactionSnapshotBuilder | Any,
         history_repository: HistoryRepository,
         evidence_repository: EvidenceRepository,
-        investigation_repository: InvestigationRepository,
+        investigation_repository: InvestigationRepository | None = None,
         budget_monitor: ContextBudgetMonitor | None = None,
         protected_builder: ProtectedContextBuilder | None = None,
         model: BaseChatModel | None = None,
@@ -133,7 +133,6 @@ class CompactionCoordinator:
             task_id,
             version,
             evidence=self.evidence_repository,
-            investigation=self.investigation_repository,
         )
 
     def active_snapshot_from_event(
