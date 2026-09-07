@@ -50,13 +50,33 @@ from deepfix.protected_context import (
 from deepfix.task_domain.outcome import RepairOutcomeCandidate
 
 
-def _build_deepseek_model(role: ModelRoleConfig) -> ChatDeepSeek:
+class _ThinkingDeepSeek(ChatDeepSeek):
+    """Preserve DeepSeek reasoning across tool turns with the installed SDK."""
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        messages = self._convert_input(input_).to_messages()
+        for original, serialized in zip(messages, payload["messages"], strict=True):
+            if serialized["role"] == "assistant":
+                serialized["reasoning_content"] = original.additional_kwargs.get(
+                    "reasoning_content", ""
+                )
+        # LangChain's structured-output tools force a choice, which thinking
+        # endpoints reject. Keep the schema tools available for auto selection.
+        choice = payload.get("tool_choice")
+        if isinstance(choice, dict) or choice in {"any", "required"}:
+            payload["tool_choice"] = "auto"
+        return payload
+
+
+def _build_deepseek_model(role: ModelRoleConfig, *, thinking: bool = False) -> ChatDeepSeek:
     profile = (
         {"max_input_tokens": 1_000_000}
         if role.model_name in {"deepseek-v4-flash", "deepseek-v4-pro"}
         else None
     )
-    return ChatDeepSeek(
+    model_class = _ThinkingDeepSeek if thinking else ChatDeepSeek
+    return model_class(
         model=role.model_name,
         api_key=role.api_key,
         base_url=role.base_url,
@@ -64,12 +84,12 @@ def _build_deepseek_model(role: ModelRoleConfig) -> ChatDeepSeek:
         timeout=role.request_timeout_seconds,
         max_retries=0,
         profile=profile,
-        extra_body={"thinking": {"type": "disabled"}},
+        extra_body={"thinking": {"type": "enabled" if thinking else "disabled"}},
     )
 
 
 def build_main_model(config: AppConfig) -> ChatDeepSeek:
-    return _build_deepseek_model(config.main_model)
+    return _build_deepseek_model(config.main_model, thinking=True)
 
 
 def build_compaction_model(config: AppConfig) -> ChatDeepSeek:

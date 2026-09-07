@@ -112,13 +112,27 @@ def test_role_models_use_independent_names_keys_and_shared_base_url(config):
     assert compaction.max_retries == 0
 
 
-def test_both_role_models_disable_thinking_for_tool_choice_compatibility(config):
+def test_main_model_enables_thinking_and_compaction_keeps_existing_mode(config):
     main = build_main_model(config)
     compaction = build_compaction_model(config)
 
-    expected = {"thinking": {"type": "disabled"}}
-    assert main.extra_body == expected
-    assert compaction.extra_body == expected
+    assert main.extra_body == {"thinking": {"type": "enabled"}}
+    assert compaction.extra_body == {"thinking": {"type": "disabled"}}
+
+
+def test_thinking_request_preserves_reasoning_and_uses_auto_tool_choice(config):
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    main = build_main_model(config)
+    messages = [
+        HumanMessage(content="inspect"),
+        AIMessage(content="", additional_kwargs={"reasoning_content": "Inspect the file."},
+                  tool_calls=[{"id": "read-1", "name": "read_file", "args": {}}]),
+        ToolMessage(content="source", tool_call_id="read-1"),
+    ]
+    payload = main._get_request_payload(messages, tool_choice="required")
+    assert payload["messages"][1]["reasoning_content"] == "Inspect the file."
+    assert payload["tool_choice"] == "auto"
 
 
 def _extension_tool(name):
