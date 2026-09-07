@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import os
 import re
@@ -72,16 +73,18 @@ class WorkspaceCommandPolicy:
     def evaluate(self, command: str) -> CommandDecision:
         if not isinstance(command, str) or not command.strip():
             return self._deny("command must be a non-empty string")
-        if _SHELL_OPERATORS.search(command):
-            return self._deny("compound shell commands are not allowed")
-        if _SHELL_EXPANSION.search(command):
-            return self._deny("shell variable expansion is not allowed")
         try:
             tokens = _command_tokens(command)
         except ValueError:
             return self._deny("command quoting is invalid")
         if not tokens:
             return self._deny("command must be a non-empty string")
+        # -c expressions are validated below and executed as argv, without a shell.
+        expression = len(tokens) == 3 and tokens[1] == "-c"
+        if not expression and _SHELL_OPERATORS.search(command):
+            return self._deny("compound shell commands are not allowed")
+        if _SHELL_EXPANSION.search(command) or "$" in command or "`" in command:
+            return self._deny("shell variable expansion is not allowed")
 
         if Path(tokens[0]).is_absolute() or "/" in tokens[0] or "\\" in tokens[0]:
             # Compare invocation paths, not resolved targets or basenames. Two
@@ -115,6 +118,10 @@ class WorkspaceCommandPolicy:
 
     def _evaluate_python(self, tokens: list[str]) -> CommandDecision:
         lowered = [token.lower() for token in tokens]
+        if len(tokens) == 3 and tokens[1] == "-c":
+            if _is_pure_python_expression(tokens[2]):
+                return self._allow("pure Python diagnostic expression", requires_approval=False)
+            return self._deny("Python expression may access files, processes or external state")
         if lowered[1:3] == ["-m", "pip"]:
             return self._deny("package installation is not allowed")
         if lowered[1:3] != ["-m", "pytest"]:
@@ -275,7 +282,40 @@ def task_scoped_environment(
 
 def _command_tokens(command: str) -> list[str]:
     normalized = command.replace("\\", "/")
-    return [token.strip('"\'') for token in shlex.split(normalized, posix=True)]
+    return shlex.split(normalized, posix=True)
+
+
+def _is_pure_python_expression(code: str) -> bool:
+    # A deliberately small subset, not a sandbox for arbitrary project code.
+    # Project tests retain their existing approved execution path.
+    if len(code) > 4096:
+        return False
+    allowed = (
+        ast.Module, ast.Expr, ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict,
+        ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.Load,
+        ast.Add, ast.Sub, ast.Div, ast.FloorDiv,
+        ast.UAdd, ast.USub, ast.Not, ast.And, ast.Or, ast.Eq, ast.NotEq,
+        ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.In, ast.NotIn,
+        ast.Call, ast.Name,
+    )
+    builtins = {"print", "abs", "len", "min", "max", "sum", "sorted", "int", "float", "bool"}
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    nodes = list(ast.walk(tree))
+    if len(nodes) > 512:
+        return False
+    for node in nodes:
+        if not isinstance(node, allowed):
+            return False
+        if isinstance(node, ast.Name) and node.id not in builtins:
+            return False
+        if isinstance(node, ast.Call) and (
+            not isinstance(node.func, ast.Name) or node.func.id not in builtins
+        ):
+            return False
+    return bool(tree.body)
 
 
 def _path_argument(token: str) -> str | None:

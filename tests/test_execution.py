@@ -67,6 +67,36 @@ def test_guarded_policy_allows_read_only_repository_diagnostic(workspace) -> Non
     assert decision.requires_approval is False
 
 
+def test_simple_python_expression_runs_without_approval(workspace):
+    runner = WorkspaceCommandRunner(workspace, WorkspaceCommandPolicy(workspace))
+    result = runner.execute('python -c "print(sum([1, 2, 3]))"',
+                            timeout=30, approval_grant=None)
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "6"
+
+
+@pytest.mark.parametrize("code", [
+    "open('/etc/passwd').read()", "__import__('os').system('whoami')",
+    "import socket", "print((1).__class__)", "eval('1')",
+])
+def test_python_expression_does_not_grant_io_or_dynamic_execution(workspace, code):
+    assert not WorkspaceCommandPolicy(workspace).evaluate(f'python -c "{code}"').allowed
+
+
+def test_pure_expression_does_not_load_workspace_startup_code(workspace):
+    (workspace.root / "sitecustomize.py").write_text(
+        "from pathlib import Path; Path('startup-marker').touch()\n", encoding="utf-8")
+    runner = WorkspaceCommandRunner(workspace, WorkspaceCommandPolicy(workspace))
+    result = runner.execute('python -c "print(1)"', timeout=30, approval_grant=None)
+    assert result.exit_code == 0
+    assert not (workspace.root / "startup-marker").exists()
+
+
+@pytest.mark.parametrize("code", ["print(10**1000000000)", "print('x' * 10000000000)"])
+def test_resource_amplifying_expression_is_not_approval_free(workspace, code):
+    assert not WorkspaceCommandPolicy(workspace).evaluate(f'python -c "{code}"').allowed
+
+
 def test_runner_denies_scoped_pytest_without_matching_approval(workspace) -> None:
     command = "python -m pytest tests/test_value.py -q"
     runner = WorkspaceCommandRunner(

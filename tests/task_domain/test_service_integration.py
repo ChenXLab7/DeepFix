@@ -102,6 +102,25 @@ def no_response() -> dict[str, list]:
     return {"messages": []}
 
 
+@pytest.mark.parametrize("mode, expected", [
+    (ApprovalMode.GUARDED, "allow"), (ApprovalMode.MANUAL, "ask"),
+])
+def test_configured_python_uses_routine_approval_after_workspace_preflight(config, mode, expected):
+    config = replace(config, approval_mode=mode)
+    service = service_for(config, FakeAgent(no_response()), workspace=True)
+    task = service.start("修复问题")
+    definition = service.repository.get_definition(task.task_id)
+    for arguments, action in [("-m pytest -q", expected),
+                              ("-m pytest ../outside.py", "deny"),
+                              ('-c "print(1)"', "allow"),
+                              ('-c "open(123)"', "deny")]:
+        result = service._normalize_actions([{
+            "action_requests": [{"name": "execute", "args": {
+                "command": f'"{definition.project_python}" {arguments}'}}]
+        }], task_id=task.task_id)
+        assert result[0]["policy_action"] == action
+
+
 def _not_ready_report(task_id: str) -> DomainMigrationReport:
     return DomainMigrationReport(
         domain="evidence",

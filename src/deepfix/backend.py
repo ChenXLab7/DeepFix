@@ -94,9 +94,16 @@ class GuardedLocalShellBackend(LocalShellBackend):
         effective_timeout = hard_limit if timeout is None else min(timeout, hard_limit)
         process: subprocess.Popen[str] | None = None
         try:
+            from deepfix.execution import _command_tokens
+
+            tokens = _command_tokens(command)
+            direct_expression = len(tokens) == 3 and tokens[1] == "-c"
+            if direct_expression:
+                # Do not execute workspace/site startup code before a pure diagnostic.
+                tokens[1:1] = ["-I", "-S"]
             process = subprocess.Popen(
-                command,
-                shell=True,
+                tokens if direct_expression else command,
+                shell=not direct_expression,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 from langchain_core.messages import ToolMessage
 
@@ -13,9 +15,80 @@ from deepfix.verification import (
     VerificationPolicyBuilder,
     VerificationPolicyConflict,
     evaluate_required_oracles,
+    extract_user_pytest_commands,
+    normalize_verification_command,
     pytest_target_paths,
     unavailable_required_oracle_paths,
 )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows command line semantics")
+def test_windows_target_backslashes_are_not_shell_escapes():
+    assert normalize_verification_command(r'python -m pytest tests\test_a.py') != normalize_verification_command('python -m pytest teststest_a.py')
+    assert pytest_target_paths(r'python -m pytest tests\test_a.py') == ['tests/test_a.py']
+
+
+def test_wrapper_command_preserves_interpreter_and_quoted_selector():
+    command = '/home/python-venv-wrapper -m pytest -k "CaseA or CaseB" tests/test_value.py'
+    import shlex
+
+    extracted = extract_user_pytest_commands(f"使用 {command} 验证。")
+    assert len(extracted) == 1
+    assert shlex.split(extracted[0]) == shlex.split(command)
+
+
+def test_wrapper_evidence_matches_required_oracle(tmp_path, task_workspace, task):
+    command = '/home/python-venv-wrapper -m pytest tests/test_value.py -q'
+    task = task.model_copy(update={"original_problem": f"使用 {command} 验证",
+                                   "project_python": "/home/python-venv-wrapper"})
+    policy = VerificationPolicyBuilder().build(task, task_workspace)
+    (task_workspace.root / "value.py").write_text("VALUE = 2\n", encoding="utf-8")
+    collector = EvidenceCollector(EvidenceRepository(tmp_path / "wrapper.db"))
+    result = ToolMessage(content="1 passed", id="wrapper-result", name="execute",
+                         tool_call_id="wrapper-call", artifact={"exit_code": 0})
+    evidence = collector.collect_pair(task.task_id, {
+        "name": "execute", "args": {"command": command}, "id": "wrapper-call",
+        "type": "tool_call",
+    }, result, task)
+    assert evidence.origin == "user_specified"
+    assert evaluate_required_oracles(policy, [evidence],
+        current_code_state_hash=evidence.code_state_hash,
+        workspace_baseline_id=task.workspace_baseline_id).fixed_allowed
+
+
+def test_whole_test_file_failure_blocks_passing_node(task_workspace, task):
+    from deepfix.verification import classify_pytest_scope
+
+    command = '/home/python-venv-wrapper -m pytest tests/test_value.py::test_value -q'
+    task = task.model_copy(update={"original_problem": f"使用 {command} 验证"})
+    policy = VerificationPolicyBuilder().build(task, task_workspace)
+    passed = _test_evidence(command, origin="user_specified", scope="targeted",
+                            exit_code=0, evidence_id="target")
+    module = '/home/python-venv-wrapper -m pytest tests/test_value.py -q'
+    failed = _test_evidence(module, origin="repository_existing",
+        scope=classify_pytest_scope(module), exit_code=1, evidence_id="module")
+    result = evaluate_required_oracles(policy, [passed, failed])
+    assert result.all_required_satisfied
+    assert not result.fixed_allowed
+    assert result.conflicting_evidence_ids == ["module"]
+
+
+@pytest.mark.parametrize("changed", [
+    '/home/other-wrapper -m pytest -k "CaseA or CaseB" tests/test_value.py',
+    '/home/python-venv-wrapper -m pytest -k "casea or caseb" tests/test_value.py',
+    '/home/python-venv-wrapper -m pytest -k CaseA or CaseB tests/test_value.py',
+])
+def test_oracle_does_not_conflate_interpreter_or_argument_semantics(task_workspace, task, changed):
+    command = '/home/python-venv-wrapper -m pytest -k "CaseA or CaseB" tests/test_value.py'
+    task = task.model_copy(update={"original_problem": f"使用 {command} 验证"})
+    policy = VerificationPolicyBuilder().build(task, task_workspace)
+    # Require the full invocation, even when auditing an already stored policy.
+    policy = policy.model_copy(update={"required_oracles": [
+        policy.required_oracles[0].model_copy(update={"command": command})
+    ]})
+    evidence = _test_evidence(changed, origin="user_specified", scope="targeted",
+                              exit_code=0, evidence_id="changed")
+    assert not evaluate_required_oracles(policy, [evidence]).fixed_allowed
 from deepfix.workspace import WorkspaceFactory
 
 
@@ -50,12 +123,12 @@ def task(task_workspace):
     )
 
 
-def test_existing_user_test_is_required_targeted_oracle(task_workspace, task):
+def test_existing_user_test_file_is_required_module_oracle(task_workspace, task):
     policy = VerificationPolicyBuilder().build(task, task_workspace)
 
     oracle = policy.required_oracles[0]
     assert oracle.origin == "user_specified"
-    assert oracle.scope == "targeted"
+    assert oracle.scope == "module"
     assert oracle.command == "python -m pytest tests/test_value.py -q"
 
 

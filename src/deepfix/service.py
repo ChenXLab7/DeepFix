@@ -11,7 +11,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 
-from deepfix.approval import ApprovalPolicy, PolicyAction
+from deepfix.approval import ApprovalPolicy, PolicyAction, PolicyDecision, RiskLevel
 from deepfix.compaction.errors import ContextCoordinationError
 from deepfix.compaction.evidence import EvidenceCollector
 from deepfix.compaction.identity import (
@@ -713,6 +713,14 @@ class BugfixService:
                         if not executable.allowed:
                             action = PolicyAction.DENY.value
                             reason = executable.reason
+                        elif decision.action is not PolicyAction.DENY:
+                            decision = (
+                                self.policy._routine_decision(executable.reason)
+                                if executable.requires_approval else
+                                PolicyDecision(RiskLevel.L0, PolicyAction.ALLOW, executable.reason)
+                            )
+                            action = decision.action.value
+                            reason = decision.reason
                 normalized.append(
                     {
                         "name": name,

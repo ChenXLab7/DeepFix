@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
+import subprocess
 from pathlib import Path
 from typing import Literal
 
@@ -13,7 +15,8 @@ from deepfix.compaction.models import StrictModel, SystemTestEvidence
 from deepfix.workspace import TaskWorkspace
 
 _PYTEST_COMMAND = re.compile(
-    r"(?i)(?:python(?:\.exe)?\s+-m\s+pytest|pytest)(?:\s+[^\r\n，。；;]+)?"
+    r'''(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s`"'，。；;]+)\s+-m\s+pytest\b'''
+    r"(?:\s+[^\r\n`，。；;]+)?|(?<![\w/.-])pytest\b(?:\s+[^\r\n`，。；;]+)?"
 )
 _PYTEST_OPTIONS_WITH_VALUE = frozenset(
     {
@@ -254,7 +257,7 @@ def extract_user_pytest_commands(problem: str) -> list[str]:
 
 def _clean_pytest_command(candidate: str) -> str:
     try:
-        tokens = shlex.split(candidate.replace("\\", "/"), posix=True)
+        tokens = _verification_tokens(candidate)
     except ValueError:
         return candidate.strip().rstrip(".。")
     retained: list[str] = []
@@ -262,16 +265,21 @@ def _clean_pytest_command(candidate: str) -> str:
         if any("\u4e00" <= character <= "\u9fff" for character in token):
             break
         retained.append(token)
-    return " ".join(retained).strip().rstrip(".。")
+    rendered = subprocess.list2cmdline(retained) if os.name == "nt" else shlex.join(retained)
+    return rendered.strip().rstrip(".。")
 
 
 def classify_pytest_scope(command: str) -> Literal["targeted", "module", "full_suite"]:
+    tokens = _tokens_after_pytest(command)
+    if any(token.startswith(("-k", "-m")) for token in tokens):
+        return "targeted"
+    positional = _pytest_positional_tokens(command)
+    if positional and all("::" in token for token in positional):
+        return "targeted"
     targets = pytest_target_paths(command)
     if not targets:
         return "full_suite"
-    if any("::" in token for token in _tokens_after_pytest(command)):
-        return "targeted"
-    return "targeted" if len(targets) == 1 else "module"
+    return "module"
 
 
 def pytest_target_paths(command: str) -> list[str]:
@@ -314,7 +322,7 @@ def _oracle(
 
 def _tokens_after_pytest(command: str) -> list[str]:
     try:
-        tokens = shlex.split(command.replace("\\", "/"), posix=True)
+        tokens = _verification_tokens(command)
     except ValueError:
         return []
     lowered = [item.lower() for item in tokens]
@@ -355,7 +363,38 @@ def _normalize_pytest_target(token: str) -> str:
 
 
 def _normalize_command(command: str) -> str:
-    return " ".join(command.strip().replace("\\", "/").split()).lower()
+    return normalize_verification_command(command)
+
+
+def _verification_tokens(command: str) -> list[str]:
+    if os.name == "nt":
+        # Use native argv rules: backslashes in paths are not POSIX escapes,
+        # and single quotes do not group Windows command-line arguments.
+        import ctypes
+
+        split = ctypes.windll.shell32.CommandLineToArgvW
+        split.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+        split.restype = ctypes.POINTER(ctypes.c_wchar_p)
+        free = ctypes.windll.kernel32.LocalFree
+        free.argtypes = [ctypes.c_void_p]
+        free.restype = ctypes.c_void_p
+        count = ctypes.c_int()
+        argv = split(command.strip(), ctypes.byref(count))
+        if not argv:
+            raise ValueError("invalid Windows command line")
+        try:
+            return list(argv[:count.value])
+        finally:
+            free(argv)
+    return shlex.split(command, posix=True)
+
+
+def normalize_verification_command(command: str) -> str:
+    """Keep interpreter identity, argument boundaries and case-sensitive values."""
+    try:
+        return json.dumps(_verification_tokens(command), ensure_ascii=False)
+    except ValueError:
+        return command.strip()
 
 
 def _timing_satisfies(

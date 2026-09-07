@@ -25,6 +25,7 @@ from deepfix.domain_repositories.evidence import (
 from deepfix.verification import (
     classify_pytest_scope,
     extract_user_pytest_commands,
+    normalize_verification_command,
     pytest_target_paths,
 )
 from deepfix.workspace import WorkspaceBaseline, compute_code_state_hash
@@ -303,7 +304,7 @@ def _workspace_baseline(root: Path) -> WorkspaceBaseline | None:
 
 
 def _normalize_command(command: str) -> str:
-    return " ".join(command.strip().replace("\\", "/").split()).lower()
+    return normalize_verification_command(command)
 
 
 def _file_evidence(

@@ -41,7 +41,7 @@ def test_task_workspace_backend_is_confined_and_uses_workspace_root(
     workspace = WorkspaceFactory(tmp_path / "workspaces").create("task-a", project)
 
     backend = build_backend(config, workspace)
-    denied = backend.execute('python -c "print(1)"')
+    denied = backend.execute('python -c "open(123)"')
 
     assert backend.default.cwd == workspace.root
     assert denied.exit_code == 126
