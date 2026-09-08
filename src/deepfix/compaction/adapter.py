@@ -9,7 +9,7 @@ from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime
 from typing import Any
 
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AnyMessage, messages_from_dict, messages_to_dict
 from langchain_core.messages.utils import get_buffer_string
 
 from deepfix.compaction.errors import ArtifactPersistenceError
@@ -100,6 +100,22 @@ class DeepAgentsArtifactAdapter:
             return response.content.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError(f"artifact 不是 UTF-8: {path}") from exc
+
+    def restore_history(self, path: str, attempt_id: str) -> list[AnyMessage]:
+        text = self.read_verified(path)
+        attempt = re.escape(html.escape(attempt_id, quote=True))
+        event = re.search(
+            rf'<deepfix_history_event attempt_id="{attempt}"[^>]*>(.*?)</deepfix_history_event>',
+            text, re.DOTALL,
+        )
+        record = re.search(r'<message_objects sha256="([a-f0-9]+)">(.*?)</message_objects>',
+                           event.group(1) if event else "", re.DOTALL)
+        if record is None:
+            raise ValueError("history has no restorable message objects")
+        payload = html.unescape(record.group(2))
+        if _sha256(payload) != record.group(1):
+            raise ValueError("history message objects hash mismatch")
+        return messages_from_dict(json.loads(payload))
 
     def _download(self, path: str, prepared: _PreparedHistory) -> str | None:
         try:
@@ -201,6 +217,7 @@ def _prepare(
             f'content_hash="{_message_hash(message)}" />'
         )
     serialized = get_buffer_string(messages, format="xml") if messages else ""
+    objects = json.dumps(messages_to_dict(list(messages)), ensure_ascii=False, sort_keys=True)
     body = "\n".join(
         [
             "<message_manifest>",
@@ -209,6 +226,7 @@ def _prepare(
             "<serialized_messages>",
             serialized,
             "</serialized_messages>",
+            f'<message_objects sha256="{_sha256(objects)}">{html.escape(objects)}</message_objects>',
         ]
     )
     input_hash = _sha256(body)

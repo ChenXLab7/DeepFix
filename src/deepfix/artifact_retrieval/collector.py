@@ -142,11 +142,17 @@ class ArtifactReferenceCollector:
                 if item.kind is DiagnosticArtifactKind.CONVERSATION_HISTORY
             }
         )
+        # View-only snipping has no snapshot or checkpoint event to point here.
+        # Only probe the canonical path for this validated task, never model-supplied paths.
+        canonical = f"{_HISTORY_ROOT}{task_id}.md"
+        if re.fullmatch(r"[A-Za-z0-9_-]+", task_id) and canonical not in history_paths:
+            history_paths.append(canonical)
         expanded: list[DiagnosticArtifactDescriptor] = []
         for history_path in history_paths:
             content = self._download_history(history_path)
             if content is None:
                 continue
+            expanded.append(_descriptor(task_id, DiagnosticArtifactKind.CONVERSATION_HISTORY, history_path))
             for tool_call_id, backend_path in _history_large_result_pairs(content):
                 expanded.append(
                     _descriptor(

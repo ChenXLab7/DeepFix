@@ -3,7 +3,13 @@ from types import SimpleNamespace
 from deepagents.backends import FilesystemBackend
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import ExecutionInfo, Runtime
 
@@ -116,6 +122,108 @@ class _Coordinator:
         return handler(request.messages)
 
 
+def _long_tool_history(count=12, size=12000):
+    messages = [HumanMessage(id="start", content="fix; never change tests")]
+    for i in range(count):
+        messages.extend([AIMessage(id=f"ai-{i}", content="", tool_calls=[{
+            "id": f"call-{i}", "name": "read_file", "args": {"file_path": "a.py"},
+            "type": "tool_call"}]), ToolMessage(id=f"tool-{i}", tool_call_id=f"call-{i}",
+                content=f"unique-{i}:" + "x" * size, artifact={"exit_code": 0})])
+    messages.append(HumanMessage(id="latest", content="new direction and constraints"))
+    return messages
+
+
+def test_snip_is_view_only_restorable_and_skips_semantic_model(tmp_path):
+    from deepfix.compaction.budget import ContextBudgetMonitor
+    coordinator = _Coordinator(tmp_path / "state.db")
+    coordinator.adapter = DeepAgentsArtifactAdapter(FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True))
+    middleware = DeepFixCompactionMiddleware(_ProtectedBuilder("latest"), ContextBudgetMonitor(output_reserve_tokens=0), coordinator)
+    messages = _long_tool_history(size=20000)
+    original = [m.model_dump() for m in messages]
+    request = _request(messages).override(model=FakeListChatModel(responses=["ok"], profile={"max_input_tokens": 75000}))
+    seen = []
+    middleware.wrap_model_call(request, lambda r: seen.append(r) or ModelResponse(result=[AIMessage(content="ok")]))
+    assert not coordinator.requests
+    assert [m.model_dump() for m in request.state["messages"]] == original
+    assert len(str(seen[0].messages[2].content)) < 4000
+    assert seen[0].messages[-2].content == messages[-2].content
+    assert seen[0].messages[-1].content == messages[-1].content
+    assert [m.id for m in seen[0].messages] == [m.id for m in messages]
+    body = coordinator.adapter.read_verified("/.deepfix-artifacts/conversation_history/task-a.md")
+    assert "unique-0:" in body
+    # A fresh middleware after Resume reconstructs the same view without checkpoint edits.
+    resumed = DeepFixCompactionMiddleware(_ProtectedBuilder("latest"), ContextBudgetMonitor(output_reserve_tokens=0), coordinator)
+    resumed.wrap_model_call(request, lambda r: seen.append(r) or ModelResponse(result=[AIMessage(content="ok")]))
+    assert [m.model_dump() for m in seen[0].messages] == [m.model_dump() for m in seen[1].messages]
+    assert coordinator.adapter.read_verified("/.deepfix-artifacts/conversation_history/task-a.md") == body
+
+
+def test_message_count_snip_keeps_whole_pairs_and_users(tmp_path):
+    from deepfix.compaction.budget import ContextBudgetMonitor
+    coordinator = _Coordinator(tmp_path / "state.db")
+    coordinator.adapter = DeepAgentsArtifactAdapter(FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True))
+    middleware = DeepFixCompactionMiddleware(_ProtectedBuilder("latest"), ContextBudgetMonitor(output_reserve_tokens=0), coordinator)
+    messages = _long_tool_history(count=110, size=10)
+    request = _request(messages).override(model=FakeListChatModel(responses=["ok"], profile={"max_input_tokens": 1000000}))
+    seen = []
+    middleware.wrap_model_call(request, lambda r: seen.extend(r.messages) or ModelResponse(result=[AIMessage(content="ok")]))
+    assert len(seen) < 100
+    assert len(request.state["messages"]) == 222
+    assert {m.id for m in seen if isinstance(m, HumanMessage)} == {"start", "latest"}
+    calls = {c["id"] for m in seen if isinstance(m, AIMessage) for c in m.tool_calls}
+    assert calls == {m.tool_call_id for m in seen if isinstance(m, ToolMessage)}
+    assert not coordinator.requests
+
+
+def test_snip_view_survives_sqlite_checkpoint_reopen(tmp_path):
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    from langgraph.graph import END, START, MessagesState, StateGraph
+
+    from deepfix.compaction.budget import ContextBudgetMonitor
+
+    messages = _long_tool_history(count=110, size=10)
+    seen = []
+    def graph_for(saver):
+        coordinator = _Coordinator(tmp_path / "domain.db")
+        coordinator.adapter = DeepAgentsArtifactAdapter(FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True))
+        middleware = DeepFixCompactionMiddleware(_ProtectedBuilder("latest"), ContextBudgetMonitor(output_reserve_tokens=0), coordinator)
+        def node(state):
+            request = _request(state["messages"]).override(model=FakeListChatModel(responses=["ok"], profile={"max_input_tokens": 1000000}))
+            middleware.wrap_model_call(request, lambda r: seen.append(r.messages) or ModelResponse(result=[AIMessage(content="ok")]))
+            return {}
+        builder = StateGraph(MessagesState)
+        builder.add_node("model", node)
+        builder.add_edge(START, "model")
+        builder.add_edge("model", END)
+        return builder.compile(checkpointer=saver)
+    config = {"configurable": {"thread_id": "task-a"}}
+    with SqliteSaver.from_conn_string(str(tmp_path / "checkpoint.db")) as saver:
+        graph_for(saver).invoke({"messages": messages}, config)
+    with SqliteSaver.from_conn_string(str(tmp_path / "checkpoint.db")) as saver:
+        graph = graph_for(saver)
+        assert [m.model_dump() for m in graph.get_state(config).values["messages"]] == [m.model_dump() for m in messages]
+        graph.invoke({"messages": [HumanMessage(id="followup", content="additional user constraint")]}, config)
+        assert len(graph.get_state(config).values["messages"]) == 223
+    assert len(seen[0]) < 100 and len(seen[1]) < 100
+    assert seen[1][-1].content == "additional user constraint"
+
+
+def test_snip_archive_failure_keeps_original_view(tmp_path):
+    from deepagents.backends.protocol import WriteResult
+
+    from deepfix.compaction.budget import ContextBudgetMonitor
+    coordinator = _Coordinator(tmp_path / "state.db")
+    backend = FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True)
+    backend.write = lambda *args: WriteResult(error="storage unavailable")
+    coordinator.adapter = DeepAgentsArtifactAdapter(backend)
+    middleware = DeepFixCompactionMiddleware(_ProtectedBuilder("latest"), ContextBudgetMonitor(output_reserve_tokens=0), coordinator)
+    messages = _long_tool_history(size=20000)
+    request = _request(messages).override(model=FakeListChatModel(responses=["ok"], profile={"max_input_tokens": 75000}))
+    seen = []
+    middleware.wrap_model_call(request, lambda r: seen.extend(r.messages) or ModelResponse(result=[AIMessage(content="ok")]))
+    assert [m.model_dump() for m in seen] == [m.model_dump() for m in messages]
+
+
 def test_identity_middleware_replaces_messages_once_without_content_change():
     middleware = MessageIdentityMiddleware()
     messages = [HumanMessage(content="question"), AIMessage(content="answer")]
@@ -188,7 +296,7 @@ def test_protected_blocks_are_request_local_and_not_added_to_messages(tmp_path):
 
 
 class _EmptyDelta:
-    def generate(self, model, units):
+    def generate(self, model, units, messages=()):
         return CompactionDelta(
             user_constraint_candidates=[],
             confirmed_fact_candidates=[],
@@ -214,7 +322,7 @@ def test_committed_event_reconstructs_effective_view_without_deleting_checkpoint
         investigation_repository=repositories.investigation,
     )
     messages = [
-        HumanMessage(id="m1", content="old question"),
+        AIMessage(id="m1", content="old tool analysis " * 100),
         AIMessage(id="m2", content="old answer"),
         HumanMessage(id="m3", content="latest question"),
         AIMessage(id="m4", content="working"),

@@ -82,10 +82,10 @@ class _Budget:
 
 
 class _Delta:
-    def generate(self, model, units):
+    def generate(self, model, units, messages=()):
         return _empty_delta()
 
-    async def agenerate(self, model, units):
+    async def agenerate(self, model, units, messages=()):
         return _empty_delta()
 
 
@@ -135,7 +135,8 @@ def test_overflow_retries_handler_exactly_once_with_minimal_safe_context(tmp_pat
     assert len(calls) == 2
     retry_ids = {message.id for message in calls[1].messages}
     assert {"m3", "m4"} <= retry_ids
-    assert "m1" not in retry_ids
+    # Overflow must not silently discard an earlier user constraint.
+    assert "m1" in retry_ids
     assert isinstance(calls[1].messages[0], SystemMessage)
     assert "<deepfix_task_anchor>" in calls[1].system_message.text
     assert history.context_telemetry("task-a").overflow_retry_count == 1

@@ -12,6 +12,28 @@ from deepfix.task_domain.models import TaskDefinition
 from deepfix.workspace import WorkspaceFactory
 
 
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_large_shell_result_archives_full_output_before_preview(tmp_path, monkeypatch, exit_code):
+    import json
+    import re
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    monkeypatch.setenv("DEEPFIX_HOME", str(tmp_path / "state"))
+    config = load_config(tmp_path, ApprovalMode.MANUAL)
+    backend = build_backend(config)
+    backend.default._deepfix_max_output_bytes = 100
+    result = backend.execute(f'python -c "print(\'start\' + \'x\' * 1000 + \'END\'); raise SystemExit({exit_code})"')
+    assert result.exit_code == exit_code
+    if exit_code:
+        assert "Exit code: 7" in result.output
+    assert len(result.output) < 1000
+    match = re.search(r"/.deepfix-artifacts/operation_results/[^\s]+\.json", result.output)
+    assert match is not None
+    downloaded = backend.download_files([match.group(0)])[0]
+    saved = json.loads(downloaded.content)
+    assert saved["output"].strip() == "start" + "x" * 1000 + "END"
+    assert saved["exit_code"] == exit_code
+
+
 def test_backend_is_rooted_at_target_project(tmp_path, monkeypatch):
     marker = tmp_path / "marker.txt"
     marker.write_text("project marker", encoding="utf-8")

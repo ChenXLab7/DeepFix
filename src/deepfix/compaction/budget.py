@@ -63,6 +63,13 @@ class ContextBudgetMonitor:
             counted_values.append(_content_text(request.system_message.content))
         counted_values.extend(_content_text(block) for block in protected_blocks)
         counted_values.extend(_content_text(message.content) for message in request.messages)
+        for message in request.messages:
+            calls = getattr(message, "tool_calls", None)
+            if calls:
+                counted_values.append(_canonical_text(calls))
+            reasoning = message.additional_kwargs.get("reasoning_content")
+            if reasoning:
+                counted_values.append(_content_text(reasoning))
         counted_values.extend(_canonical_text(tool) for tool in request.tools)
         request_tokens = (
             sum(max(0, int(self._count(value))) for value in counted_values)
@@ -118,6 +125,8 @@ def select_retained_units(
     report: ContextBudgetReport,
     units: Sequence[WorkUnit],
     latest_user_message_id: str,
+    message_costs: dict[str, int] | None = None,
+    protected_message_ids: set[str] | frozenset[str] = frozenset(),
 ) -> RetentionPlan:
     ordered = tuple(units)
     if not ordered or report.target_ratio is None:
@@ -131,14 +140,19 @@ def select_retained_units(
 
     total_messages = sum(len(unit.message_ids) for unit in ordered)
     unit_costs = {
-        unit.unit_id: (report.request_tokens * len(unit.message_ids) / total_messages)
+        unit.unit_id: (sum(message_costs.get(mid, 0) for mid in unit.message_ids)
+                      if message_costs is not None else
+                      report.request_tokens * len(unit.message_ids) / total_messages)
         for unit in ordered
     }
     target_tokens = report.max_input_tokens * report.target_ratio
+    if message_costs is not None:
+        target_tokens -= max(0, report.request_tokens - sum(unit_costs.values()))
     mandatory = {
         unit.unit_id
         for unit in ordered
         if unit.must_keep or unit.state != "complete" or latest_user_message_id in unit.message_ids
+        or protected_message_ids.intersection(unit.message_ids)
     }
     selected = set(mandatory)
     selected_cost = sum(unit_costs[unit_id] for unit_id in selected)

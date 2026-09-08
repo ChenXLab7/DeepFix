@@ -43,7 +43,7 @@ def _delta():
 
 def _messages():
     return (
-        HumanMessage(id="m1", content="old question"),
+        AIMessage(id="m1", content="old tool analysis " * 100),
         AIMessage(id="m2", content="old answer"),
         HumanMessage(id="m3", content="latest question"),
         AIMessage(id="m4", content="working"),
@@ -101,7 +101,7 @@ class _RecordingDelta:
     def __init__(self, calls):
         self.calls = calls
 
-    def generate(self, model, units):
+    def generate(self, model, units, messages=()):
         self.calls.append("delta_generate")
         return _delta()
 
@@ -275,7 +275,7 @@ class _FailingAdapter:
 
 
 class _RuntimeFailingDelta:
-    def generate(self, model, units):
+    def generate(self, model, units, messages=()):
         raise RuntimeError("delta failed")
 
 
@@ -283,7 +283,7 @@ class _ModelRecordingFailingDelta:
     def __init__(self):
         self.models = []
 
-    def generate(self, model, units):
+    def generate(self, model, units, messages=()):
         self.models.append(model)
         raise RuntimeError("compaction model unavailable")
 

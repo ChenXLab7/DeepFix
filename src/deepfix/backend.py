@@ -8,6 +8,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Any
+from uuid import uuid4
 
 from deepagents.backends import CompositeBackend, FilesystemBackend, LocalShellBackend
 from deepagents.backends.protocol import ExecuteResponse, GrepResult
@@ -43,6 +44,7 @@ class GuardedLocalShellBackend(LocalShellBackend):
         env: dict[str, str] | None = None,
         command_validator: Callable[[str], tuple[bool, str]] | None = None,
         command_transform: Callable[[str], str] | None = None,
+        full_output_writer: Callable[[str, int], str] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -58,6 +60,7 @@ class GuardedLocalShellBackend(LocalShellBackend):
         self._deepfix_env = env
         self._command_validator = command_validator
         self._command_transform = command_transform
+        self._full_output_writer = full_output_writer
 
     def execute(
         self,
@@ -118,6 +121,7 @@ class GuardedLocalShellBackend(LocalShellBackend):
                 stderr,
                 process.returncode,
                 self._deepfix_max_output_bytes,
+                self._full_output_writer,
             )
         except subprocess.TimeoutExpired:
             if process is not None:
@@ -258,6 +262,7 @@ def _execute_response(
     stderr: str,
     exit_code: int,
     max_output_bytes: int,
+    full_output_writer: Callable[[str, int], str] | None = None,
 ) -> ExecuteResponse:
     output_parts: list[str] = []
     if stdout:
@@ -269,6 +274,18 @@ def _execute_response(
     output = "\n".join(output_parts) if output_parts else "<no output>"
     truncated = len(output) > max_output_bytes
     if truncated:
+        if full_output_writer is not None:
+            try:
+                reference = full_output_writer(output, exit_code)
+            except Exception:  # noqa: BLE001 - lossless fallback on archive failure
+                # Preserve the real result if persistence fails; never silently discard it.
+                return ExecuteResponse(output=output, exit_code=exit_code, truncated=False)
+            output = (output[:max_output_bytes // 2] + "\n[...snipped...]\n"
+                      + output[-max_output_bytes // 2:]
+                      + f"\nFull output: {reference}")
+            if exit_code != 0:
+                output += f"\n\nExit code: {exit_code}"
+            return ExecuteResponse(output=output, exit_code=exit_code, truncated=True)
         output = (
             output[:max_output_bytes]
             + f"\n\n... Output truncated at {max_output_bytes} bytes."
@@ -333,7 +350,25 @@ def _build_project_backend(
         inherit_env=False,
         command_validator=command_validator,
         command_transform=command_transform,
+        full_output_writer=lambda output, code: _persist_shell_output(
+            config.artifacts_path, workspace.task_id if workspace else "diagnostic", output, code,
+        ),
     )
+
+
+def _persist_shell_output(root: Path, task_id: str, output: str, exit_code: int) -> str:
+    from langchain_core.messages import ToolMessage
+
+    from deepfix.investigation.receipts import ToolResultArtifactStorage
+
+    capture_id = f"capture-{uuid4().hex}"
+    storage = ToolResultArtifactStorage(root / "investigation_receipts")
+    reference = storage.save_result_artifact_reference(
+        task_id, capture_id, "execute",
+        ToolMessage(content=output, tool_call_id=capture_id, artifact={"exit_code": exit_code}),
+        max_output_bytes=max(1, len(output.encode("utf-8"))),
+    )
+    return f"/.deepfix-artifacts/{reference.path}"
 
 
 class DeepFixBackend(CompositeBackend):

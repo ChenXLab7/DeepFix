@@ -66,18 +66,24 @@ class CompactionDeltaGenerator:
         self,
         model: Any,
         work_units: Sequence[WorkUnit],
+        messages: Sequence[Any] = (),
     ) -> CompactionDelta:
+        if not work_units:
+            return CompactionDelta.model_validate({name: [] for name in CompactionDelta.model_fields})
         structured_model = model.with_structured_output(CompactionDelta)
-        result = structured_model.invoke(_delta_messages(work_units))
+        result = structured_model.invoke(_delta_messages(work_units, messages))
         return CompactionDelta.model_validate(result)
 
     async def agenerate(
         self,
         model: Any,
         work_units: Sequence[WorkUnit],
+        messages: Sequence[Any] = (),
     ) -> CompactionDelta:
+        if not work_units:
+            return self.generate(model, work_units, messages)
         structured_model = model.with_structured_output(CompactionDelta)
-        result = await structured_model.ainvoke(_delta_messages(work_units))
+        result = await structured_model.ainvoke(_delta_messages(work_units, messages))
         return CompactionDelta.model_validate(result)
 
 
@@ -368,9 +374,12 @@ def snapshot_content_hash(snapshot: CompactionSnapshot) -> str:
     return _semantic_hash(snapshot.model_dump(mode="json"))
 
 
-def _delta_messages(work_units: Sequence[WorkUnit]) -> list[Any]:
+def _delta_messages(work_units: Sequence[WorkUnit], messages: Sequence[Any] = ()) -> list[Any]:
+    selected_ids = {message_id for unit in work_units for message_id in unit.message_ids}
     body = json.dumps(
-        [unit.model_dump(mode="json") for unit in work_units],
+        {"work_units": [unit.model_dump(mode="json") for unit in work_units],
+         "messages": [message.model_dump(mode="json") for message in messages
+                      if str(message.id) in selected_ids]},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

@@ -23,6 +23,15 @@ def collector(*snapshots):
     )
 
 
+def test_view_archive_is_discoverable_without_snapshot(tmp_path):
+    from deepagents.backends import FilesystemBackend
+    backend = FilesystemBackend(root_dir=tmp_path, virtual_mode=True)
+    adapter = DeepAgentsArtifactAdapter(backend)
+    reference = adapter.persist_history("task-a", "snip-only", [HumanMessage(id="m", content="original")], set())
+    catalog = ArtifactReferenceCollector(SnapshotStoreStub(()), backend).collect("task-a", [], expand_history=True)
+    assert any(item.backend_path == reference.path for item in catalog.artifacts)
+
+
 def test_only_tool_message_with_matching_call_id_authorizes_large_result():
     messages = [
         HumanMessage(

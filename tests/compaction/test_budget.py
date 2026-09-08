@@ -30,6 +30,16 @@ def test_budget_boundaries(ratio, zone):
     assert classify_budget_zone(ratio) == zone
 
 
+def test_budget_counts_tool_arguments_and_reasoning():
+    from langchain_core.messages import AIMessage
+    model = FakeListChatModel(responses=["ok"], profile={"max_input_tokens": 100000})
+    message = AIMessage(content="", tool_calls=[{"name": "write_file", "id": "c",
+        "args": {"content": "x" * 12000}, "type": "tool_call"}],
+        additional_kwargs={"reasoning_content": "r" * 12000})
+    request = ModelRequest(model=model, messages=[message], tools=[], state={})
+    assert ContextBudgetMonitor(output_reserve_tokens=0).measure(request, []).request_tokens >= 6000
+
+
 def test_measure_counts_system_protection_messages_tools_and_reserve():
     counted = []
 
@@ -144,6 +154,14 @@ def test_retention_prioritizes_whole_units_and_mandatory_context():
         message_id for unit in plan.retained_units for message_id in unit.message_ids
     )
     assert plan.estimated_ratio <= 0.75
+
+
+def test_semantic_retention_preserves_original_user_constraints():
+    units = [_unit("original", 0), _unit("middle", 1), _unit("latest", 2)]
+    report = ContextBudgetReport(90, 100, 0, .9, "normal_compaction", .3)
+    plan = select_retained_units(report, units, "m-latest",
+                                 protected_message_ids={"m-original"})
+    assert {"m-original", "m-latest"} <= plan.retained_message_ids
 
 
 def test_mandatory_unit_is_retained_even_when_it_exceeds_target():

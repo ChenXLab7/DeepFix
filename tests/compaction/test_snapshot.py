@@ -25,6 +25,25 @@ from deepfix.compaction.snapshot import (
 )
 
 
+def test_delta_input_contains_actual_command_and_result():
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    from deepfix.compaction.snapshot import _delta_messages
+    from deepfix.compaction.work_units import partition_work_units
+
+    messages = [AIMessage(id="a", content="", tool_calls=[{
+        "id": "c", "name": "execute", "args": {"command": "pytest UNIQUE_CASE"},
+        "type": "tool_call"}]), ToolMessage(id="t", tool_call_id="c", content="UNIQUE_RESULT")]
+    units = partition_work_units(messages, set()).units
+    payload = _delta_messages(units, messages)[1].content
+    assert "UNIQUE_CASE" in payload
+    assert "UNIQUE_RESULT" in payload
+
+
+def test_no_summary_model_call_when_nothing_can_be_compacted():
+    assert CompactionDeltaGenerator().generate(object(), []).confirmed_fact_candidates == []
+
+
 def _delta(**updates):
     values = {
         "user_constraint_candidates": [],

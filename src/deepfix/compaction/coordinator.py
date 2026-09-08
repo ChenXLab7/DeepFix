@@ -11,7 +11,7 @@ from typing import Any, Literal
 from langchain.agents.middleware import ModelResponse
 from langchain.agents.middleware.types import ExtendedModelResponse
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import Command
 
 from deepfix.compaction.adapter import DeepAgentsArtifactAdapter
@@ -94,7 +94,7 @@ class _StaticDeltaGenerator:
     def __init__(self, delta: Any) -> None:
         self.delta = delta
 
-    def generate(self, model: Any, units: Any) -> Any:
+    def generate(self, model: Any, units: Any, messages: Any = ()) -> Any:
         return self.delta
 
 
@@ -309,6 +309,9 @@ class CompactionCoordinator:
             request.budget,
             partition.units,
             request.protected_context.task_anchor.latest_user_message_id,
+            {str(m.id): max(1, len(m.model_dump_json(exclude={"artifact", "response_metadata"})) // 4)
+             for m in messages},
+            {str(m.id) for m in messages if isinstance(m, (HumanMessage, SystemMessage))},
         )
         compressed_ids = {unit.unit_id for unit in retention.compressed_units}
 
@@ -336,6 +339,7 @@ class CompactionCoordinator:
             delta = self.delta_generator.generate(
                 self.model if self.model is not None else request.model,
                 retention.compressed_units,
+                messages,
             )
         except CompactionPreparationError as exc:
             raise _rebind_error(
@@ -511,6 +515,9 @@ class CompactionCoordinator:
             request.budget,
             partition.units,
             request.protected_context.task_anchor.latest_user_message_id,
+            {str(m.id): max(1, len(m.model_dump_json(exclude={"artifact", "response_metadata"})) // 4)
+             for m in messages},
+            {str(m.id) for m in messages if isinstance(m, (HumanMessage, SystemMessage))},
         )
         compressed_ids = {unit.unit_id for unit in retention.compressed_units}
         try:
@@ -536,6 +543,7 @@ class CompactionCoordinator:
             delta = await self.delta_generator.agenerate(
                 self.model if self.model is not None else request.model,
                 retention.compressed_units,
+                messages,
             )
         except CompactionPreparationError as exc:
             raise _rebind_error(

@@ -53,6 +53,16 @@ def test_history_contains_every_message_and_manifests(tmp_path):
     assert ref.work_unit_ids == ["wu-1"]
 
 
+def test_history_roundtrips_full_message_objects(tmp_path):
+    adapter = DeepAgentsArtifactAdapter(FilesystemBackend(root_dir=tmp_path, virtual_mode=True))
+    messages = _messages()
+    messages[2].artifact = {"exit_code": 17, "source": "original"}
+    messages[1].additional_kwargs["reasoning_content"] = "original reasoning"
+    ref = adapter.persist_history("task-a", "roundtrip", messages, set())
+    restored = adapter.restore_history(ref.path, "roundtrip")
+    assert [m.model_dump() for m in restored] == [m.model_dump() for m in messages]
+
+
 def test_same_attempt_does_not_append_twice(tmp_path):
     adapter = DeepAgentsArtifactAdapter(
         FilesystemBackend(root_dir=tmp_path, virtual_mode=True)

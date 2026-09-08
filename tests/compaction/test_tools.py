@@ -82,10 +82,10 @@ class _Budget:
 
 
 class _Delta:
-    def generate(self, model, units):
+    def generate(self, model, units, messages=()):
         return _empty_delta()
 
-    async def agenerate(self, model, units):
+    async def agenerate(self, model, units, messages=()):
         return _empty_delta()
 
 
