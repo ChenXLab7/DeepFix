@@ -11,13 +11,17 @@ a Context Runtime, Message Store, HistoryRepository schema or debugging controll
    The preview retains a nonzero exit status. If saving fails, the real full result
    is returned rather than silently discarded. Native DeepAgents per-tool controls
    continue to apply; they are not duplicated.
-2. At context pressure above the existing 75% boundary, old ToolMessage text above
-   8,000 characters can become a 2,000-character head and 1,000-character tail plus
-   a verified history reference. The final eight WorkUnits remain intact.
-3. Above 200 messages, older complete WorkUnits outside the final approximately
-   80 messages can be omitted from the model view, with a history index in their
-   place. All Human/System messages and incomplete or ambiguous units are retained.
-   These are conservative view limits, not hard limits on protected user content.
+2. Above 50 messages, older complete WorkUnits outside the final approximately
+   40 messages are omitted from the model view after archival. Human/System units,
+   incomplete/ambiguous units, the last three consumed tool rounds and unseen tool
+   results remain intact. These are soft view limits, not limits on user content.
+3. After snip, if serialized message-view size exceeds 50,000 characters, Micro
+   shortens eligible old ToolMessage bodies above 2,000 characters to a 500-character
+   head and 500-character tail plus archive reference, stopping at 40,000 characters
+   or when no eligible results remain. Size excludes artifact/response_metadata;
+   it includes message content, tool calls and reasoning. It is independent of the
+   model-window ratio. The same recent/unseen protections apply. All operations
+   affect the request view only; no persistent consumed-result state is added.
 4. The request is measured again. Existing semantic compaction is used only if
    pressure still requires it. Empty selections do not invoke the summary model.
 

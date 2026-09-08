@@ -185,62 +185,91 @@ class DeepFixCompactionMiddleware(AgentMiddleware):
         self, task_id: str, messages: Sequence[AnyMessage], report: ContextBudgetReport,
     ) -> list[AnyMessage] | None:
         """Request-local only: never return a checkpoint Command or mutate a Receipt."""
-        long_history = len(messages) > 200
-        if report.zone == "normal" and not long_history:
+        def view_chars(view):
+            return len(json.dumps([
+                m.model_dump(exclude={"artifact", "response_metadata"}) for m in view
+            ], ensure_ascii=False, default=str))
+
+        long_history = len(messages) > 50
+        if not long_history and view_chars(messages) <= 50_000:
             return None
         if ensure_message_ids(task_id, messages).conflicted_message_ids:
             return None
         partition = partition_work_units(_scoped_messages(task_id, messages), set())
-        recent = {unit.unit_id for unit in partition.units[-8:]}
-        replacements: dict[str, AnyMessage] = {}
-        omitted: set[str] = set()
-        history_path = ""
-        for unit in partition.units:
-            originals = list(messages[unit.start_index:unit.end_index + 1])
-            if (unit.state != "complete" or unit.unit_id in recent
-                    or any(isinstance(m, (HumanMessage, SystemMessage)) for m in originals)):
-                continue
-            drop = long_history and unit.end_index < len(messages) - 80
-            large = [m for m in originals if isinstance(m, ToolMessage)
-                     and isinstance(m.content, str) and len(m.content) > 8000]
-            if not drop and not large:
-                continue
-            attempt = "snip-" + hashlib.sha256(
-                "".join(m.model_dump_json() for m in originals).encode("utf-8")
-            ).hexdigest()[:32]
-            try:
-                reference = self.coordinator.adapter.persist_history(
-                    task_id, attempt, originals, set(), work_unit_ids={unit.unit_id},
-                )
-            except ArtifactPersistenceError:
-                # An unsuccessful archive cannot justify hiding original content.
-                return None
-            history_path = reference.path
-            if drop:
+        last_assistant = max((i for i, m in enumerate(messages)
+                              if m.type == "ai"), default=-1)
+        consumed = [unit for unit in partition.units
+                    if unit.state == "complete" and unit.tool_call_ids
+                    and all(i < last_assistant for i in range(unit.start_index, unit.end_index + 1)
+                            if isinstance(messages[i], ToolMessage))]
+        recent = {unit.unit_id for unit in consumed[-3:]}
+        protected = {unit.unit_id for unit in partition.units
+                     if unit.state != "complete" or unit.unit_id in recent
+                     or any(isinstance(m, (HumanMessage, SystemMessage))
+                            or (isinstance(m, ToolMessage) and i > last_assistant)
+                            for i, m in enumerate(messages[unit.start_index:unit.end_index + 1],
+                                                  unit.start_index))}
+        view = list(messages)
+        try:
+            # Remove old whole rounds first; Micro measures only the remaining view.
+            omitted: set[str] = set()
+            history_path = ""
+            for unit in partition.units:
+                if (not long_history or unit.unit_id in protected
+                        or unit.end_index >= len(messages) - 40):
+                    continue
+                originals = list(messages[unit.start_index:unit.end_index + 1])
+                reference, _ = self._archive_view_unit(task_id, originals, unit.unit_id)
+                history_path = reference.path
                 omitted.update(unit.message_ids)
-            else:
-                for message in large:
-                    replacements[str(message.id)] = message.model_copy(update={"content": (
-                        f"[Archived tool result: {reference.path}; event={attempt}; message={message.id}]\n"
-                        + message.content[:2000] + "\n[...snipped; original is recoverable...]\n"
-                        + message.content[-1000:]
-                    )}, deep=True)
-        if not omitted and not replacements:
+            if omitted:
+                view = []
+                note_added = False
+                for message in messages:
+                    if str(message.id) in omitted:
+                        if not note_added:
+                            view.append(SystemMessage(id=f"snip-view-{task_id}", content=(
+                                f"Older complete tool rounds archived at {history_path}. "
+                                "Use read_file with offset/limit, or search_diagnostic_artifacts / "
+                                "read_diagnostic_artifact to retrieve originals."
+                            )))
+                            note_added = True
+                        continue
+                    view.append(message)
+            if view_chars(view) > 50_000:
+                positions = {str(m.id): i for i, m in enumerate(view)}
+                for unit in partition.units:
+                    if view_chars(view) <= 40_000:
+                        break
+                    if unit.unit_id in protected:
+                        continue
+                    originals = list(messages[unit.start_index:unit.end_index + 1])
+                    large = [m for m in originals if str(m.id) in positions
+                             and isinstance(m, ToolMessage) and isinstance(m.content, str)
+                             and len(m.content) > 2000]
+                    if not large:
+                        continue
+                    reference, attempt = self._archive_view_unit(task_id, originals, unit.unit_id)
+                    for message in large:
+                        if view_chars(view) <= 40_000:
+                            break
+                        view[positions[str(message.id)]] = message.model_copy(update={"content": (
+                            f"[Archived tool result: {reference.path}; event={attempt}; message={message.id}]\n"
+                            + message.content[:500] + "\n[...snipped; original is recoverable...]\n"
+                            + message.content[-500:]
+                        )}, deep=True)
+        except ArtifactPersistenceError:
             return None
-        view: list[AnyMessage] = []
-        note_added = False
-        for message in messages:
-            if str(message.id) in omitted:
-                if not note_added:
-                    view.append(SystemMessage(id=f"snip-view-{task_id}", content=(
-                        f"Older complete tool rounds archived at {history_path}. "
-                        "Use read_file with offset/limit, or search_diagnostic_artifacts / "
-                        "read_diagnostic_artifact to retrieve originals."
-                    )))
-                    note_added = True
-                continue
-            view.append(replacements.get(str(message.id), message))
-        return view
+        return view if view != list(messages) else None
+
+    def _archive_view_unit(self, task_id, originals, unit_id):
+        attempt = "snip-" + hashlib.sha256(
+            "".join(m.model_dump_json() for m in originals).encode("utf-8")
+        ).hexdigest()[:32]
+        reference = self.coordinator.adapter.persist_history(
+            task_id, attempt, originals, set(), work_unit_ids={unit_id},
+        )
+        return reference, attempt
 
     def _invoke_zone(
         self,

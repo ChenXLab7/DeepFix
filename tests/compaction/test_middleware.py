@@ -360,3 +360,44 @@ def test_committed_event_reconstructs_effective_view_without_deleting_checkpoint
     assert request.state["messages"] == messages
     assert repositories.history.get("task-a", 1).lifecycle == "active"
     assert coordinator.history_repository.context_telemetry("task-a").active_snapshot_version == 1
+
+
+def test_micro_uses_character_budget_and_stops_at_target(tmp_path):
+    import json
+    coordinator = _Coordinator(tmp_path / "state.db")
+    coordinator.adapter = DeepAgentsArtifactAdapter(FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True))
+    middleware = DeepFixCompactionMiddleware(_ProtectedBuilder(), None, coordinator)
+    messages = _long_tool_history(count=12, size=4500)
+    original = [m.model_dump() for m in messages]
+    view = middleware._lightweight_view("task-a", messages, _report("normal", 0.01))
+    assert view is not None
+    assert len(json.dumps([m.model_dump(exclude={"artifact", "response_metadata"}) for m in view], ensure_ascii=False, default=str)) <= 40000
+    results = [m for m in view if isinstance(m, ToolMessage)]
+    assert len(results[0].content) < 1500
+    assert results[-4:] == [m for m in messages if isinstance(m, ToolMessage)][-4:]
+    assert any(len(m.content) > 2000 for m in results[:-4])
+    assert [m.model_dump() for m in messages] == original
+
+
+def test_snip_starts_above_fifty_messages_before_micro(tmp_path):
+    coordinator = _Coordinator(tmp_path / "state.db")
+    coordinator.adapter = DeepAgentsArtifactAdapter(FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True))
+    middleware = DeepFixCompactionMiddleware(_ProtectedBuilder(), None, coordinator)
+    messages = _long_tool_history(count=25, size=1100)
+    view = middleware._lightweight_view("task-a", messages, _report("normal", 0.01))
+    assert view is not None
+    assert 40 <= len(view) < 50
+    assert all(m.content == next(old.content for old in messages if old.id == m.id)
+               for m in view if isinstance(m, ToolMessage))
+    assert middleware._lightweight_view("task-a", _long_tool_history(count=24, size=10), _report("normal", 0.01)) is None
+
+
+def test_micro_keeps_recent_rounds_after_assistant_explanation(tmp_path):
+    coordinator = _Coordinator(tmp_path / "state.db")
+    coordinator.adapter = DeepAgentsArtifactAdapter(FilesystemBackend(root_dir=tmp_path / "artifacts", virtual_mode=True))
+    middleware = DeepFixCompactionMiddleware(_ProtectedBuilder(), None, coordinator)
+    messages = _long_tool_history(count=12, size=4500)
+    messages.insert(-1, AIMessage(id="explanation", content="I have read the results"))
+    view = middleware._lightweight_view("task-a", messages, _report("normal", 0.01))
+    assert view is not None
+    assert [m for m in view if isinstance(m, ToolMessage)][-3:] == [m for m in messages if isinstance(m, ToolMessage)][-3:]
